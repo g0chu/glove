@@ -1,0 +1,26 @@
+{
+  "name": "glove",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Discord bot that bridges guild text channels to any OpenAI-compatible Chat Completions endpoint",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/smoke.ts"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}
