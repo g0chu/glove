@@ -29,10 +29,19 @@ async function main(): Promise<void> {
   });
   const histories = new ConversationStore(cfg.model.contextMaxMessages);
 
-  /** One full turn: user message -> model -> streamed/chunked reply. */
-  const runTurn = async (channelId: string, content: string): Promise<void> => {
+  /**
+   * One full turn for a queued mention. The mention is already in the
+   * channel history (every trackable message is appended on arrival); the
+   * request is built from the *current* snapshot, so edits that happened
+   * while the turn was queued are picked up.
+   */
+  const runTurn = async (channelId: string, mentionId: string): Promise<void> => {
     const history = histories.get(channelId);
-    history.push("user", content);
+    if (!history.has(mentionId)) {
+      // Deleted (or evicted out of the context window) before its turn ran.
+      log.info(`mention ${mentionId} in ${channelId} left the context window; skipping turn`);
+      return;
+    }
 
     // Resolve the channel (it is cached because a message just came from it).
     let channel: GuildTextBasedChannel | null = null;
@@ -63,23 +72,16 @@ async function main(): Promise<void> {
       const reply = await llm.chat(messages, (delta) => {
         writer.chunk(delta);
       });
-      await writer.finish(reply);
-      if (reply.trim().length > 0) {
-        history.push("assistant", reply.trim());
-      }
+      const posted = await writer.finish(reply);
+      if (posted) history.push("assistant", posted.text, posted.messageIds, posted.chunks);
     } catch (err) {
       log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
-      await writer.reportError(err);
+      const posted = await writer.reportError(err);
+      if (posted) history.push("assistant", posted.text, posted.messageIds, posted.chunks);
     }
   };
 
-  const queues = new QueueStore({
-    onAmbient: (channelId, content) => {
-      // Ambient messages ride along as user turns, in order (PLAN.md §4).
-      histories.get(channelId).push("user", content);
-    },
-    runTurn,
-  });
+  const queues = new QueueStore({ runTurn });
 
   client.once("clientReady", () => {
     log.info(`connected as ${client.user?.tag} (id ${client.user?.id})`);
@@ -89,13 +91,63 @@ async function main(): Promise<void> {
     }
   });
 
+  // Every trackable message enters the channel's context immediately, keyed
+  // by its Discord id so edits/deletes can be reflected (handlers below).
+  // Only mentions additionally queue a turn; ambient messages never trigger
+  // one on their own.
   client.on("messageCreate", (message) => {
     const botId = client.user?.id;
     if (!botId) return;
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
-    const isMention = isMentionOf(message, botId);
-    const content = stripMention(message, botId);
-    queues.get(message.channelId).push({ content, isMention });
+    histories.get(message.channelId).push("user", stripMention(message, botId), [message.id]);
+    if (isMentionOf(message, botId)) {
+      queues.get(message.channelId).push(message.id);
+    }
+  });
+
+  // Edits: keep the context in sync. Single-message entries (a human
+  // message, or a short bot reply) take the new content as-is; chunked bot
+  // replies rebuild their visible text from the stored chunks. The bot's own
+  // final post of a chunk matches the stored chunk, so it is a no-op — only
+  // real edits (by anyone) change anything. Note: an edit that *adds* a
+  // mention does not queue a turn; only fresh messages do.
+  client.on("messageUpdate", (_oldMessage, message) => {
+    const botId = client.user?.id;
+    if (!botId) return;
+    const channelId = message.channel?.id;
+    if (!channelId || !histories.has(channelId)) return;
+    const history = histories.get(channelId);
+    const entry = history.find(message.id);
+    if (!entry) return; // not in this channel's context window
+    const newContent = stripMention(message, botId);
+    if (entry.ids.length === 1) {
+      if (newContent !== entry.content) history.updateContent(message.id, newContent);
+    } else if (entry.chunks) {
+      const i = entry.ids.indexOf(message.id);
+      if (i !== -1 && entry.chunks[i] !== newContent) {
+        history.updateChunk(message.id, newContent);
+      }
+    }
+  });
+
+  // Deletions: drop the entry, wherever it is in the window. (A delete of
+  // any chunk of a chunked reply drops the whole reply.)
+  client.on("messageDelete", (message) => {
+    const channelId = message.channel?.id;
+    if (!channelId || !histories.has(channelId)) return;
+    histories.get(channelId).removeById(message.id);
+  });
+
+  client.on("messageDeleteBulk", (messages, channel) => {
+    if (!histories.has(channel.id)) return;
+    for (const m of messages.values()) {
+      histories.get(channel.id).removeById(m.id);
+    }
+  });
+
+  // A deleted channel's history is gone; forget it.
+  client.on("channelDelete", (channel) => {
+    histories.clear(channel.id);
   });
 
   // Lifecycle: cancel in-flight generation, destroy the client, exit cleanly.
