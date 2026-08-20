@@ -94,6 +94,16 @@ export interface WriterOptions {
   throttleMs: number;
 }
 
+/** What the writer actually posted to the channel (for history tracking). */
+export interface PostedReply {
+  /** Discord message ids in send order (one per chunk). */
+  messageIds: string[];
+  /** Text to record in the history: the canonical reply when every chunk posted. */
+  text: string;
+  /** Per-message text as posted, when the reply spanned multiple messages. */
+  chunks?: string[];
+}
+
 /**
  * Posts a model reply to a channel with Discord-specific concerns:
  *  - typing indicator refreshed every `typingIntervalMs`;
@@ -102,7 +112,10 @@ export interface WriterOptions {
  *    `throttleMs` (edits are serialized; when the text exceeds 2000 chars
  *    the live preview shows the most recent tail);
  *  - on completion the final text is chunked (code-fence aware) and posted
- *    as one message per chunk.
+ *    as one message per chunk;
+ *  - `finish()`/`reportError()` return the ids and text of whatever was
+ *    actually posted, so the caller can record the reply in the channel
+ *    history (making it editable/deletable like any other message).
  */
 export class ResponseWriter {
   private buffer = "";
@@ -133,47 +146,51 @@ export class ResponseWriter {
   /**
    * Finalize: stop typing, post the complete text (or a note when empty).
    * `fullText` is the model's full answer; falls back to whatever was
-   * streamed so far.
+   * streamed so far. Returns what actually landed in the channel (message
+   * ids + text) so the caller can record it in the history, or null when
+   * nothing could be posted.
    */
-  async finish(fullText: string): Promise<void> {
-    if (this.finished) return;
+  async finish(fullText: string): Promise<PostedReply | null> {
+    if (this.finished) return null;
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
 
     const text = fullText.trim() || this.buffer.trim();
+    const posted: Message[] = [];
     try {
       if (!text) {
         const note = "*(the model returned no response)*";
-        if (this.message) {
-          await this.message.edit({ content: note });
-        } else {
-          await this.opts.channel.send(note);
-        }
-        return;
+        posted.push(
+          this.message ? await this.message.edit({ content: note }) : await this.opts.channel.send(note),
+        );
+        return { messageIds: [posted[0].id], text: note };
       }
       const chunks = splitForDiscord(text);
       if (this.message) {
-        await this.message.edit({ content: chunks[0] });
+        posted.push(await this.message.edit({ content: chunks[0] }));
         for (const c of chunks.slice(1)) {
-          await this.opts.channel.send(c);
+          posted.push(await this.opts.channel.send(c));
         }
       } else {
         for (const c of chunks) {
-          await this.opts.channel.send(c);
+          posted.push(await this.opts.channel.send(c));
         }
       }
+      return this.reported(posted, text);
     } catch (err) {
       log.error(`failed to finalize reply: ${errMsg(err)}`);
+      // Partial post: keep an honest record of whatever did land in the channel.
+      return this.reported(posted);
     }
   }
 
   /**
    * Report a generation failure: keep any partial text, append a short
-   * honest error note, stop typing.
+   * honest error note, stop typing. Returns what was posted (see finish).
    */
-  async reportError(err: unknown): Promise<void> {
-    if (this.finished) return;
+  async reportError(err: unknown): Promise<PostedReply | null> {
+    if (this.finished) return null;
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
@@ -181,21 +198,38 @@ export class ResponseWriter {
     const note = `⚠️ *generation failed:* ${truncate(errMsg(err), 400)}`;
     const partial = this.buffer.trim();
     const text = partial ? `${partial}\n\n${note}` : note;
+    const posted: Message[] = [];
     try {
       const chunks = splitForDiscord(text);
       if (this.message) {
-        await this.message.edit({ content: chunks[0] });
+        posted.push(await this.message.edit({ content: chunks[0] }));
         for (const c of chunks.slice(1)) {
-          await this.opts.channel.send(c);
+          posted.push(await this.opts.channel.send(c));
         }
       } else {
         for (const c of chunks) {
-          await this.opts.channel.send(c);
+          posted.push(await this.opts.channel.send(c));
         }
       }
+      return this.reported(posted, text);
     } catch (err2) {
       log.error(`failed to post error message: ${errMsg(err2)}`);
+      return this.reported(posted);
     }
+  }
+
+  /**
+   * Describe what was posted. `canonicalText` (the model's full answer) is
+   * kept when every chunk landed; otherwise the visible text of whatever
+   * was posted is reported. null when nothing was posted.
+   */
+  private reported(posted: Message[], canonicalText?: string): PostedReply | null {
+    if (posted.length === 0) return null;
+    return {
+      messageIds: posted.map((m) => m.id),
+      text: canonicalText ?? posted.map((m) => m.content).join("\n"),
+      chunks: posted.length > 1 ? posted.map((m) => m.content) : undefined,
+    };
   }
 
   private async updateLive(): Promise<void> {

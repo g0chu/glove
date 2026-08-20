@@ -1,32 +1,29 @@
 import { errMsg, log } from "../log.js";
 
-export interface QueueItem {
-  content: string;
-  isMention: boolean;
-}
-
 export interface QueueDeps {
-  /** Ambient (non-mention) message rides along with the next turn. */
-  onAmbient: (channelId: string, content: string) => void;
-  /** Run one full turn: append user message, call the model, post the reply. */
-  runTurn: (channelId: string, content: string) => Promise<void>;
+  /**
+   * Run one full turn for a queued mention. The mention is already in the
+   * channel history (see index.ts); this callback builds the request from
+   * the current history, calls the model, and posts the reply.
+   */
+  runTurn: (channelId: string, mentionId: string) => Promise<void>;
 }
 
 /**
  * FIFO queue + serial worker for a single channel (PLAN.md §4).
  *
- * Semantics:
+ * Every trackable message lands in the channel history as soon as it
+ * arrives (mention or ambient); this queue only holds *mentions*, i.e. the
+ * turns to run. Semantics:
  *  - one turn (mention -> model reply) at a time;
- *  - messages arriving while a turn is in flight are queued, not dropped;
- *  - the first queued mention starts the next turn;
- *  - non-mention messages sitting before that mention are appended to the
- *    channel history (as user turns) so the model sees them as context
- *    leading into the mention;
- *  - non-mentions with no later mention stay buffered until a mention
- *    arrives (they never trigger a reply on their own).
+ *  - mentions arriving while a turn is in flight are queued, not dropped;
+ *  - turns run in arrival order;
+ *  - ambient (non-mention) messages never trigger a turn;
+ *  - a mention whose message was deleted (or evicted out of the history
+ *    window) before its turn runs is skipped by runTurn.
  */
 export class ChannelQueue {
-  private pending: QueueItem[] = [];
+  private pending: string[] = [];
   private pumping = false;
 
   constructor(
@@ -38,8 +35,9 @@ export class ChannelQueue {
     return this.pending.length;
   }
 
-  push(item: QueueItem): void {
-    this.pending.push(item);
+  /** Queue a mention to be answered, in arrival order. */
+  push(mentionId: string): void {
+    this.pending.push(mentionId);
     void this.pump();
   }
 
@@ -47,17 +45,10 @@ export class ChannelQueue {
     if (this.pumping) return;
     this.pumping = true;
     try {
-      for (;;) {
-        const mentionIndex = this.pending.findIndex((m) => m.isMention);
-        if (mentionIndex === -1) break; // only ambient messages: keep them buffered
-        const mention = this.pending[mentionIndex];
-        const ambient = this.pending.splice(0, mentionIndex);
-        this.pending.shift(); // drop the mention itself; it becomes the turn
-        for (const a of ambient) {
-          this.deps.onAmbient(this.channelId, a.content);
-        }
+      while (this.pending.length > 0) {
+        const mentionId = this.pending.shift()!;
         try {
-          await this.deps.runTurn(this.channelId, mention.content);
+          await this.deps.runTurn(this.channelId, mentionId);
         } catch (err) {
           // runTurn is expected to handle its own errors; belt and braces so
           // the worker never dies and the channel loop keeps going.

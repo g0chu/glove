@@ -29,7 +29,10 @@ npm run dev            # or: npm run build && npm start
   count as mentions) in any text channel of `DISCORD_GUILD_ID`.
 - **Memory:** per-channel sliding window of the last
   `MODEL_CONTEXT_MAX_MESSAGES` (default 20) messages; an optional
-  `MODEL_SYSTEM_PROMPT` is prepended to every request.
+  `MODEL_SYSTEM_PROMPT` is prepended to every request. Every message in the
+  channel enters the window as soon as it arrives (mentions and non-mentions
+  alike), and edits and deletions are reflected, so the model always sees
+  the channel's current state.
 - **Streaming:** by default the answer is built up live: typing indicator
   while generating, message created on the first chunk, edits throttled to
   at least `DISCORD_STREAM_UPDATE_THROTTLE_MS` apart. Set `MODEL_STREAM=false`
@@ -37,11 +40,9 @@ npm run dev            # or: npm run build && npm start
 - **Chunking:** replies longer than Discord's 2000-char limit are split into
   multiple messages, preferring newlines and never cutting inside a code
   fence (fences are closed/reopened across the boundary).
-- **Queue:** one turn per channel at a time. Messages that arrive while a
-  reply is generating are queued: the first queued mention starts the next
-  turn, and non-mention messages ahead of it are appended to the channel
-  history as context leading into that mention. Non-mentions on their own
-  never trigger a reply.
+- **Queue:** one turn per channel at a time. Mentions that arrive while a
+  reply is generating are queued and answered in order. Non-mentions on
+  their own never trigger a reply, but they are part of the context.
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 

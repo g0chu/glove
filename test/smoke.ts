@@ -61,25 +61,53 @@ const ok = (name: string): void => {
 // --------------------------------------------------------------- history --
 {
   const h = new ChannelHistory(3);
-  h.push("user", "a");
-  h.push("assistant", "b");
-  h.push("user", "c");
-  h.push("user", "d");
-  h.push("assistant", "e");
+  h.push("user", "a", ["1"]);
+  h.push("assistant", "b", ["2"]);
+  h.push("user", "c", ["3"]);
+  h.push("user", "d", ["4"]);
+  h.push("assistant", "e", ["5"]);
   assert.deepEqual(
     h.snapshot().map((m) => `${m.role}:${m.content}`),
     ["user:c", "user:d", "assistant:e"],
   );
   ok("history: sliding window keeps only the last N");
 
+  // Edits update in place (keeping position); deletes drop the entry.
   const h2 = new ChannelHistory(10);
-  h2.push("user", "hi");
-  assert.deepEqual(toRequestMessages(h2, "You are helpful."), [
+  h2.push("user", "hi", ["10"]);
+  h2.push("assistant", "hello", ["11"]);
+  h2.push("user", "thanks", ["12"]);
+  h2.updateContent("10", "hii (edited)");
+  assert.deepEqual(h2.snapshot().map((m) => m.content), ["hii (edited)", "hello", "thanks"]);
+  assert.equal(h2.has("11"), true);
+  assert.equal(h2.removeById("11"), true, "assistant entry removed by its message id");
+  assert.deepEqual(h2.snapshot().map((m) => m.content), ["hii (edited)", "thanks"]);
+  assert.equal(h2.removeById("nope"), false, "unknown id is a no-op");
+  ok("history: id-based edit/delete keeps the window in sync");
+
+  // Chunked assistant replies: any chunk id resolves the entry, and editing
+  // a chunk rebuilds the visible text from the stored chunks.
+  const h3 = new ChannelHistory(10);
+  h3.push("assistant", "canonical full reply", ["20", "21"], ["part one", "part two"]);
+  assert.equal(h3.find("21")!.content, "canonical full reply");
+  h3.updateChunk("21", "part two (edited)");
+  assert.equal(h3.find("21")!.content, "part one\npart two (edited)");
+  assert.equal(h3.find("20")!.content, "part one\npart two (edited)", "first chunk id resolves the same entry");
+  h3.updateChunk("21", "part two");
+  assert.equal(h3.find("20")!.content, "part one\npart two", "editing back rebuilds too");
+  assert.equal(h3.removeById("20"), true, "deleting any chunk drops the whole reply");
+  assert.equal(h3.length, 0);
+  ok("history: chunked assistant entries (rebuild on edit, drop on delete)");
+
+  const h4 = new ChannelHistory(10);
+  h4.push("user", "", ["30"]); // e.g. a bare mention: tracked, but no text
+  h4.push("user", "hi", ["31"]);
+  assert.deepEqual(toRequestMessages(h4, "You are helpful."), [
     { role: "system", content: "You are helpful." },
     { role: "user", content: "hi" },
   ]);
-  assert.deepEqual(toRequestMessages(h2, "   "), [{ role: "user", content: "hi" }]);
-  ok("history: request messages with/without system prompt");
+  assert.deepEqual(toRequestMessages(h4, "   "), [{ role: "user", content: "hi" }]);
+  ok("history: request messages skip textless entries, with/without system prompt");
 }
 
 // ----------------------------------------------------------------- split --
@@ -130,58 +158,55 @@ const ok = (name: string): void => {
   let gate: (() => void) | null = null;
   let turnCount = 0;
   const deps = {
-    onAmbient: (_ch: string, content: string): void => {
-      events.push(`ambient:${content}`);
-    },
-    runTurn: async (_ch: string, content: string): Promise<void> => {
+    runTurn: async (ch: string, mentionId: string): Promise<void> => {
       turnCount++;
-      events.push(`turn:${content}`);
-      if (content === "m1") await new Promise<void>((r) => (gate = r));
+      events.push(`turn:${ch}:${mentionId}`);
+      if (mentionId === "m1") await new Promise<void>((r) => (gate = r));
     },
   };
 
   const q = new ChannelQueue("c1", deps);
-  q.push({ content: "a", isMention: false });
-  q.push({ content: "m1", isMention: true });
+  q.push("m1");
+  q.push("m2");
   await ticks(3);
-  assert.deepEqual(events, ["ambient:a", "turn:m1"], "ambient a rides along with turn m1");
-
-  q.push({ content: "b", isMention: false });
-  q.push({ content: "m2", isMention: true });
-  assert.equal(events.length, 2, "second turn must wait for the first to finish");
+  assert.deepEqual(events, ["turn:c1:m1"], "second mention waits for the first turn to finish");
   gate!();
   await ticks(5);
-  assert.deepEqual(events, ["ambient:a", "turn:m1", "ambient:b", "turn:m2"]);
+  assert.deepEqual(events, ["turn:c1:m1", "turn:c1:m2"], "mentions run in arrival order");
   assert.equal(turnCount, 2);
-  ok("queue: turns serialized, ambient rides along with next mention");
+  ok("queue: one turn at a time, FIFO");
 
+  // A turn that throws must not kill the worker.
   const events2: string[] = [];
   const q2 = new ChannelQueue("c2", {
-    onAmbient: (_c: string, x: string): void => events2.push(x),
-    runTurn: async (): Promise<void> => {},
+    runTurn: async (_c: string, mentionId: string): Promise<void> => {
+      if (mentionId === "a") throw new Error("boom");
+      events2.push(mentionId);
+    },
   });
-  q2.push({ content: "x", isMention: false });
-  await ticks(3);
-  assert.deepEqual(events2, [], "non-mention with no later mention stays buffered");
-  q2.push({ content: "m", isMention: true });
-  await ticks(3);
-  assert.deepEqual(events2, ["x"], "buffered ambient released when a mention arrives");
-  ok("queue: buffered ambient never triggers a reply on its own");
+  q2.push("a");
+  q2.push("b");
+  await ticks(5);
+  assert.deepEqual(events2, ["b"], "worker survives a failed turn and keeps going");
+  ok("queue: worker survives a failed turn");
 }
 
 // --------------------------------------------------------------- writer --
 {
   interface FakeMessage {
+    id: string;
     content: string;
     edit: (u: { content: string }) => Promise<FakeMessage>;
   }
   const makeChannel = () => {
     const sent: string[] = [];
     let live: FakeMessage | null = null;
+    let nextId = 0;
     const channel = {
       sendTyping: async (): Promise<void> => {},
       send: async (content: string) => {
         const m: FakeMessage = {
+          id: `msg${String(++nextId)}`,
           content,
           edit: async (u) => {
             m.content = u.content;
@@ -210,10 +235,12 @@ const ok = (name: string): void => {
   await ticks(2);
   assert.equal(a.sent.length, 1, "one message created on first chunk");
   assert.equal(a.sent[0], "Hel");
-  await w1.finish("Hello, world!");
+  const p1 = await w1.finish("Hello, world!");
   assert.equal(a.sent.length, 1, "no extra messages for a short reply");
   assert.equal(a.getLive()!.content, "Hello, world!");
-  ok("writer: first-chunk create + final edit");
+  assert.equal(p1!.text, "Hello, world!", "posted text is the canonical reply");
+  assert.deepEqual(p1!.messageIds, [a.getLive()!.id], "posted id is the live message's id");
+  ok("writer: first-chunk create + final edit, posted ids reported");
 
   // >2000 chars split into multiple messages
   const b = makeChannel();
@@ -224,10 +251,13 @@ const ok = (name: string): void => {
   });
   w2.start();
   const long = "z".repeat(5000);
-  await w2.finish(long);
+  const p2 = await w2.finish(long);
   assert.equal(b.sent.length, 3, "5000 chars -> 3 messages");
   assert.ok(b.sent.every((c) => c.length <= 2000));
   assert.equal(b.sent.join(""), long);
+  assert.equal(p2!.messageIds.length, 3, "one id per chunk");
+  assert.equal(p2!.text, long, "canonical reply kept in history");
+  assert.deepEqual(p2!.chunks, b.sent, "per-chunk text recorded for edit tracking");
   ok("writer: >2000 chars split across multiple messages");
 
   // empty reply -> note
@@ -238,9 +268,10 @@ const ok = (name: string): void => {
     throttleMs: 2000,
   });
   w3.start();
-  await w3.finish("");
+  const p3 = await w3.finish("");
   assert.equal(c.sent.length, 1);
   assert.match(c.sent[0], /no response/i);
+  assert.equal(p3!.messageIds.length, 1);
   ok("writer: empty reply posts a note");
 
   // error after partial stream keeps the partial + note
@@ -253,10 +284,11 @@ const ok = (name: string): void => {
   w4.start();
   w4.chunk("partial text");
   await ticks(2);
-  await w4.reportError(new Error("model endpoint returned HTTP 500"));
+  const p4 = await w4.reportError(new Error("model endpoint returned HTTP 500"));
   assert.equal(d.sent.length, 1);
   assert.match(d.getLive()!.content, /partial text/);
   assert.match(d.getLive()!.content, /generation failed/);
+  assert.equal(p4!.messageIds.length, 1, "the error note is recorded in history too");
   ok("writer: error keeps partial text + note");
 }
 
