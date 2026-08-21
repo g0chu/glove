@@ -26,6 +26,7 @@ export function buildTools(cfg: Config): ToolsSetup {
       cacheTtlMs: cfg.tools.web.cacheTtlMs,
       cacheMaxEntries: cfg.tools.web.cacheMaxEntries,
       searchMaxResults: cfg.tools.web.searchMaxResults,
+      maxResultChars: cfg.tools.maxResultChars,
     });
     clients.push(web);
     registerWebTools(registry, web);
@@ -40,6 +41,7 @@ export function buildTools(cfg: Config): ToolsSetup {
       searchMaxFiles: cfg.tools.file.searchMaxFiles,
       searchMaxFileBytes: cfg.tools.file.searchMaxFileBytes,
       lineMaxChars: cfg.tools.file.lineMaxChars,
+      maxResultChars: cfg.tools.maxResultChars,
     });
     clients.push(file);
     registerFileTools(registry, file);

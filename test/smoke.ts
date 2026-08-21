@@ -17,6 +17,7 @@ import { ChannelHistory, toRequestMessages } from "../src/llm/history.js";
 import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
 import { ChannelQueue } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
+import { sanitizeForDiscord } from "../src/bot/format.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
@@ -83,6 +84,7 @@ const ok = (name: string): void => {
     FILETOOLS_ENABLED: "true",
     FILETOOLS_WORKSPACE: "/tmp/ws",
     FILETOOLS_READ_MAX_BYTES: "4096",
+    TOOLS_MAX_RESULT_CHARS: "12345",
     TOOLS_MAX_ROUNDS: "7",
   });
   assert.deepEqual(te, []);
@@ -97,6 +99,7 @@ const ok = (name: string): void => {
   assert.equal(tc.tools.file.workspace, "/tmp/ws");
   assert.equal(tc.tools.file.readMaxBytes, 4096);
   assert.equal(tc.tools.file.listMaxEntries, 500); // default
+  assert.equal(tc.tools.maxResultChars, 12345);
   assert.equal(tc.tools.maxRounds, 7);
   ok("config: tools section parses env and applies defaults");
 
@@ -109,6 +112,7 @@ const ok = (name: string): void => {
   assert.equal(td.tools.file.enabled, false, "file tools off by default");
   assert.equal(td.tools.file.workspace, "./workspace");
   assert.equal(td.tools.web.searchMaxResults, 10); // default
+  assert.equal(td.tools.maxResultChars, 200_000); // default
   assert.equal(td.tools.maxRounds, 5);
   ok("config: tools disabled by default");
 
@@ -118,9 +122,11 @@ const ok = (name: string): void => {
     MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
     WEBTOOLS_FETCH_MAX_BYTES: "abc",
     TOOLS_MAX_ROUNDS: "0",
+    TOOLS_MAX_RESULT_CHARS: "10",
   });
   assert.ok(toolErrs.some((e) => e.includes("WEBTOOLS_FETCH_MAX_BYTES")), `got: ${toolErrs.join("; ")}`);
   assert.ok(toolErrs.some((e) => e.includes("TOOLS_MAX_ROUNDS")), `got: ${toolErrs.join("; ")}`);
+  assert.ok(toolErrs.some((e) => e.includes("TOOLS_MAX_RESULT_CHARS")), `got: ${toolErrs.join("; ")}`);
   ok("config: invalid tool env values rejected");
 }
 
@@ -216,6 +222,90 @@ const ok = (name: string): void => {
     lastIdx = i;
   }
   ok("split: code fence closed/reopened across chunks, lines in order");
+
+  // A table that fits in one chunk is never split across messages, even
+  // when the preceding text fills the chunk.
+  const row = (tag: string, fill: number): string => `| ${tag} | ${"z".repeat(fill)} |`;
+  const table1 = ["| A | B |", "| --- | --- |", row("r1", 200), row("r2", 200), row("r3", 200)];
+  const text1 = ["p".repeat(1800), ...table1].join("\n");
+  const tblChunks = splitForDiscord(text1);
+  assert.ok(tblChunks.every((x) => x.length <= 2000));
+  const t1 = tblChunks.filter((c) => c.includes("| A | B |"));
+  assert.equal(t1.length, 1, "table header appears in exactly one chunk");
+  assert.ok(t1[0].includes(row("r3", 200)), "whole table in that chunk");
+  ok("split: table that fits in a chunk is kept whole");
+
+  // A table longer than one chunk is split row-wise, repeating the header.
+  const body = Array.from({ length: 30 }, (_, i) => row(`r${String(i).padStart(2, "0")}`, 120));
+  const text2 = ["| A | B |", "| --- | --- |", ...body].join("\n");
+  const bigChunks = splitForDiscord(text2);
+  assert.ok(bigChunks.length >= 2, "big table spans several chunks");
+  assert.ok(bigChunks.every((x) => x.length <= 2000));
+  for (const c of bigChunks) {
+    assert.ok(c.includes("| A | B |") && c.includes("| --- | --- |"), "each part repeats the header");
+  }
+  const flat = bigChunks.join("\n");
+  let lastBigIdx = -1;
+  for (const r of body) {
+    const i = flat.indexOf(r, lastBigIdx + 1);
+    assert.ok(i > lastBigIdx, `row out of order: ${r.slice(0, 20)}`);
+    lastBigIdx = i;
+  }
+  ok("split: oversized table splits row-wise with repeated header");
+
+  // Prose breaks prefer block boundaries (blank lines, headings, lists);
+  // the carried-over tail starts the next chunk without leading blanks.
+  const L = (ch: string, n: number): string => `${ch} ${ch.repeat(n)}`;
+  const text3 = [L("a", 40), "", L("b", 40), "", L("c", 40), "", L("d", 40)].join("\n");
+  const paraChunks = splitForDiscord(text3, 100);
+  assert.ok(paraChunks.every((x) => x.length <= 100));
+  assert.deepEqual(paraChunks, [
+    `${L("a", 40)}\n\n${L("b", 40)}`,
+    `${L("c", 40)}\n\n${L("d", 40)}`,
+  ]);
+  assert.equal(
+    paraChunks.join("\n").replace(/\n/g, ""),
+    text3.replace(/\n/g, ""),
+    "content preserved",
+  );
+  ok("split: prose breaks at block boundaries, no leading blank chunks");
+
+  // A heading right before a table stays with the table.
+  const text5 = ["q".repeat(1800), "", "Summary Table", "| A | B |", "| --- | --- |", row("x", 200)].join("\n");
+  const headChunks = splitForDiscord(text5);
+  assert.ok(headChunks.every((x) => x.length <= 2000));
+  assert.ok(headChunks.length >= 2);
+  const lastChunk = headChunks[headChunks.length - 1];
+  assert.ok(lastChunk.startsWith("Summary Table"), "heading carried into the table chunk");
+  assert.ok(lastChunk.includes("| A | B |") && lastChunk.includes(row("x", 200)), "table whole in same chunk");
+  ok("split: heading before a table stays with the table");
+
+  const sec = ["# H", "x".repeat(60), "", "y".repeat(60), "z".repeat(60)].join("\n");
+  const secChunks = splitForDiscord(sec, 100);
+  assert.ok(secChunks.every((x) => x.length <= 100));
+  assert.ok(secChunks[0].startsWith("# H") && secChunks[0].includes("x".repeat(60)), "heading keeps its paragraph");
+  assert.equal(secChunks.join("\n").replace(/\n/g, ""), sec.replace(/\n/g, ""), "content preserved");
+  ok("split: heading stays with its paragraph");
+}
+
+// --------------------------------------------------------------- format --
+{
+  // Non-math text (incl. prices) is untouched.
+  assert.equal(sanitizeForDiscord("plain text, no math"), "plain text, no math");
+  assert.equal(sanitizeForDiscord("costs $5 and $10 total"), "costs $5 and $10 total");
+  // Inline math -> Unicode.
+  assert.equal(sanitizeForDiscord("$\\uparrow$"), "↑");
+  assert.equal(sanitizeForDiscord("PGC-1$\\alpha$"), "PGC-1α");
+  assert.equal(sanitizeForDiscord("$\\text{H}^+$"), "H⁺");
+  assert.equal(sanitizeForDiscord("$\\text{VO}_2 \\text{max}$"), "VO₂ max");
+  assert.equal(sanitizeForDiscord("$a \\le b \\land c \\neq d$"), "a ≤ b ∧ c ≠ d");
+  assert.equal(sanitizeForDiscord("$x_1 + x_2$"), "x₁ + x₂");
+  assert.equal(sanitizeForDiscord("$\\frac{a}{b}$"), "a/b");
+  assert.equal(sanitizeForDiscord("$\\sqrt{x}$"), "√x");
+  // Display math and noise commands.
+  assert.equal(sanitizeForDiscord("$$\\text{VO}_2 = \\text{CO} \\times a$$"), "VO₂ = CO × a");
+  assert.equal(sanitizeForDiscord("$\\label{eq1} y$"), "y");
+  ok("format: LaTeX math converted to Unicode, non-math $ left alone");
 }
 
 // ----------------------------------------------------------------- queue --
@@ -399,6 +489,20 @@ const ok = (name: string): void => {
   assert.equal(p5!.text, "Final answer!");
   assert.deepEqual(p5!.messageIds, [msgs[1].id]);
   ok("writer: discard() deletes the transient preview, next round is fresh");
+
+  // LaTeX in model output is sanitized before posting (and in the history).
+  const f = makeChannel();
+  const w6 = new ResponseWriter({
+    channel: f.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w6.start();
+  const p6 = await w6.finish("The rate goes $\\uparrow$ and $\\text{H}^+$ matters");
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0], "The rate goes ↑ and H⁺ matters");
+  assert.equal(p6!.text, "The rate goes ↑ and H⁺ matters", "history records the sanitized text");
+  ok("writer: LaTeX sanitized before posting and recording");
 }
 
 // -------------------------------------------------------------- executor --

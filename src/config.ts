@@ -58,6 +58,8 @@ export interface ToolsConfig {
   file: FileToolsConfig;
   /** Max tool-execution rounds per turn before the turn is cut off. */
   maxRounds: number;
+  /** Hard cap on characters in one tool result (both families). */
+  maxResultChars: number;
 }
 
 export interface Config {
@@ -176,6 +178,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
         lineMaxChars: intEnv("FILETOOLS_LINE_MAX_CHARS", 500, 20),
       },
       maxRounds: intEnv("TOOLS_MAX_ROUNDS", 5, 1),
+      maxResultChars: intEnv("TOOLS_MAX_RESULT_CHARS", 200_000, 1_000),
     },
   };
 
