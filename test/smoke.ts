@@ -1,8 +1,8 @@
 /**
  * Smoke tests: config parsing, history window, code-fence-aware chunk
- * splitting, queue semantics, response writer behavior, and the LLM client
- * (stream + non-stream + errors) against a local mock OpenAI-compatible
- * server. Run with: npm test
+ * splitting, queue semantics, response writer behavior, the tool executor
+ * and tool loop, and the LLM client (stream + non-stream + tool calls +
+ * errors) against a local mock OpenAI-compatible server. Run with: npm test
  */
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -10,9 +10,11 @@ import type { AddressInfo } from "node:net";
 import type { GuildTextBasedChannel } from "discord.js";
 import { parseConfig } from "../src/config.js";
 import { ChannelHistory, toRequestMessages } from "../src/llm/history.js";
-import { LlmClient } from "../src/llm/client.js";
+import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
 import { ChannelQueue } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
+import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
+import { runToolTurn } from "../src/tools/loop.js";
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 const ticks = async (n: number): Promise<void> => {
@@ -56,6 +58,49 @@ const ok = (name: string): void => {
   });
   assert.ok(badErrors.length >= 4, `expected >= 4 errors, got ${badErrors.length}`);
   ok("config: reports missing/invalid values");
+
+  const { config: tc, errors: te } = parseConfig({
+    DISCORD_TOKEN: "t",
+    DISCORD_GUILD_ID: "g",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    WEBTOOLS_ENABLED: "true",
+    WEBTOOLS_BASE_URL: "http://127.0.0.1:9999",
+    WEBTOOLS_TIMEOUT_S: "12",
+    FILETOOLS_ENABLED: "true",
+    FILETOOLS_TIMEOUT_S: "5",
+    TOOLS_MAX_ROUNDS: "7",
+  });
+  assert.deepEqual(te, []);
+  assert.equal(tc.tools.web.enabled, true);
+  assert.equal(tc.tools.web.baseUrl, "http://127.0.0.1:9999");
+  assert.equal(tc.tools.web.timeoutMs, 12000);
+  assert.equal(tc.tools.file.enabled, true);
+  assert.equal(tc.tools.file.baseUrl, "http://127.0.0.1:8378"); // default
+  assert.equal(tc.tools.file.timeoutMs, 5000);
+  assert.equal(tc.tools.maxRounds, 7);
+  ok("config: tools section parses env and applies defaults");
+
+  const { config: td } = parseConfig({
+    DISCORD_TOKEN: "t",
+    DISCORD_GUILD_ID: "g",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+  });
+  assert.equal(td.tools.web.enabled, false, "web tools off by default");
+  assert.equal(td.tools.file.enabled, false, "file tools off by default");
+  assert.equal(td.tools.web.baseUrl, "http://127.0.0.1:8377");
+  assert.equal(td.tools.maxRounds, 5);
+  ok("config: tools disabled by default");
+
+  const { errors: toolErrs } = parseConfig({
+    DISCORD_TOKEN: "t",
+    DISCORD_GUILD_ID: "g",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    WEBTOOLS_BASE_URL: "ftp://nope",
+    TOOLS_MAX_ROUNDS: "0",
+  });
+  assert.ok(toolErrs.some((e) => e.includes("WEBTOOLS_BASE_URL")), `got: ${toolErrs.join("; ")}`);
+  assert.ok(toolErrs.some((e) => e.includes("TOOLS_MAX_ROUNDS")), `got: ${toolErrs.join("; ")}`);
+  ok("config: invalid tool env values rejected");
 }
 
 // --------------------------------------------------------------- history --
@@ -290,6 +335,175 @@ const ok = (name: string): void => {
   assert.match(d.getLive()!.content, /generation failed/);
   assert.equal(p4!.messageIds.length, 1, "the error note is recorded in history too");
   ok("writer: error keeps partial text + note");
+
+  // discard(): a tool-call round's streamed preview is deleted, and the
+  // next round streams a fresh live message
+  const msgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const dchan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (content: string) => {
+      const m = { id: `w${String(msgs.length)}`, content, deleted: false };
+      msgs.push(m);
+      return {
+        id: m.id,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const w5 = new ResponseWriter({
+    channel: dchan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w5.start();
+  w5.chunk("transient");
+  await ticks(2);
+  w5.discard();
+  await ticks(3);
+  assert.equal(msgs.length, 1, "preview message created");
+  assert.equal(msgs[0].deleted, true, "preview deleted on discard");
+  w5.chunk("Final answer!");
+  await ticks(2);
+  const p5 = await w5.finish("Final answer!");
+  assert.equal(msgs.length, 2, "next round streams a fresh live message");
+  assert.equal(msgs[1].deleted, false);
+  assert.equal(msgs[1].content, "Final answer!");
+  assert.equal(p5!.text, "Final answer!");
+  assert.deepEqual(p5!.messageIds, [msgs[1].id]);
+  ok("writer: discard() deletes the transient preview, next round is fresh");
+}
+
+// -------------------------------------------------------------- executor --
+{
+  assert.deepEqual(parseToolArgs(""), {});
+  assert.deepEqual(parseToolArgs(' {"a": 1} '), { a: 1 });
+  assert.throws(() => parseToolArgs("not json"), /not valid JSON/);
+  assert.throws(() => parseToolArgs("[1,2]"), /JSON object/);
+  assert.equal(argString({ q: " hi " }, "q"), "hi");
+  assert.throws(() => argString({}, "q"), /missing required/);
+  assert.equal(argOptionalString({ p: "x" }, "p"), "x");
+  assert.equal(argOptionalString({}, "p"), undefined);
+  assert.equal(argInt({ n: 99 }, "n", 5, 1, 10), 10, "clamped to max");
+  assert.equal(argInt({}, "n", 5, 1, 10), 5, "default");
+  assert.throws(() => argInt({ n: "x" }, "n", 5, 1, 10), /integer/);
+  ok("executor: arg parsing and clamping");
+
+  const order: string[] = [];
+  const registry = new ToolRegistry()
+    .register(
+      { name: "echo", description: "", parameters: {} },
+      async (args) => {
+        order.push("start");
+        await ticks(2);
+        order.push("end");
+        return `echo:${JSON.stringify(args)}`;
+      },
+    )
+    .register({ name: "boom", description: "", parameters: {} }, async () => {
+      throw new Error("kaboom");
+    });
+  assert.equal(registry.size, 2);
+  assert.deepEqual(registry.specs().map((s) => s.name), ["echo", "boom"]);
+  assert.throws(
+    () => registry.register({ name: "echo", description: "", parameters: {} }, async () => ""),
+    /already registered/,
+  );
+  ok("executor: registry holds specs and rejects duplicates");
+
+  const results = await executeToolCalls(registry, [
+    { id: "c1", name: "echo", arguments: '{"x": 1}' },
+    { id: "c2", name: "nope", arguments: "{}" },
+    { id: "c3", name: "echo", arguments: "broken{" },
+    { id: "c4", name: "boom", arguments: "{}" },
+  ]);
+  assert.deepEqual(results.map((r) => r.toolCallId), ["c1", "c2", "c3", "c4"], "order preserved");
+  assert.equal(results[0].role, "tool");
+  assert.equal(results[0].name, "echo");
+  assert.equal(results[0].content, 'echo:{"x":1}');
+  assert.match(results[1].content, /unknown tool "nope"/);
+  assert.match(results[2].content, /not valid JSON/);
+  assert.match(results[3].content, /kaboom/);
+  ok("executor: unknown tools and bad args become Error results, order kept");
+
+  order.length = 0;
+  await executeToolCalls(registry, [
+    { id: "a", name: "echo", arguments: "{}" },
+    { id: "b", name: "echo", arguments: "{}" },
+  ]);
+  assert.deepEqual(order, ["start", "start", "end", "end"], "calls run concurrently");
+  ok("executor: tool calls run concurrently");
+}
+
+// ------------------------------------------------------------------- loop --
+{
+  const registry = new ToolRegistry().register(
+    { name: "echo", description: "", parameters: {} },
+    async (args: Record<string, unknown>) => `echo:${JSON.stringify(args)}`,
+  );
+
+  // two rounds: a tool call, then the final answer
+  const script: ChatResult[] = [
+    { content: "", toolCalls: [{ id: "t1", name: "echo", arguments: '{"x":"y"}' }] },
+    { content: "final answer", toolCalls: [] },
+  ];
+  let i = 0;
+  const specsSeen: Array<unknown> = [];
+  const messages: ChatMessage[] = [{ role: "user", content: "go" }];
+  const out = await runToolTurn(messages, {
+    chat: async (_msgs, _d, tools) => {
+      specsSeen.push(tools);
+      return script[i++];
+    },
+    registry,
+    maxRounds: 3,
+  });
+  assert.equal(out.content, "final answer");
+  assert.equal(out.toolRounds, 1);
+  assert.equal(out.exhausted, false);
+  assert.equal(specsSeen.length, 2);
+  assert.ok(Array.isArray(specsSeen[0]) && (specsSeen[0] as unknown[]).length === 1, "specs sent while tools registered");
+  const last = messages[messages.length - 1];
+  assert.equal(last.role, "tool");
+  assert.equal(last.toolCallId, "t1");
+  assert.equal(last.content, 'echo:{"x":"y"}');
+  const prev = messages[messages.length - 2];
+  assert.equal(prev.role, "assistant");
+  assert.deepEqual(prev.toolCalls, script[0].toolCalls);
+  ok("loop: tool round executed, results appended, final answer returned");
+
+  // budget exhausted: the model keeps requesting tools
+  let toolRoundSignals = 0;
+  const out2 = await runToolTurn([{ role: "user", content: "go" }], {
+    chat: async () => ({ content: "", toolCalls: [{ id: "t", name: "echo", arguments: "{}" }] }),
+    registry,
+    maxRounds: 2,
+    onToolRound: () => toolRoundSignals++,
+  });
+  assert.equal(out2.exhausted, true);
+  assert.equal(out2.toolRounds, 2);
+  assert.equal(toolRoundSignals, 3, "onToolRound fires for every tool-call response, incl. the cutoff");
+  ok("loop: maxRounds cutoff reported as exhausted");
+
+  // empty registry: plain chat, no tools argument
+  let gotTools: unknown = "unset";
+  const out3 = await runToolTurn([{ role: "user", content: "hi" }], {
+    chat: async (_m, _d, tools) => {
+      gotTools = tools;
+      return { content: "hi", toolCalls: [] };
+    },
+    registry: new ToolRegistry(),
+    maxRounds: 1,
+  });
+  assert.equal(out3.content, "hi");
+  assert.equal(gotTools, undefined, "no tools argument when the registry is empty");
+  ok("loop: empty registry means a plain chat");
 }
 
 // ------------------------------------------------------------------- llm --
@@ -333,6 +547,59 @@ const ok = (name: string): void => {
         res.end(JSON.stringify({ choices: [{ message: { content: "non-stream reply" } }] }));
         return;
       }
+      if (url.includes("toolstream")) {
+        // Two tool calls streamed as fragments: first chunk carries ids +
+        // names + argument heads, the second chunk carries argument tails
+        // (and NO id/name — the reassembly must not drop those).
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "Let me search." } }] })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: "call_1", function: { name: "web_search", arguments: '{"qu' } },
+                    { index: 1, id: "call_2", function: { name: "web_fetch", arguments: '{"url' } },
+                  ],
+                },
+              },
+            ],
+          })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, function: { arguments: 'ery": "cats"}' } },
+                    { index: 1, function: { arguments: '": "http://example.com"}' } },
+                  ],
+                },
+              },
+            ],
+          })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+      if (url.includes("tooljson")) {
+        // Non-stream: whole tool_calls, arguments as a JSON object (not a string).
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: "",
+                  tool_calls: [{ id: "call_3", type: "function", function: { name: "web_fetch", arguments: { url: "http://example.com" } } }],
+                },
+              },
+            ],
+          }),
+        );
+        return;
+      }
       // default: SSE stream with noise lines mixed in
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       res.write(": keep-alive\n\n");
@@ -357,7 +624,8 @@ const ok = (name: string): void => {
     timeoutMs: 5000,
   });
   const full = await streamClient.chat([{ role: "user", content: "hi" }], (d) => deltas.push(d));
-  assert.equal(full, "Hello world");
+  assert.equal(full.content, "Hello world");
+  assert.deepEqual(full.toolCalls, []);
   assert.deepEqual(deltas, ["Hel", "lo ", "world"]);
   const r0 = seenRequests[0];
   assert.equal(r0.auth, "Bearer none");
@@ -377,7 +645,7 @@ const ok = (name: string): void => {
     timeoutMs: 5000,
   });
   const ns = await nsClient.chat([{ role: "user", content: "hi" }]);
-  assert.equal(ns, "non-stream reply");
+  assert.equal(ns.content, "non-stream reply");
   assert.deepEqual(seenRequests.at(-1)!.body, {
     model: "m",
     messages: [{ role: "user", content: "hi" }],
@@ -435,6 +703,59 @@ const ok = (name: string): void => {
     /could not reach model endpoint/,
   );
   ok("llm: connection refused reported honestly");
+
+  // tool calls: streamed fragments reassembled by index; tools on the wire;
+  // assistant+tool messages serialized to the OpenAI wire shape
+  const toolClient = new LlmClient({
+    apiUrl: `${base}/v1/toolstream`,
+    apiKey: "none",
+    model: "local",
+    stream: true,
+    timeoutMs: 5000,
+  });
+  const toolRes = await toolClient.chat(
+    [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "", toolCalls: [{ id: "call_1", name: "web_search", arguments: '{"query":"cats"}' }] },
+      { role: "tool", toolCallId: "call_1", name: "web_search", content: "results" },
+    ],
+    undefined,
+    [{ name: "web_search", description: "search the web", parameters: { type: "object" } }],
+  );
+  assert.equal(toolRes.content, "Let me search.");
+  assert.deepEqual(toolRes.toolCalls, [
+    { id: "call_1", name: "web_search", arguments: '{"query": "cats"}' },
+    { id: "call_2", name: "web_fetch", arguments: '{"url": "http://example.com"}' },
+  ]);
+  const toolBody = seenRequests.at(-1)!.body as Record<string, unknown>;
+  const toolsWire = toolBody.tools as Array<Record<string, unknown>>;
+  assert.equal(toolsWire.length, 1, "tools array sent");
+  assert.equal(toolsWire[0].type, "function");
+  assert.equal((toolsWire[0].function as Record<string, unknown>).name, "web_search");
+  assert.equal(toolBody.tool_choice, "auto");
+  const wireMsgs = toolBody.messages as Array<Record<string, unknown>>;
+  assert.equal(wireMsgs[1].role, "assistant");
+  const wireTcs = wireMsgs[1].tool_calls as Array<Record<string, unknown>>;
+  assert.equal(wireTcs[0].id, "call_1");
+  assert.equal(wireTcs[0].type, "function");
+  assert.equal((wireTcs[0].function as Record<string, unknown>).arguments, '{"query":"cats"}');
+  assert.equal(wireMsgs[2].role, "tool");
+  assert.equal(wireMsgs[2].tool_call_id, "call_1");
+  assert.equal(wireMsgs[2].content, "results");
+  ok("llm: streamed tool-call fragments reassembled, tools + wire shapes correct");
+
+  const toolNs = await new LlmClient({
+    apiUrl: `${base}/v1/tooljson`,
+    apiKey: "none",
+    model: "m",
+    stream: false,
+    timeoutMs: 5000,
+  }).chat([]);
+  assert.equal(toolNs.content, "");
+  assert.deepEqual(toolNs.toolCalls, [
+    { id: "call_3", name: "web_fetch", arguments: '{"url":"http://example.com"}' },
+  ]);
+  ok("llm: non-stream tool_calls normalized (object args stringified)");
 
   server.close();
 }
