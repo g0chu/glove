@@ -1,11 +1,15 @@
 /**
  * Smoke tests: config parsing, history window, code-fence-aware chunk
  * splitting, queue semantics, response writer behavior, the tool executor
- * and tool loop, and the LLM client (stream + non-stream + tool calls +
- * errors) against a local mock OpenAI-compatible server. Run with: npm test
+ * and tool loop, the in-process web/file tools, and the LLM client
+ * (stream + non-stream + tool calls + errors) against a local mock
+ * OpenAI-compatible server. Run with: npm test
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import type { AddressInfo } from "node:net";
 import type { GuildTextBasedChannel } from "discord.js";
 import { parseConfig } from "../src/config.js";
@@ -15,6 +19,12 @@ import { ChannelQueue } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
+import { resolveUrl } from "../src/tools/web/ssrf.js";
+import { FetchCache } from "../src/tools/web/cache.js";
+import { extractTitle, extractContent } from "../src/tools/web/extract.js";
+import { searchDuckDuckGo } from "../src/tools/web/search.js";
+import { resolveInWorkspace } from "../src/tools/file/paths.js";
+import * as fileOps from "../src/tools/file/ops.js";
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 const ticks = async (n: number): Promise<void> => {
@@ -71,7 +81,8 @@ const ok = (name: string): void => {
     WEBTOOLS_CACHE_MAX_ENTRIES: "4",
     WEBTOOLS_SEARCH_MAX_RESULTS: "3",
     FILETOOLS_ENABLED: "true",
-    FILETOOLS_TIMEOUT_S: "5",
+    FILETOOLS_WORKSPACE: "/tmp/ws",
+    FILETOOLS_READ_MAX_BYTES: "4096",
     TOOLS_MAX_ROUNDS: "7",
   });
   assert.deepEqual(te, []);
@@ -83,8 +94,9 @@ const ok = (name: string): void => {
   assert.equal(tc.tools.web.cacheMaxEntries, 4);
   assert.equal(tc.tools.web.searchMaxResults, 3);
   assert.equal(tc.tools.file.enabled, true);
-  assert.equal(tc.tools.file.baseUrl, "http://127.0.0.1:8378"); // default
-  assert.equal(tc.tools.file.timeoutMs, 5000);
+  assert.equal(tc.tools.file.workspace, "/tmp/ws");
+  assert.equal(tc.tools.file.readMaxBytes, 4096);
+  assert.equal(tc.tools.file.listMaxEntries, 500); // default
   assert.equal(tc.tools.maxRounds, 7);
   ok("config: tools section parses env and applies defaults");
 
@@ -95,7 +107,7 @@ const ok = (name: string): void => {
   });
   assert.equal(td.tools.web.enabled, false, "web tools off by default");
   assert.equal(td.tools.file.enabled, false, "file tools off by default");
-  assert.equal(td.tools.file.baseUrl, "http://127.0.0.1:8378");
+  assert.equal(td.tools.file.workspace, "./workspace");
   assert.equal(td.tools.web.searchMaxResults, 10); // default
   assert.equal(td.tools.maxRounds, 5);
   ok("config: tools disabled by default");
@@ -513,6 +525,245 @@ const ok = (name: string): void => {
   assert.equal(out3.content, "hi");
   assert.equal(gotTools, undefined, "no tools argument when the registry is empty");
   ok("loop: empty registry means a plain chat");
+}
+
+// ------------------------------------------------------------ web tools --
+// The in-process web tools used to be tested in the Python sidecar smoke
+// suite; these groups pin the TS port.
+{
+  const fakeResolver =
+    (addrs: string | string[]): ((host: string, port: number) => Promise<string[]>) =>
+    async (_host: string, _port: number): Promise<string[]> => (Array.isArray(addrs) ? addrs : [addrs]);
+
+  const pub = await resolveUrl("http://example.com/a?b=1", { resolver: fakeResolver("93.184.216.34") });
+  assert.equal(pub.ip, "93.184.216.34");
+  assert.equal(pub.port, 80);
+  assert.equal(pub.path, "/a?b=1");
+  const pubPort = await resolveUrl("http://example.com:8080/x", { resolver: fakeResolver("203.0.113.7") });
+  assert.equal(pubPort.port, 8080);
+  const https = await resolveUrl("https://example.com", { resolver: fakeResolver("2001:4860:4860::8888") });
+  assert.equal(https.scheme, "https");
+  assert.equal(https.port, 443);
+  assert.equal(https.path, "/");
+  ok("ssrf: public hosts pinned, scheme/port/path preserved");
+
+  const blocked: Array<[string, string[]]> = [
+    ["http://127.0.0.1/", ["127.0.0.1"]],
+    ["http://10.1.2.3/", ["10.1.2.3"]],
+    ["http://172.16.0.9/", ["172.16.0.9"]],
+    ["http://192.168.0.9/", ["192.168.0.9"]],
+    ["http://169.254.169.254/latest/meta-data/", ["169.254.169.254"]],
+    ["http://100.64.1.2/", ["100.64.1.2"]],
+    ["http://[::1]/", ["::1"]],
+    ["http://[fe80::1]/", ["fe80::1"]],
+    ["http://[fd12::1]/", ["fd12::1"]],
+    ["http://[::ffff:10.0.0.1]/", ["::ffff:10.0.0.1"]],
+  ];
+  for (const [url, addrs] of blocked) {
+    await assert.rejects(resolveUrl(url, { resolver: fakeResolver(addrs) }), /blocked/i);
+  }
+  ok("ssrf: loopback/RFC1918/link-local/CGNAT/ULA and mapped-v4 blocked");
+
+  await assert.rejects(
+    resolveUrl("http://example.com/", { resolver: fakeResolver(["93.184.216.34", "10.0.0.8"]) }),
+    /blocked/i,
+  );
+  ok("ssrf: mixed public/private records refused (strict)");
+
+  const priv = await resolveUrl("http://127.0.0.1:9/", { allowPrivate: true, resolver: fakeResolver("127.0.0.1") });
+  assert.equal(priv.port, 9);
+  ok("ssrf: allowPrivate escape hatch");
+
+  await assert.rejects(resolveUrl("ftp://example.com/", { resolver: fakeResolver("93.184.216.34") }), /scheme/i);
+  await assert.rejects(resolveUrl("http://user:pw@example.com/", { resolver: fakeResolver("93.184.216.34") }), /credential/i);
+  await assert.rejects(resolveUrl("http://nope.invalid/", { resolver: async () => { throw new Error("boom"); } }), /could not resolve/i);
+  await assert.rejects(resolveUrl("not a url", {}), /invalid URL/i);
+  ok("ssrf: bad scheme/credentials/resolve failures rejected");
+
+  let now = 1_000;
+  const cache = new FetchCache<string>(100, 2, () => now);
+  cache.put("a", "1");
+  assert.equal(cache.get("a"), "1");
+  now = 1_099;
+  assert.equal(cache.get("a"), "1");
+  now = 1_101;
+  assert.equal(cache.get("a"), null);
+  cache.put("a", "1");
+  cache.put("b", "2");
+  cache.put("c", "3");
+  assert.equal(cache.get("a"), null); // evicted: oldest entry
+  assert.equal(cache.get("b"), "2");
+  assert.equal(cache.get("c"), "3");
+  ok("cache: TTL expiry and oldest-first eviction");
+
+  const html =
+    "<!doctype html><html><head><title>  My Page  </title><script>var x=1;</script></head>" +
+    "<body><nav>menu</nav><article><h1>Head</h1><p>First paragraph.</p><pre>  keep  spaces  </pre></article><footer>foot</footer></body></html>";
+  assert.equal(extractTitle(html), "My Page");
+  const content = extractContent(html);
+  assert.ok(content.includes("First paragraph."), content);
+  assert.ok(content.includes("keep  spaces"), "pre whitespace preserved");
+  assert.ok(!content.includes("menu"), "nav dropped");
+  assert.ok(!content.includes("foot"), "footer dropped");
+  assert.ok(!content.includes("var x=1;"), "script dropped");
+  assert.equal(extractTitle("<html><body>t</body></html>"), "");
+  assert.equal(extractContent(""), "");
+  ok("extract: title and main content, noise and scripts dropped");
+
+  const ddg = (_q: string): Promise<Response> =>
+    Promise.resolve(
+      new Response(
+        "<!doctype html><html><body>" +
+          '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa">A</a>' +
+          '<a class="result__snippet" href="#">Snippet A</a>' +
+          '<a class="result__a" href="https://example.com/b">B</a>' +
+          "</body></html>",
+      ),
+    );
+  const results = await searchDuckDuckGo("cats", 10, { fetchImpl: ddg, timeoutMs: 1000 });
+  assert.equal(results.length, 2);
+  assert.equal(results[0].url, "https://example.com/a");
+  assert.equal(results[0].snippet, "Snippet A");
+  assert.equal(results[1].url, "https://example.com/b");
+  assert.equal(results[1].snippet, "");
+  const capped = await searchDuckDuckGo("cats", 1, { fetchImpl: ddg, timeoutMs: 1000 });
+  assert.equal(capped.length, 1);
+  await assert.rejects(
+    searchDuckDuckGo("cats", 5, { fetchImpl: async () => new Response("nope", { status: 503 }), timeoutMs: 1000 }),
+    /HTTP 503/,
+  );
+  await assert.rejects(searchDuckDuckGo("  ", 5, { fetchImpl: ddg, timeoutMs: 1000 }), /must not be empty/i);
+  ok("web search: DDG rows normalized, redirect links unwrapped, capped, errors");
+}
+
+// ------------------------------------------------------------ file tools --
+// In-process file tools (path confinement + operations) ported from the
+// removed Python sidecar; these groups pin the TS port.
+{
+  const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "glove-filetest-")));
+  const outside = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "glove-outside-")));
+  try {
+    // -- confinement
+    fs.mkdirSync(path.join(ws, "sub"));
+    const fileInSub = path.join(ws, "sub", "a.txt");
+    fs.writeFileSync(fileInSub, "hello");
+    assert.equal(resolveInWorkspace(ws, "sub/a.txt"), fileInSub);
+    assert.equal(resolveInWorkspace(ws, "/sub/a.txt"), fileInSub);
+    assert.equal(resolveInWorkspace(ws, undefined), ws);
+    assert.equal(resolveInWorkspace(ws, "."), ws);
+    assert.throws(() => resolveInWorkspace(ws, "../outside"), /escapes/);
+    assert.throws(() => resolveInWorkspace(ws, "sub/../../outside"), /escapes/);
+    fs.writeFileSync(path.join(outside, "secret.txt"), "s");
+    fs.symlinkSync(outside, path.join(ws, "link"));
+    assert.throws(() => resolveInWorkspace(ws, "link/secret.txt"), /escapes/);
+    fs.symlinkSync(fileInSub, path.join(ws, "sub", "alias.txt"));
+    assert.equal(resolveInWorkspace(ws, "sub/alias.txt"), fileInSub);
+    ok("file paths: traversal and symlink escapes rejected, inner symlinks ok");
+
+    const ops: fileOps.FileOpsOptions = {
+      readMaxBytes: 1000,
+      writeMaxBytes: 10,
+      listMaxEntries: 100,
+      searchMaxResults: 500,
+      searchMaxFiles: 10_000,
+      searchMaxFileBytes: 100_000,
+      lineMaxChars: 500,
+    };
+
+    // -- write
+    const w1 = await fileOps.writeFile(ws, "notes/a.txt", "hello\n", true, ops.writeMaxBytes);
+    assert.equal(w1.bytesWritten, 6);
+    await assert.rejects(fileOps.writeFile(ws, "no/dirs/x.txt", "x", false, 10), /does not exist/);
+    await assert.rejects(fileOps.writeFile(ws, "notes/a.txt", "x".repeat(11), true, 10), /write cap/);
+    await assert.rejects(fileOps.writeFile(ws, "notes", "x", true, 10), /overwrite a directory/);
+    ok("file write: create_dirs, cap, directory guard");
+
+    // -- list
+    fs.writeFileSync(path.join(ws, "top.txt"), "top");
+    const listing = await fileOps.listFiles(ws, undefined, ops.listMaxEntries);
+    assert.equal(listing.path, ".");
+    assert.deepEqual(
+      listing.entries.map((e) => `${e.name}:${e.type}`),
+      ["link:dir", "notes:dir", "sub:dir", "top.txt:file"],
+    );
+    const noteListing = await fileOps.listFiles(ws, "notes", ops.listMaxEntries);
+    assert.equal(noteListing.path, "notes");
+    assert.equal(noteListing.entries.length, 1);
+    assert.equal(noteListing.entries[0].name, "a.txt");
+    assert.ok(typeof noteListing.entries[0].size === "number");
+    assert.ok(noteListing.entries[0].mtime?.includes("UTC") ?? false);
+    await assert.rejects(fileOps.listFiles(ws, "notes/a.txt", ops.listMaxEntries), /not a directory/);
+    await assert.rejects(fileOps.listFiles(ws, "missing", ops.listMaxEntries), /not a directory/);
+    ok("file list: dirs-first, size/mtime, path display, errors");
+
+    // -- read
+    fs.writeFileSync(path.join(ws, "big.txt"), "abcdef");
+    const r1 = await fileOps.readFile(ws, "big.txt", 0, 2, ops.readMaxBytes);
+    assert.equal(r1.content, "ab");
+    assert.equal(r1.bytesRead, 2);
+    assert.ok(r1.truncated);
+    const r2 = await fileOps.readFile(ws, "big.txt", 4, undefined, ops.readMaxBytes);
+    assert.equal(r2.content, "ef");
+    assert.ok(!r2.truncated);
+    await assert.rejects(fileOps.readFile(ws, "big.txt", 7, undefined, 100), /past the end/);
+    fs.writeFileSync(path.join(ws, "bin.dat"), Buffer.from([0, 1, 2]));
+    await assert.rejects(fileOps.readFile(ws, "bin.dat", 0, undefined, 100), /binary/);
+    await assert.rejects(fileOps.readFile(ws, "notes", 0, undefined, 100), /not a file/);
+    await assert.rejects(fileOps.readFile(ws, "missing.txt", 0, undefined, 100), /not a file/);
+    ok("file read: windows, truncation, binary refusal, errors");
+
+    // -- edit
+    fs.writeFileSync(path.join(ws, "e.txt"), "aXbXcXa");
+    const eAll = await fileOps.editFile(ws, "e.txt", "X", "Y", true);
+    assert.equal(eAll.replacements, 3);
+    assert.equal(fs.readFileSync(path.join(ws, "e.txt"), "utf8"), "aYbYcYa");
+    const eFirst = await fileOps.editFile(ws, "e.txt", "Y", "Z", false);
+    assert.equal(eFirst.replacements, 1);
+    assert.equal(fs.readFileSync(path.join(ws, "e.txt"), "utf8"), "aZbYcYa");
+    await assert.rejects(fileOps.editFile(ws, "e.txt", "", "x", false), /must not be empty/);
+    await assert.rejects(fileOps.editFile(ws, "e.txt", "nope", "x", false), /not found/);
+    fs.writeFileSync(path.join(ws, "bad.txt"), Buffer.from([0xff, 0xfe, 0xfd]));
+    await assert.rejects(fileOps.editFile(ws, "bad.txt", "x", "y", false), /not valid UTF-8/);
+    await assert.rejects(fileOps.editFile(ws, "missing.txt", "x", "y", false), /not a file/);
+    ok("file edit: exact span, replace_all, empty new_text, errors");
+
+    // -- delete
+    fs.writeFileSync(path.join(ws, "del.txt"), "x");
+    assert.equal((await fileOps.deletePath(ws, "del.txt")).deleted, "file");
+    fs.mkdirSync(path.join(ws, "tree"));
+    fs.writeFileSync(path.join(ws, "tree", "f.txt"), "x");
+    assert.equal((await fileOps.deletePath(ws, "tree")).deleted, "dir");
+    assert.ok(!fs.existsSync(path.join(ws, "tree")));
+    await assert.rejects(fileOps.deletePath(ws, ""), /workspace root/);
+    await assert.rejects(fileOps.deletePath(ws, "nope"), /not found/);
+    ok("file delete: file, directory tree, root guard, errors");
+
+    // -- search
+    fs.writeFileSync(path.join(ws, "s1.txt"), "alpha\nbeta alpha\n");
+    fs.mkdirSync(path.join(ws, "sdir"));
+    fs.writeFileSync(path.join(ws, "sdir", "s2.txt"), "alpha gamma\n");
+    const found = await fileOps.searchFiles(ws, undefined, "alpha", false, 100, ops);
+    assert.deepEqual(
+      found.matches.map((m) => `${m.file}:${m.line}`),
+      ["s1.txt:1", "s1.txt:2", "sdir/s2.txt:1"],
+    );
+    const literal = await fileOps.searchFiles(ws, undefined, "a.l+", true, 100, ops);
+    assert.equal(literal.matches.length, 0); // literal: no regex metachars
+    const anchored = await fileOps.searchFiles(ws, undefined, "^alpha", false, 100, ops);
+    assert.deepEqual(
+      anchored.matches.map((m) => `${m.file}:${m.line}`),
+      ["s1.txt:1", "sdir/s2.txt:1"],
+    );
+    const cappedResults = await fileOps.searchFiles(ws, undefined, "alpha", false, 2, ops);
+    assert.equal(cappedResults.matches.length, 2);
+    assert.ok(cappedResults.truncated);
+    await assert.rejects(fileOps.searchFiles(ws, undefined, "[", false, 10, ops), /invalid regular expression/);
+    await assert.rejects(fileOps.searchFiles(ws, "s1.txt", "alpha", false, 10, ops), /not a directory/);
+    ok("file search: walk order, literal vs regex, capping, invalid pattern");
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
 }
 
 // ------------------------------------------------------------------- llm --

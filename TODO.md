@@ -1,10 +1,13 @@
 # TODO — web search/fetch + file tools
 
-Snapshot: bot side **and** the Python sidecar are implemented and tested
-(`npm test` 35 groups, `tools/test/smoke.py` 27 groups, `npm run typecheck`).
-Docker build/up + live checks and the commit remain.
+Snapshot (updated after the in-process migration): both tool families now
+run **in-process in the bot** — `src/tools/web/` (ssrf, fetcher, extract,
+search, cache) and `src/tools/file/` (paths, ops). The Python sidecar
+(`tools/`) and `docker-compose.yml` were removed; no Docker anywhere.
+`npm test` (50 check groups) + `npm run typecheck` are green; the migration
+is committed.
 
-## Done
+## Done (original sidecar migration — historical; the sidecar was later removed)
 
 - [x] Bot side (`src/`): `llm/client.ts` tool calls (streamed fragment
       reassembly, `tools`/`tool_choice` on the wire), `tools/executor.ts`
@@ -31,25 +34,18 @@ Docker build/up + live checks and the commit remain.
 
 ## Remaining
 
-### 1. Live verification (needs Docker)
+### Live verification (no Docker needed)
 
-- [ ] `docker compose build`
-- [ ] `docker compose up -d webtools` and `docker compose --profile files up -d`
-- [ ] Live curl checks: `/health` on both, `/search` (real DDG), `/fetch`
-      (real page; verify markdown + browser fallback), file round-trip
-      through `./workspace`, persistence across container restart
-- [ ] End-to-end: enable `WEBTOOLS_ENABLED`/`FILETOOLS_ENABLED` in `.env`,
-      mention the bot, verify multi-round tool turns, transient-preview
+- [ ] Enable `WEBTOOLS_ENABLED`/`FILETOOLS_ENABLED` in `.env`, restart the
+      bot, mention it, and verify multi-round tool turns, transient-preview
       deletion, and the exhaustion note
-
-### 2. Finish
-
-- [ ] Commit (bot side / sidecar as separate commits, or one) — awaiting call
+- [ ] Verify `./workspace` round-trips (write/edit/search/delete) and
+      persists across bot restarts
 
 ## Open notes
 
 - llama.cpp only speaks tools with a function-calling chat template — if the
   endpoint rejects `tools`, keep `WEBTOOLS_ENABLED`/`FILETOOLS_ENABLED` off.
-- Browser path can't pin DNS (Chromium resolves itself); pre-validation only.
-  Documented residual, fine for a single-user bot.
+- `web_fetch` has no browser rendering (JavaScript-heavy pages may come back
+  incomplete) by design.
 - `file_edit` allows empty `new_text` (deleting a span) by design.

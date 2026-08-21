@@ -1,6 +1,6 @@
 import type { Config } from "../config.js";
 import { ToolRegistry } from "./executor.js";
-import { FileToolsClient, registerFileTools } from "./filetools.js";
+import { FileTools, registerFileTools } from "./filetools.js";
 import { WebTools, registerWebTools } from "./webtools.js";
 
 /** Everything abortable the tool stack owns (wired into shutdown). */
@@ -11,9 +11,9 @@ export interface ToolsSetup {
 
 /**
  * Build the tool registry from config. A family is registered only when
- * enabled (the file family's sidecar container must be running, and the
- * model endpoint must support function calling). With nothing enabled the
- * registry is empty and the model is called exactly as before.
+ * enabled (and the model endpoint must support function calling). With
+ * nothing enabled the registry is empty and the model is called exactly as
+ * before.
  */
 export function buildTools(cfg: Config): ToolsSetup {
   const registry = new ToolRegistry();
@@ -31,9 +31,18 @@ export function buildTools(cfg: Config): ToolsSetup {
     registerWebTools(registry, web);
   }
   if (cfg.tools.file.enabled) {
-    const client = new FileToolsClient({ baseUrl: cfg.tools.file.baseUrl, timeoutMs: cfg.tools.file.timeoutMs });
-    clients.push(client);
-    registerFileTools(registry, client);
+    const file = new FileTools({
+      workspace: cfg.tools.file.workspace,
+      readMaxBytes: cfg.tools.file.readMaxBytes,
+      writeMaxBytes: cfg.tools.file.writeMaxBytes,
+      listMaxEntries: cfg.tools.file.listMaxEntries,
+      searchMaxResults: cfg.tools.file.searchMaxResults,
+      searchMaxFiles: cfg.tools.file.searchMaxFiles,
+      searchMaxFileBytes: cfg.tools.file.searchMaxFileBytes,
+      lineMaxChars: cfg.tools.file.lineMaxChars,
+    });
+    clients.push(file);
+    registerFileTools(registry, file);
   }
   return { registry, clients };
 }
