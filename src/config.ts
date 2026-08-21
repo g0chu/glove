@@ -19,16 +19,33 @@ export interface ModelConfig {
   timeoutMs: number;
 }
 
-/** One tool family (web, file): a Dockerized sidecar the bot calls locally. */
-export interface ToolFamilyConfig {
+/** Web tool family (in-process: the bot does the search/fetch itself, no sidecar). */
+export interface WebToolsConfig {
+  enabled: boolean;
+  /** Deadline per search/fetch call. */
+  timeoutMs: number;
+  /** Max response body bytes kept from a fetch. */
+  fetchMaxBytes: number;
+  /** Max redirect hops per fetch. */
+  maxRedirects: number;
+  /** Fetch-result cache entry lifetime. */
+  cacheTtlMs: number;
+  /** Fetch-result cache size cap. */
+  cacheMaxEntries: number;
+  /** Hard cap on search results (the tool arg is clamped to this). */
+  searchMaxResults: number;
+}
+
+/** File tool family: a Dockerized sidecar the bot calls locally. */
+export interface FileToolsConfig {
   enabled: boolean;
   baseUrl: string;
   timeoutMs: number;
 }
 
 export interface ToolsConfig {
-  web: ToolFamilyConfig;
-  file: ToolFamilyConfig;
+  web: WebToolsConfig;
+  file: FileToolsConfig;
   /** Max tool-execution rounds per turn before the turn is cut off. */
   maxRounds: number;
 }
@@ -105,9 +122,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
   const apiUrl = required("MODEL_API_URL");
   if (apiUrl) httpUrlOk("MODEL_API_URL", apiUrl);
 
-  const webBaseUrl = optional("WEBTOOLS_BASE_URL", "http://127.0.0.1:8377");
   const fileBaseUrl = optional("FILETOOLS_BASE_URL", "http://127.0.0.1:8378");
-  httpUrlOk("WEBTOOLS_BASE_URL", webBaseUrl);
   httpUrlOk("FILETOOLS_BASE_URL", fileBaseUrl);
 
   const config: Config = {
@@ -130,12 +145,15 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
     },
     tools: {
       // Off by default: not every Chat Completions endpoint supports
-      // function calling, and the sidecars must be running first.
+      // function calling. The file sidecar must also be running first.
       web: {
         enabled: boolEnv("WEBTOOLS_ENABLED", false),
-        baseUrl: webBaseUrl,
-        // Generous: the browser fallback can take a while on slow pages.
         timeoutMs: intEnv("WEBTOOLS_TIMEOUT_S", 90, 1) * 1000,
+        fetchMaxBytes: intEnv("WEBTOOLS_FETCH_MAX_BYTES", 5_000_000, 1_024),
+        maxRedirects: intEnv("WEBTOOLS_MAX_REDIRECTS", 5, 0),
+        cacheTtlMs: intEnv("WEBTOOLS_CACHE_TTL_S", 300, 0) * 1000,
+        cacheMaxEntries: intEnv("WEBTOOLS_CACHE_MAX_ENTRIES", 256, 1),
+        searchMaxResults: intEnv("WEBTOOLS_SEARCH_MAX_RESULTS", 10, 1),
       },
       file: {
         enabled: boolEnv("FILETOOLS_ENABLED", false),
