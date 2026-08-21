@@ -41,6 +41,18 @@ export interface LlmClientOptions {
   timeoutMs: number;
 }
 
+/** Stream callbacks for one request (both optional). */
+export interface StreamCallbacks {
+  /** Called with each streamed content delta, as it arrives. */
+  onDelta?: (delta: string) => void;
+  /**
+   * Called with each streamed reasoning/thinking delta, if the endpoint
+   * sends any (some providers stream the model's private thinking alongside
+   * the answer, under `reasoning` or `reasoning_content`).
+   */
+  onReasoning?: (delta: string) => void;
+}
+
 interface SseToolCallDelta {
   index?: unknown;
   id?: unknown;
@@ -50,15 +62,22 @@ interface SseToolCallDelta {
 interface SseDeltaChunk {
   error?: { message?: string } | string;
   choices?: Array<{
-    delta?: { content?: unknown; tool_calls?: SseToolCallDelta[] };
+    delta?: { content?: unknown; reasoning?: unknown; reasoning_content?: unknown; tool_calls?: SseToolCallDelta[] };
   }>;
 }
 
 interface SseMessageChunk {
   error?: { message?: string } | string;
   choices?: Array<{
-    message?: { content?: unknown; tool_calls?: SseToolCallDelta[] };
+    message?: { content?: unknown; reasoning?: unknown; reasoning_content?: unknown; tool_calls?: SseToolCallDelta[] };
   }>;
+}
+
+/** The reasoning/thinking text of a message object, if the endpoint sent it. */
+function reasoningOf(msg: { reasoning?: unknown; reasoning_content?: unknown }): string {
+  if (typeof msg.reasoning === "string") return msg.reasoning;
+  if (typeof msg.reasoning_content === "string") return msg.reasoning_content;
+  return "";
 }
 
 function isAbortError(err: unknown): boolean {
@@ -126,25 +145,23 @@ export class LlmClient {
   }
 
   /**
-   * Send a chat-completions request. When configured for streaming, deltas
-   * are handed to `onDelta` as they arrive. When `tools` is provided (and
-   * non-empty), it is sent with `tool_choice: "auto"` and the result may
-   * carry `toolCalls` instead of (or alongside) content.
+   * Send a chat-completions request. When configured for streaming, content
+   * (and, when the endpoint sends it, reasoning) deltas are handed to the
+   * callbacks as they arrive. When `tools` is provided (and non-empty), it
+   * is sent with `tool_choice: "auto"` and the result may carry `toolCalls`
+   * instead of (or alongside) content.
    */
-  async chat(
-    messages: ChatMessage[],
-    onDelta?: (delta: string) => void,
-    tools?: ToolSpec[],
-  ): Promise<ChatResult> {
+  async chat(messages: ChatMessage[], callbacks?: StreamCallbacks, tools?: ToolSpec[]): Promise<ChatResult> {
+    const cbs = callbacks ?? {};
     const controller = new AbortController();
     this.active.add(controller);
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
     try {
       const res = await this.request(messages, tools, controller);
       if (this.opts.stream) {
-        return await this.readSse(res, onDelta ?? (() => {}));
+        return await this.readSse(res, cbs);
       }
-      return await this.readJson(res);
+      return await this.readJson(res, cbs);
     } catch (err) {
       if (isAbortError(err)) {
         throw new Error(`model request timed out after ${Math.round(this.opts.timeoutMs / 1000)}s`);
@@ -198,7 +215,7 @@ export class LlmClient {
     return res;
   }
 
-  private async readJson(res: Response): Promise<ChatResult> {
+  private async readJson(res: Response, callbacks: StreamCallbacks): Promise<ChatResult> {
     let data: SseMessageChunk;
     try {
       data = (await res.json()) as SseMessageChunk;
@@ -213,13 +230,17 @@ export class LlmClient {
     if (!message) {
       throw new Error("malformed model response: missing choices[0].message");
     }
+    // Non-stream reasoning arrives as one blob; hand it over whole so a
+    // live preview can still show it (there is no "in real time" in this mode).
+    const reasoning = reasoningOf(message);
+    if (reasoning.length > 0) callbacks.onReasoning?.(reasoning);
     return {
       content: typeof message.content === "string" ? message.content : "",
       toolCalls: (message.tool_calls ?? []).map(normalizeToolCall).filter((c): c is ToolCall => c !== null),
     };
   }
 
-  private async readSse(res: Response, onDelta: (delta: string) => void): Promise<ChatResult> {
+  private async readSse(res: Response, callbacks: StreamCallbacks): Promise<ChatResult> {
     const body = res.body;
     if (!body) throw new Error("malformed model response: empty body");
     const reader = body.getReader();
@@ -259,7 +280,11 @@ export class LlmClient {
           const content = delta.content;
           if (typeof content === "string" && content.length > 0) {
             full += content;
-            onDelta(content);
+            callbacks.onDelta?.(content);
+          }
+          const reasoning = reasoningOf(delta);
+          if (reasoning.length > 0) {
+            callbacks.onReasoning?.(reasoning);
           }
           for (const tc of delta.tool_calls ?? []) {
             // Fragments arrive incrementally: the first usually carries

@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatResult, ToolSpec } from "../llm/client.js";
+import type { ChatMessage, ChatResult, StreamCallbacks, ToolCall, ToolSpec } from "../llm/client.js";
 import { executeToolCalls, ToolRegistry } from "./executor.js";
 
 /**
@@ -14,10 +14,10 @@ import { executeToolCalls, ToolRegistry } from "./executor.js";
 export interface ToolTurnDeps {
   /**
    * One model request. `tools` is the registry's spec list (or undefined
-   * when no tool is registered). The delta callback, if any, belongs to the
-   * caller (e.g. the live writer).
+   * when no tool is registered). The stream callbacks, if any, belong to
+   * the caller (e.g. the live writer).
    */
-  chat: (messages: ChatMessage[], onDelta?: (delta: string) => void, tools?: ToolSpec[]) => Promise<ChatResult>;
+  chat: (messages: ChatMessage[], callbacks?: StreamCallbacks, tools?: ToolSpec[]) => Promise<ChatResult>;
   registry: ToolRegistry;
   /** Max number of tool-execution rounds before the turn is cut off. */
   maxRounds: number;
@@ -27,6 +27,13 @@ export interface ToolTurnDeps {
    * discard any streamed preview text — it is transient, not the answer.
    */
   onToolRound?: () => void;
+  /**
+   * Called with the calls about to execute, right before execution starts
+   * (awaited, so any posted activity messages land first). The caller uses
+   * this to surface what the tools are doing — one persistent message per
+   * call; the results themselves stay internal (they only reach the model).
+   */
+  onToolCalls?: (calls: ToolCall[]) => void | Promise<void>;
 }
 
 export interface ToolTurnOutcome {
@@ -53,6 +60,7 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
       return { content: res.content, toolRounds, exhausted: true };
     }
     deps.onToolRound?.();
+    await deps.onToolCalls?.(res.toolCalls);
     const results = await executeToolCalls(deps.registry, res.toolCalls);
     messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
     for (const r of results) {

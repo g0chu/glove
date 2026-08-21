@@ -37,15 +37,21 @@ npm run dev            # or: npm run build && npm start
   while generating, message created on the first chunk, edits throttled to
   at least `DISCORD_STREAM_UPDATE_THROTTLE_MS` apart. Set `MODEL_STREAM=false`
   for a single reply instead.
+- **Live peek at the work:** while generating, the live message shows the
+  model's streamed reasoning ("🤔 *thinking: …*", tail-capped to 2000 chars)
+  when the endpoint sends reasoning deltas (`DISCORD_SHOW_REASONING`,
+  default on) — it is transient and replaced by the reply. Tool activity is
+  different: each tool call is posted as its own **persistent** short
+  message ("🔎 *web_search(query=\"…\")*" — name + arguments only, results
+  never shown; `DISCORD_SHOW_TOOL_ACTIVITY`, default on). These are bot
+  messages and never enter the channel context.
 - **Chunking:** replies longer than Discord's 2000-char limit are split
   into multiple messages, preferring newlines, keeping markdown tables
   together (a table that must span messages repeats its header row in each
   part), and never cutting inside a code fence (fences are closed/reopened
   across the boundary).
-- **Formatting:** a short formatting note is appended to the system prompt
-  of every request (Discord markdown, no LaTeX, Unicode symbols, compact
-  tables), and any math the model still emits as `$...$` LaTeX is rewritten
-  to plain Unicode before posting.
+- **Formatting:** any math the model emits as `$...$` LaTeX is rewritten
+  to plain Unicode before posting (Discord renders markdown but not LaTeX).
 - **Queue:** one turn per channel at a time. Mentions that arrive while a
   reply is generating are queued and answered in order. Non-mentions on
   their own never trigger a reply, but they are part of the context.
@@ -69,9 +75,11 @@ exactly as before.
   restarts.
 
 A turn may run several model rounds: rounds that end in tool calls are
-transient (their streamed preview is deleted), the tools execute, and the
-next round continues with the results in context. Only the final reply is
-posted and recorded. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
+transient (their streamed preview is deleted), the tools execute — each
+call is posted as its own persistent activity message (name + arguments
+only; `DISCORD_SHOW_TOOL_ACTIVITY`) — and the next round continues with
+the results in context. Only the final reply is posted and recorded in the
+channel history. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
 
 ### Setup
 
