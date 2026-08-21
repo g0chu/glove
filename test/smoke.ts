@@ -64,16 +64,24 @@ const ok = (name: string): void => {
     DISCORD_GUILD_ID: "g",
     MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
     WEBTOOLS_ENABLED: "true",
-    WEBTOOLS_BASE_URL: "http://127.0.0.1:9999",
     WEBTOOLS_TIMEOUT_S: "12",
+    WEBTOOLS_FETCH_MAX_BYTES: "2048",
+    WEBTOOLS_MAX_REDIRECTS: "2",
+    WEBTOOLS_CACHE_TTL_S: "60",
+    WEBTOOLS_CACHE_MAX_ENTRIES: "4",
+    WEBTOOLS_SEARCH_MAX_RESULTS: "3",
     FILETOOLS_ENABLED: "true",
     FILETOOLS_TIMEOUT_S: "5",
     TOOLS_MAX_ROUNDS: "7",
   });
   assert.deepEqual(te, []);
   assert.equal(tc.tools.web.enabled, true);
-  assert.equal(tc.tools.web.baseUrl, "http://127.0.0.1:9999");
   assert.equal(tc.tools.web.timeoutMs, 12000);
+  assert.equal(tc.tools.web.fetchMaxBytes, 2048);
+  assert.equal(tc.tools.web.maxRedirects, 2);
+  assert.equal(tc.tools.web.cacheTtlMs, 60000);
+  assert.equal(tc.tools.web.cacheMaxEntries, 4);
+  assert.equal(tc.tools.web.searchMaxResults, 3);
   assert.equal(tc.tools.file.enabled, true);
   assert.equal(tc.tools.file.baseUrl, "http://127.0.0.1:8378"); // default
   assert.equal(tc.tools.file.timeoutMs, 5000);
@@ -87,7 +95,8 @@ const ok = (name: string): void => {
   });
   assert.equal(td.tools.web.enabled, false, "web tools off by default");
   assert.equal(td.tools.file.enabled, false, "file tools off by default");
-  assert.equal(td.tools.web.baseUrl, "http://127.0.0.1:8377");
+  assert.equal(td.tools.file.baseUrl, "http://127.0.0.1:8378");
+  assert.equal(td.tools.web.searchMaxResults, 10); // default
   assert.equal(td.tools.maxRounds, 5);
   ok("config: tools disabled by default");
 
@@ -95,10 +104,10 @@ const ok = (name: string): void => {
     DISCORD_TOKEN: "t",
     DISCORD_GUILD_ID: "g",
     MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
-    WEBTOOLS_BASE_URL: "ftp://nope",
+    WEBTOOLS_FETCH_MAX_BYTES: "abc",
     TOOLS_MAX_ROUNDS: "0",
   });
-  assert.ok(toolErrs.some((e) => e.includes("WEBTOOLS_BASE_URL")), `got: ${toolErrs.join("; ")}`);
+  assert.ok(toolErrs.some((e) => e.includes("WEBTOOLS_FETCH_MAX_BYTES")), `got: ${toolErrs.join("; ")}`);
   assert.ok(toolErrs.some((e) => e.includes("TOOLS_MAX_ROUNDS")), `got: ${toolErrs.join("; ")}`);
   ok("config: invalid tool env values rejected");
 }

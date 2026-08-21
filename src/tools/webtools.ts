@@ -1,15 +1,14 @@
-import { errMsg } from "../log.js";
 import type { ToolSpec } from "../llm/client.js";
 import type { ToolRegistry } from "./executor.js";
 import { argInt, argString } from "./executor.js";
+import { FetchCache } from "./web/cache.js";
+import { extractContent, extractTitle } from "./web/extract.js";
+import { pinnedFetch } from "./web/fetcher.js";
+import { searchDuckDuckGo, type SearchFetch } from "./web/search.js";
+import { ToolError, type ResolveOptions } from "./web/ssrf.js";
 
 /** Hard cap on one tool result before it is handed to the model. */
 const MAX_RESULT_CHARS = 200_000;
-
-export interface WebToolsOptions {
-  baseUrl: string;
-  timeoutMs: number;
-}
 
 function asString(v: unknown): string {
   return typeof v === "string" ? v : "";
@@ -19,21 +18,50 @@ function cap(text: string): string {
   return text.length > MAX_RESULT_CHARS ? `${text.slice(0, MAX_RESULT_CHARS)}\n…[truncated]` : text;
 }
 
+export interface WebToolsOptions {
+  /** Deadline per search/fetch call (covers the whole fetch, incl. redirects). */
+  timeoutMs: number;
+  /** Max response body bytes kept from a fetch. */
+  fetchMaxBytes: number;
+  /** Max redirect hops per fetch. */
+  maxRedirects: number;
+  /** Fetch-result cache entry lifetime. */
+  cacheTtlMs: number;
+  /** Fetch-result cache size cap. */
+  cacheMaxEntries: number;
+  /** Hard cap on search results (the tool arg is clamped to this). */
+  searchMaxResults: number;
+  /**
+   * Escape hatch for tests only: when true, the SSRF guard no longer
+   * refuses loopback/private addresses. Never enable in production.
+   */
+  allowPrivate?: boolean;
+  /** Injectable resolver (tests only). */
+  resolver?: ResolveOptions["resolver"];
+  /** Injectable fetch for the search endpoint (tests only). */
+  searchFetch?: SearchFetch;
+}
+
 /**
- * Client for the webtools sidecar (Docker, 127.0.0.1 by default):
- * web search (DuckDuckGo via `ddgs`) and page fetching (plain HTTP with
- * readability extraction, headless-Chromium fallback for JS-heavy pages).
- * The sidecar is the only component that touches untrusted web content.
+ * In-process web tools: DuckDuckGo search and page fetching (pinned-socket
+ * HTTP with SSRF protection, main-content extraction, small result cache).
+ * No sidecar, no HTTP hop: the bot process does the work directly.
  */
-export class WebToolsClient {
+export class WebTools {
+  private readonly cache: FetchCache<Record<string, unknown>>;
   private readonly active = new Set<AbortController>();
 
-  constructor(private readonly opts: WebToolsOptions) {}
+  constructor(private readonly opts: WebToolsOptions) {
+    this.cache = new FetchCache(opts.cacheTtlMs, opts.cacheMaxEntries);
+  }
 
   /** Search the web; returns a formatted result list for the model. */
   async search(query: string, maxResults: number): Promise<string> {
-    const data = await this.post("/search", { query, max_results: maxResults });
-    const results = Array.isArray(data.results) ? (data.results as Array<Record<string, unknown>>) : [];
+    const limit = Math.min(maxResults, this.opts.searchMaxResults);
+    const results = await searchDuckDuckGo(query, limit, {
+      fetchImpl: this.opts.searchFetch,
+      timeoutMs: this.opts.timeoutMs,
+    });
     if (results.length === 0) return cap(`No web search results for "${query}".`);
     const lines = results.map((r, i) =>
       `${i + 1}. ${asString(r.title).trim()}\n   ${asString(r.url).trim()}\n   ${asString(r.snippet).trim()}`
@@ -45,21 +73,41 @@ export class WebToolsClient {
     return cap(`Web search results for "${query}":\n\n${lines.join("\n\n")}`);
   }
 
-  /** Fetch a page; returns title + main content (markdown) for the model. */
+  /** Fetch a page; returns title + main content for the model. */
   async fetchUrl(url: string): Promise<string> {
-    const data = await this.post("/fetch", { url });
-    const content = asString(data.content);
-    const title = asString(data.title).trim();
-    const finalUrl = asString(data.final_url).trim() || url;
-    const via = asString(data.method).trim() || "http";
-    const truncated = data.truncated === true ? "yes" : "no";
-    const header = title
-      ? `Fetched ${finalUrl}\nTitle: ${title}\nMethod: ${via} | truncated: ${truncated}`
-      : `Fetched ${finalUrl}\nMethod: ${via} | truncated: ${truncated}`;
-    return cap(`${header}\n\n${content}`);
+    const controller = new AbortController();
+    this.active.add(controller);
+    try {
+      const cached = this.cache.get(url);
+      if (cached) return this.format(url, cached);
+      const fetched = await pinnedFetch(url, {
+        timeoutMs: this.opts.timeoutMs,
+        maxBytes: this.opts.fetchMaxBytes,
+        maxRedirects: this.opts.maxRedirects,
+        allowPrivate: this.opts.allowPrivate,
+        resolver: this.opts.resolver,
+        signal: controller.signal,
+      });
+      const html = fetched.body.toString("utf8");
+      const content = extractContent(html);
+      if (!content) {
+        throw new ToolError("fetch succeeded but the page has no extractable text content");
+      }
+      const result: Record<string, unknown> = {
+        title: extractTitle(html),
+        content,
+        final_url: fetched.finalUrl,
+        method: "http",
+        truncated: fetched.truncated,
+      };
+      this.cache.put(url, result);
+      return this.format(url, result);
+    } finally {
+      this.active.delete(controller);
+    }
   }
 
-  /** Cancel all in-flight requests (graceful shutdown). */
+  /** Cancel all in-flight fetches (graceful shutdown). */
   abort(): void {
     for (const c of this.active) {
       try {
@@ -71,34 +119,16 @@ export class WebToolsClient {
     this.active.clear();
   }
 
-  /** POST JSON to the sidecar; resolves the `ok` payload, rejects with a message. */
-  private async post(path: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const controller = new AbortController();
-    this.active.add(controller);
-    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
-    let res: Response;
-    try {
-      res = await fetch(`${this.opts.baseUrl.replace(/\/$/, "")}${path}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-    } catch (err) {
-      if (controller.signal.aborted) {
-        throw new Error(`webtools request timed out after ${Math.round(this.opts.timeoutMs / 1000)}s`);
-      }
-      throw new Error(`could not reach webtools at ${this.opts.baseUrl}: ${errMsg(err)}`);
-    } finally {
-      clearTimeout(timer);
-      this.active.delete(controller);
-    }
-    const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (!res.ok || !data) {
-      const msg = data && typeof data.error === "string" ? data.error : `webtools returned HTTP ${res.status}`;
-      throw new Error(msg);
-    }
-    return data;
+  private format(url: string, r: Record<string, unknown>): string {
+    const content = asString(r.content);
+    const title = asString(r.title).trim();
+    const finalUrl = asString(r.final_url).trim() || url;
+    const via = asString(r.method).trim() || "http";
+    const truncated = r.truncated === true ? "yes" : "no";
+    const header = title
+      ? `Fetched ${finalUrl}\nTitle: ${title}\nMethod: ${via} | truncated: ${truncated}`
+      : `Fetched ${finalUrl}\nMethod: ${via} | truncated: ${truncated}`;
+    return cap(`${header}\n\n${content}`);
   }
 }
 
@@ -121,7 +151,7 @@ export const WEB_SEARCH_SPEC: ToolSpec = {
 export const WEB_FETCH_SPEC: ToolSpec = {
   name: "web_fetch",
   description:
-    "Fetch a web page and return its main content as markdown (head, plus title). Tries a plain HTTP fetch first and falls back to a headless browser for JavaScript-heavy pages. Only use URLs from web_search results or that the user gave.",
+    "Fetch a web page and return its main content as text (plus the title). JavaScript-heavy pages may come back incomplete (plain HTTP fetch, no browser rendering). Only use URLs from web_search results or that the user gave.",
   parameters: {
     type: "object",
     properties: {
@@ -132,8 +162,8 @@ export const WEB_FETCH_SPEC: ToolSpec = {
   },
 };
 
-/** Register the web tools on a registry, bound to one client. */
-export function registerWebTools(registry: ToolRegistry, client: WebToolsClient): void {
-  registry.register(WEB_SEARCH_SPEC, (args) => client.search(argString(args, "query"), argInt(args, "max_results", 5, 1, 10)));
-  registry.register(WEB_FETCH_SPEC, (args) => client.fetchUrl(argString(args, "url")));
+/** Register the web tools on a registry, bound to one WebTools. */
+export function registerWebTools(registry: ToolRegistry, tools: WebTools): void {
+  registry.register(WEB_SEARCH_SPEC, (args) => tools.search(argString(args, "query"), argInt(args, "max_results", 5, 1, 10)));
+  registry.register(WEB_FETCH_SPEC, (args) => tools.fetchUrl(argString(args, "url")));
 }
