@@ -2,3 +2,9 @@ node_modules/
 dist/
 .env
 *.log
+# Bot file workspace (mounted into the filetools container)
+workspace/
+.venv/
+# Python bytecode from running the sidecar smoke tests on the host
+__pycache__/
+*.pyc

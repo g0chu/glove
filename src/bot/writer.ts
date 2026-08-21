@@ -144,6 +144,27 @@ export class ResponseWriter {
   }
 
   /**
+   * Discard the in-progress live message without finishing the turn.
+   * Used when a streamed response turns out to contain tool calls: the
+   * text streamed so far is transient, and the next round streams its own
+   * live message. No-op when nothing has been posted or the turn finished.
+   */
+  discard(): void {
+    if (this.finished) return;
+    const target = this.message;
+    this.message = null;
+    this.buffer = "";
+    this.lastEditAt = 0;
+    if (target) {
+      // Delete the captured message object (not this.message): a pending
+      // updateLive may recreate a fresh live message, which must survive.
+      this.chain = this.chain.then(async () => {
+        await target.delete().catch(() => {});
+      });
+    }
+  }
+
+  /**
    * Finalize: stop typing, post the complete text (or a note when empty).
    * `fullText` is the model's full answer; falls back to whatever was
    * streamed so far. Returns what actually landed in the channel (message

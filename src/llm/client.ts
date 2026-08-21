@@ -1,8 +1,36 @@
 import { errMsg, truncate } from "../log.js";
 
+/** One tool invocation requested by the model. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  /** Raw JSON string exactly as delivered by the endpoint. */
+  arguments: string;
+}
+
+/** A message in the conversation sent to the model (wire shape on request). */
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** assistant only: tool calls the model requested. */
+  toolCalls?: ToolCall[];
+  /** tool only: id of the call this message answers. */
+  toolCallId?: string;
+  /** tool only: name of the tool this message answers. */
+  name?: string;
+}
+
+/** What the model answered: text, tool calls, or both. */
+export interface ChatResult {
+  content: string;
+  toolCalls: ToolCall[];
+}
+
+/** OpenAI-compatible function spec (the `function` object of a `tools` entry). */
+export interface ToolSpec {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
 }
 
 export interface LlmClientOptions {
@@ -13,18 +41,63 @@ export interface LlmClientOptions {
   timeoutMs: number;
 }
 
+interface SseToolCallDelta {
+  index?: unknown;
+  id?: unknown;
+  function?: { name?: unknown; arguments?: unknown };
+}
+
 interface SseDeltaChunk {
   error?: { message?: string } | string;
-  choices?: Array<{ delta?: { content?: unknown } }>;
+  choices?: Array<{
+    delta?: { content?: unknown; tool_calls?: SseToolCallDelta[] };
+  }>;
 }
 
 interface SseMessageChunk {
   error?: { message?: string } | string;
-  choices?: Array<{ message?: { content?: unknown } }>;
+  choices?: Array<{
+    message?: { content?: unknown; tool_calls?: SseToolCallDelta[] };
+  }>;
 }
 
 function isAbortError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
+}
+
+/** Normalize one complete tool_call object (non-stream mode) into a ToolCall. */
+function normalizeToolCall(tc: SseToolCallDelta | undefined): ToolCall | null {
+  if (!tc || typeof tc !== "object") return null;
+  const name = typeof tc.function?.name === "string" ? tc.function.name : "";
+  const rawArgs = tc.function?.arguments;
+  let args: string;
+  if (typeof rawArgs === "string") {
+    args = rawArgs;
+  } else {
+    // Some endpoints deliver arguments as a JSON object instead of a string.
+    args = rawArgs == null ? "{}" : JSON.stringify(rawArgs);
+  }
+  if (!name) return null;
+  return { id: typeof tc.id === "string" ? tc.id : "", name, arguments: args };
+}
+
+/** Convert an internal message to the OpenAI wire shape. */
+function toWireMessage(m: ChatMessage): Record<string, unknown> {
+  if (m.role === "tool") {
+    return { role: "tool", tool_call_id: m.toolCallId, name: m.name, content: m.content };
+  }
+  if (m.role === "assistant" && m.toolCalls) {
+    return {
+      role: "assistant",
+      content: m.content,
+      tool_calls: m.toolCalls.map((tc) => ({
+        id: tc.id,
+        type: "function",
+        function: { name: tc.name, arguments: tc.arguments },
+      })),
+    };
+  }
+  return { role: m.role, content: m.content };
 }
 
 /**
@@ -33,6 +106,8 @@ function isAbortError(err: unknown): boolean {
  * - non-streaming: `choices[0].message.content`
  * - per-request timeout via AbortController (covers the whole stream)
  * - `abort()` cancels every in-flight request (graceful shutdown)
+ * - tool calls: `tools` is sent only when provided; streamed
+ *   `delta.tool_calls` chunks are reassembled by index
  */
 export class LlmClient {
   /**
@@ -52,14 +127,20 @@ export class LlmClient {
 
   /**
    * Send a chat-completions request. When configured for streaming, deltas
-   * are handed to `onDelta` as they arrive and the full text is returned.
+   * are handed to `onDelta` as they arrive. When `tools` is provided (and
+   * non-empty), it is sent with `tool_choice: "auto"` and the result may
+   * carry `toolCalls` instead of (or alongside) content.
    */
-  async chat(messages: ChatMessage[], onDelta?: (delta: string) => void): Promise<string> {
+  async chat(
+    messages: ChatMessage[],
+    onDelta?: (delta: string) => void,
+    tools?: ToolSpec[],
+  ): Promise<ChatResult> {
     const controller = new AbortController();
     this.active.add(controller);
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
     try {
-      const res = await this.request(messages, controller);
+      const res = await this.request(messages, tools, controller);
       if (this.opts.stream) {
         return await this.readSse(res, onDelta ?? (() => {}));
       }
@@ -75,8 +156,24 @@ export class LlmClient {
     }
   }
 
-  private async request(messages: ChatMessage[], controller: AbortController): Promise<Response> {
+  private async request(
+    messages: ChatMessage[],
+    tools: ToolSpec[] | undefined,
+    controller: AbortController,
+  ): Promise<Response> {
     let res: Response;
+    const body: Record<string, unknown> = {
+      model: this.opts.model,
+      messages: messages.map(toWireMessage),
+      stream: this.opts.stream,
+    };
+    if (tools && tools.length > 0) {
+      body.tools = tools.map((t) => ({
+        type: "function",
+        function: { name: t.name, description: t.description, parameters: t.parameters },
+      }));
+      body.tool_choice = "auto";
+    }
     try {
       res = await fetch(this.opts.apiUrl, {
         method: "POST",
@@ -85,11 +182,7 @@ export class LlmClient {
           // Sent even when the key is "none" (PLAN.md §6).
           Authorization: `Bearer ${this.opts.apiKey}`,
         },
-        body: JSON.stringify({
-          model: this.opts.model,
-          messages,
-          stream: this.opts.stream,
-        }),
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
     } catch (err) {
@@ -97,15 +190,15 @@ export class LlmClient {
       throw new Error(`could not reach model endpoint ${this.opts.apiUrl}: ${errMsg(err)}`);
     }
     if (!res.ok) {
-      const body = await res.text().catch(() => "");
+      const text = await res.text().catch(() => "");
       throw new Error(
-        `model endpoint returned HTTP ${res.status} ${res.statusText}${body ? `: ${truncate(body, 300)}` : ""}`,
+        `model endpoint returned HTTP ${res.status} ${res.statusText}${text ? `: ${truncate(text, 300)}` : ""}`,
       );
     }
     return res;
   }
 
-  private async readJson(res: Response): Promise<string> {
+  private async readJson(res: Response): Promise<ChatResult> {
     let data: SseMessageChunk;
     try {
       data = (await res.json()) as SseMessageChunk;
@@ -116,20 +209,25 @@ export class LlmClient {
       const msg = typeof data.error === "string" ? data.error : data.error?.message ?? JSON.stringify(data.error);
       throw new Error(`model endpoint error: ${msg}`);
     }
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== "string") {
-      throw new Error("malformed model response: missing choices[0].message.content");
+    const message = data?.choices?.[0]?.message;
+    if (!message) {
+      throw new Error("malformed model response: missing choices[0].message");
     }
-    return content;
+    return {
+      content: typeof message.content === "string" ? message.content : "",
+      toolCalls: (message.tool_calls ?? []).map(normalizeToolCall).filter((c): c is ToolCall => c !== null),
+    };
   }
 
-  private async readSse(res: Response, onDelta: (delta: string) => void): Promise<string> {
+  private async readSse(res: Response, onDelta: (delta: string) => void): Promise<ChatResult> {
     const body = res.body;
     if (!body) throw new Error("malformed model response: empty body");
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let full = "";
+    // Streamed tool calls arrive as fragments keyed by index; reassemble them.
+    const calls = new Map<number, ToolCall>();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -142,7 +240,7 @@ export class LlmClient {
         const payload = line.slice(5).trim();
         if (payload === "[DONE]") {
           reader.cancel().catch(() => {});
-          return full;
+          return { content: full, toolCalls: [...calls.values()] };
         }
         if (!payload) continue;
         let json: SseDeltaChunk;
@@ -156,13 +254,35 @@ export class LlmClient {
             typeof json.error === "string" ? json.error : json.error?.message ?? JSON.stringify(json.error);
           throw new Error(`model endpoint error: ${msg}`);
         }
-        const delta = json?.choices?.[0]?.delta?.content;
-        if (typeof delta === "string" && delta.length > 0) {
-          full += delta;
-          onDelta(delta);
+        const delta = json?.choices?.[0]?.delta;
+        if (delta && typeof delta === "object") {
+          const content = delta.content;
+          if (typeof content === "string" && content.length > 0) {
+            full += content;
+            onDelta(content);
+          }
+          for (const tc of delta.tool_calls ?? []) {
+            // Fragments arrive incrementally: the first usually carries
+            // id+name, later ones only arguments — accumulate field by
+            // field instead of normalizing the whole object.
+            if (!tc || typeof tc !== "object") continue;
+            const idx = typeof tc.index === "number" ? tc.index : 0;
+            const acc = calls.get(idx) ?? { id: "", name: "", arguments: "" };
+            if (typeof tc.id === "string" && tc.id.length > 0) acc.id = tc.id;
+            const fn = tc.function;
+            if (fn && typeof fn === "object") {
+              if (typeof fn.name === "string") acc.name += fn.name;
+              if (typeof fn.arguments === "string") {
+                acc.arguments += fn.arguments;
+              } else if (fn.arguments != null) {
+                acc.arguments += JSON.stringify(fn.arguments);
+              }
+            }
+            calls.set(idx, acc);
+          }
         }
       }
     }
-    return full;
+    return { content: full, toolCalls: [...calls.values()] };
   }
 }

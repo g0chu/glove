@@ -19,9 +19,24 @@ export interface ModelConfig {
   timeoutMs: number;
 }
 
+/** One tool family (web, file): a Dockerized sidecar the bot calls locally. */
+export interface ToolFamilyConfig {
+  enabled: boolean;
+  baseUrl: string;
+  timeoutMs: number;
+}
+
+export interface ToolsConfig {
+  web: ToolFamilyConfig;
+  file: ToolFamilyConfig;
+  /** Max tool-execution rounds per turn before the turn is cut off. */
+  maxRounds: number;
+}
+
 export interface Config {
   discord: DiscordConfig;
   model: ModelConfig;
+  tools: ToolsConfig;
 }
 
 export interface ParseResult {
@@ -70,20 +85,30 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
     return dflt;
   };
 
+  const httpUrlOk = (name: string, value: string): boolean => {
+    if (!value) return true;
+    try {
+      const u = new URL(value);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        errors.push(`${name} must be http(s) (got "${value}")`);
+        return false;
+      }
+      return true;
+    } catch {
+      errors.push(`${name} is not a valid URL: "${value}"`);
+      return false;
+    }
+  };
+
   const token = required("DISCORD_TOKEN");
   const guildId = required("DISCORD_GUILD_ID");
   const apiUrl = required("MODEL_API_URL");
+  if (apiUrl) httpUrlOk("MODEL_API_URL", apiUrl);
 
-  if (apiUrl) {
-    try {
-      const u = new URL(apiUrl);
-      if (u.protocol !== "http:" && u.protocol !== "https:") {
-        errors.push(`MODEL_API_URL must be http(s) (got "${apiUrl}")`);
-      }
-    } catch {
-      errors.push(`MODEL_API_URL is not a valid URL: "${apiUrl}"`);
-    }
-  }
+  const webBaseUrl = optional("WEBTOOLS_BASE_URL", "http://127.0.0.1:8377");
+  const fileBaseUrl = optional("FILETOOLS_BASE_URL", "http://127.0.0.1:8378");
+  httpUrlOk("WEBTOOLS_BASE_URL", webBaseUrl);
+  httpUrlOk("FILETOOLS_BASE_URL", fileBaseUrl);
 
   const config: Config = {
     discord: {
@@ -102,6 +127,22 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),
       timeoutMs: intEnv("MODEL_TIMEOUT_S", 120, 1) * 1000,
+    },
+    tools: {
+      // Off by default: not every Chat Completions endpoint supports
+      // function calling, and the sidecars must be running first.
+      web: {
+        enabled: boolEnv("WEBTOOLS_ENABLED", false),
+        baseUrl: webBaseUrl,
+        // Generous: the browser fallback can take a while on slow pages.
+        timeoutMs: intEnv("WEBTOOLS_TIMEOUT_S", 90, 1) * 1000,
+      },
+      file: {
+        enabled: boolEnv("FILETOOLS_ENABLED", false),
+        baseUrl: fileBaseUrl,
+        timeoutMs: intEnv("FILETOOLS_TIMEOUT_S", 30, 1) * 1000,
+      },
+      maxRounds: intEnv("TOOLS_MAX_ROUNDS", 5, 1),
     },
   };
 

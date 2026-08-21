@@ -7,6 +7,8 @@ import { LlmClient } from "./llm/client.js";
 import { ConversationStore, toRequestMessages } from "./llm/history.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
+import { TOOLS_SYSTEM_NOTE, buildTools } from "./tools/index.js";
+import { runToolTurn } from "./tools/loop.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -28,6 +30,14 @@ async function main(): Promise<void> {
     timeoutMs: cfg.model.timeoutMs,
   });
   const histories = new ConversationStore(cfg.model.contextMaxMessages);
+  const tools = buildTools(cfg);
+  if (tools.registry.size > 0) {
+    log.info(
+      "tools enabled:",
+      tools.registry.specs().map((s) => s.name).join(", "),
+      `(max ${cfg.tools.maxRounds} round(s)/turn)`,
+    );
+  }
 
   /**
    * One full turn for a queued mention. The mention is already in the
@@ -68,11 +78,31 @@ async function main(): Promise<void> {
     });
     try {
       writer.start();
-      const messages = toRequestMessages(history, cfg.model.systemPrompt);
-      const reply = await llm.chat(messages, (delta) => {
-        writer.chunk(delta);
+      // With tools enabled, the model may answer in several rounds: a round
+      // that ends in tool calls streams transient text (discarded via
+      // onToolRound), the tools run, and the next round continues with the
+      // results in context. Only the final reply is posted and recorded.
+      const hasTools = tools.registry.size > 0;
+      const systemPrompt = hasTools
+        ? cfg.model.systemPrompt
+          ? `${cfg.model.systemPrompt}\n\n${TOOLS_SYSTEM_NOTE}`
+          : TOOLS_SYSTEM_NOTE
+        : cfg.model.systemPrompt;
+      const messages = toRequestMessages(history, systemPrompt);
+      const outcome = await runToolTurn(messages, {
+        chat: (msgs, _onDelta, t) => llm.chat(msgs, (d) => writer.chunk(d), t),
+        registry: tools.registry,
+        maxRounds: cfg.tools.maxRounds,
+        onToolRound: () => writer.discard(),
       });
-      const posted = await writer.finish(reply);
+      if (outcome.toolRounds > 0) {
+        log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);
+      }
+      const finalText =
+        outcome.exhausted && outcome.content.trim() === ""
+          ? "*(stopped: the model kept requesting tools past the round limit)*"
+          : outcome.content;
+      const posted = await writer.finish(finalText);
       if (posted) history.push("assistant", posted.text, posted.messageIds, posted.chunks);
     } catch (err) {
       log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
@@ -154,6 +184,7 @@ async function main(): Promise<void> {
   const shutdown = (signal: string): void => {
     log.info(`${signal} received, shutting down`);
     llm.abort();
+    for (const c of tools.clients) c.abort();
     client.destroy();
     process.exit(0);
   };

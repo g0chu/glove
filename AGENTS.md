@@ -7,13 +7,16 @@ Discord bot bridging guild text channels to any OpenAI-compatible Chat Completio
 - `npm test` — smoke tests: one script (`test/smoke.ts`), plain `node:assert`, no framework, no test selection. Hermetic: mock OpenAI server on an ephemeral port + fake Discord channels; no `.env` or Discord access needed.
 - `npm run typecheck` — `tsc --noEmit`.
 - `npm run dev` — run from source (tsx); `npm run build` compiles to `dist/`; `npm start` runs the compiled bot.
+- `.venv/bin/python tools/test/smoke.py` — sidecar smoke tests (SSRF, path confinement, extraction, all endpoints via FastAPI TestClient). Hermetic: injected search backend, local `http.server`, temp workspace; no Docker or network needed. Uses the repo-root `.venv` (deps in `tools/requirements.txt`).
 - No lint, formatter, or CI is configured.
 
 ## Gotchas that bite
 
 - Relative imports must use explicit `.js` extensions even in `.ts` files (NodeNext ESM): `import { x } from "./bot/queue.js"`.
 - `dist/` is a build artifact (gitignored) — never edit it.
+- `workspace/` is the bot's persistent file workspace (gitignored, bind-mounted into the filetools container) — never commit it, don't edit it by hand.
 - Code comments in `src/config.ts`, `src/index.ts`, `src/llm/client.ts`, `src/bot/queue.ts`, `src/bot/router.ts` reference `PLAN.md §N`, but PLAN.md is not in the repo.
+- The model endpoint only speaks tools if its chat template supports function calling (e.g. llama.cpp needs a tool-capable template). If it rejects `tools`, keep `WEBTOOLS_ENABLED`/`FILETOOLS_ENABLED` at their `false` defaults.
 
 ## Config
 
@@ -25,11 +28,14 @@ Discord bot bridging guild text channels to any OpenAI-compatible Chat Completio
 - `index.ts` wires everything: `messageCreate` → `bot/router.ts` (guild + text-channel + human filter, mention detection) → `bot/queue.ts` → turn in `index.ts` → `llm/client.ts` + `bot/writer.ts`.
 - Queue (`bot/queue.ts`): one turn per channel at a time. The queue only holds *mentions* (pending turns), in arrival order; every trackable message — mention or ambient — is appended to the channel history immediately on `messageCreate`, keyed by its Discord message id. Ambient messages still never trigger a reply. These semantics are pinned by `test/smoke.ts` — preserve them.
 - `llm/history.ts`: per-channel in-memory sliding window (last `MODEL_CONTEXT_MAX_MESSAGES`); no persistence, and ambient messages consume the window. Entries are keyed by Discord message id(s) so `messageUpdate`/`messageDelete`/`messageDeleteBulk`/`channelDelete` keep the context in sync with the channel; a chunked bot reply is one entry with one id per chunk (any chunk id resolves it, a chunk edit rebuilds the visible text, a chunk delete drops the whole reply).
-- `llm/client.ts`: per-request `AbortController` timeout covers the whole stream. `abort()` must cancel **all** in-flight requests — multiple channels generate concurrently (the queue serializes per channel, not globally).
-- `bot/writer.ts`: Discord's 2000-char limit; `splitForDiscord` never splits inside a code fence (closes it, reopens in the next chunk); live-stream preview edits are throttled by `throttleMs`.
+- `llm/client.ts`: per-request `AbortController` timeout covers the whole stream. `abort()` must cancel **all** in-flight requests — multiple channels generate concurrently (the queue serializes per channel, not globally). `tools`/`tool_choice:"auto"` are sent only when a registry is passed; streamed `delta.tool_calls` fragments are reassembled by index.
+- `bot/writer.ts`: Discord's 2000-char limit; `splitForDiscord` never splits inside a code fence (closes it, reopens in the next chunk); live-stream preview edits are throttled by `throttleMs`. `discard()` drops an in-progress preview without finishing the turn (used between tool rounds).
+- Tools (optional, **off by default**; `src/tools/`): `buildTools(cfg)` registers `web_search`/`web_fetch` (webtools sidecar, `:8377`) and the `file_*` tools (filetools sidecar, `:8378`) as OpenAI function specs. `runToolTurn` (`tools/loop.ts`) loops model rounds per turn: a round ending in tool calls is transient (its streamed preview is discarded via `onToolRound` → `writer.discard()`), the tools execute concurrently (`tools/executor.ts`), and their results are appended as `tool`-role messages that live only in the turn — **only the final posted reply reaches channel history**, so sliding-window semantics are untouched. `TOOLS_MAX_ROUNDS` caps the rounds; exhaustion with no text posts a note. A broken tool never kills the turn (errors become `Error: …` tool results).
+- Sidecars (`tools/`, Python/FastAPI): one Docker image, one process per role (`ROLE=webtools|filetools`), started via `docker-compose.yml`. Ports bind to `127.0.0.1` only. `web_fetch` validates URLs against an SSRF blocklist and connects to the *pinned resolved IP* (anti-DNS-rebinding); redirects re-validate hop by hop. The headless-Chromium fallback cannot pin DNS (it resolves itself) — pre-validation only, a documented residual. File paths are confined to the workspace with symlink-escape rejection.
 
 ## Operational
 
 - The bot needs the **MESSAGE CONTENT privileged intent** enabled in the Discord Developer Portal (app → Bot → Privileged Gateway Intents); without it, message content silently arrives empty.
 - `MODEL_ENABLE_IMAGES=true` is a no-op in v1 (warns at startup).
+- Tool sidecars must be running before enabling `WEBTOOLS_ENABLED`/`FILETOOLS_ENABLED` (`docker compose up -d webtools`, `docker compose --profile files up -d`); with the sidecars down, tool calls fail honestly per-call and the turn continues.
 - Async in `test/smoke.ts` is driven with `ticks()` (setImmediate), not real sleeps — follow the pattern when adding tests.
