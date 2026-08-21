@@ -7,14 +7,17 @@ FROM python:3.12-bookworm
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    # Shared, non-root path: installed as root, read by the glove runtime user.
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Headless Chromium for the JS-heavy-page fallback (installs its own system deps).
+# Headless Chromium for the JS-heavy-page fallback (installs its own system
+# deps, into $PLAYWRIGHT_BROWSERS_PATH so the non-root user can use it).
 RUN python -m playwright install --with-deps chromium
 
 COPY server ./server
