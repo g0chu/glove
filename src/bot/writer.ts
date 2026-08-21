@@ -272,18 +272,25 @@ export interface PostedReply {
 /**
  * Posts a model reply to a channel with Discord-specific concerns:
  *  - typing indicator refreshed every `typingIntervalMs`;
- *  - on the first streamed chunk, a placeholder message is created;
+ *  - one live message per round, created on the first update, showing in
+ *    priority order: the streamed reply, or the model's streamed reasoning
+ *    ("🤔 *thinking: …*");
  *  - while streaming, the live message is edited no more often than
- *    `throttleMs` (edits are serialized; when the text exceeds 2000 chars
+ *    `throttleMs` (edits are serialized; a change of what is shown —
+ *    thinking → reply — lands immediately; when the text exceeds 2000 chars
  *    the live preview shows the most recent tail);
  *  - on completion the final text is chunked (code-fence aware) and posted
- *    as one message per chunk;
+ *    as one message per chunk; reasoning never lands in the final message
+ *    or the history;
  *  - `finish()`/`reportError()` return the ids and text of whatever was
  *    actually posted, so the caller can record the reply in the channel
  *    history (making it editable/deletable like any other message).
  */
 export class ResponseWriter {
   private buffer = "";
+  private reasoningBuffer = "";
+  /** What the live message currently shows (null when it shows nothing). */
+  private shownKind: "reasoning" | "content" | null = null;
   private message: Message | null = null;
   private typingTimer: NodeJS.Timeout | null = null;
   private lastEditAt = 0;
@@ -309,6 +316,17 @@ export class ResponseWriter {
   }
 
   /**
+   * Feed a streamed reasoning delta (the model's "thinking", when the
+   * endpoint sends it). Shown live in the same message that will carry the
+   * reply; reasoning is never posted or recorded.
+   */
+  reason(delta: string): void {
+    if (this.finished) return;
+    this.reasoningBuffer += delta;
+    this.chain = this.chain.then(() => this.updateLive()).catch(() => {});
+  }
+
+  /**
    * Discard the in-progress live message without finishing the turn.
    * Used when a streamed response turns out to contain tool calls: the
    * text streamed so far is transient, and the next round streams its own
@@ -319,6 +337,8 @@ export class ResponseWriter {
     const target = this.message;
     this.message = null;
     this.buffer = "";
+    this.reasoningBuffer = "";
+    this.shownKind = null;
     this.lastEditAt = 0;
     if (target) {
       // Delete the captured message object (not this.message): a pending
@@ -420,14 +440,21 @@ export class ResponseWriter {
 
   private async updateLive(): Promise<void> {
     if (this.finished) return;
+    const preview = this.preview();
+    if (preview === null) return;
+    // A change of what is shown (activity → thinking → reply) lands
+    // immediately; updates of the same kind respect the throttle.
+    const force = this.shownKind !== preview.kind;
     try {
       if (!this.message) {
-        this.message = await this.opts.channel.send(this.livePreview());
+        this.message = await this.opts.channel.send(preview.text);
+        this.shownKind = preview.kind;
       } else {
         const now = Date.now();
-        if (now - this.lastEditAt >= this.opts.throttleMs) {
+        if (force || now - this.lastEditAt >= this.opts.throttleMs) {
           this.lastEditAt = now;
-          await this.message.edit({ content: this.livePreview() });
+          this.shownKind = preview.kind;
+          await this.message.edit({ content: preview.text });
         }
       }
     } catch (err) {
@@ -436,14 +463,44 @@ export class ResponseWriter {
     }
   }
 
-  /** Live preview capped at 2000 chars: the head while it fits, the tail once it doesn't. */
-  private livePreview(): string {
+  /**
+   * What the live message shows right now, highest priority first: the
+   * streamed reply, then the streamed reasoning.
+   */
+  private preview(): { kind: "reasoning" | "content"; text: string } | null {
+    if (this.buffer.length > 0) {
+      return { kind: "content", text: this.contentPreview() };
+    }
+    if (this.reasoningBuffer.length > 0) {
+      return { kind: "reasoning", text: this.reasoningPreview() };
+    }
+    return null;
+  }
+
+  /** Reply preview capped at 2000 chars: the head while it fits, the tail once it doesn't. */
+  private contentPreview(): string {
     const max = DISCORD_MAX_MESSAGE_CHARS;
     const text = sanitizeForDiscord(this.buffer);
     if (text.length <= max) {
       return text.trim().length > 0 ? text : "…";
     }
     return "…" + text.slice(text.length - (max - 3));
+  }
+
+  /**
+   * Reasoning preview: the most recent tail of the thinking, wrapped in an
+   * italic "🤔 *thinking: …*" header, capped at 2000 chars.
+   */
+  private reasoningPreview(): string {
+    const prefix = "🤔 *thinking: ";
+    const max = DISCORD_MAX_MESSAGE_CHARS;
+    const text = sanitizeForDiscord(this.reasoningBuffer).trim();
+    if (text.length === 0) {
+      return "🤔 *thinking…*";
+    }
+    const budget = max - prefix.length - 1 /* closing * */ - 1 /* leading … */;
+    const tail = text.length > budget ? "…" + text.slice(text.length - budget) : text;
+    return prefix + tail + "*";
   }
 
   private stopTyping(): void {

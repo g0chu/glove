@@ -2,12 +2,12 @@ import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { QueueStore } from "./bot/queue.js";
-import { DISCORD_FORMAT_NOTE } from "./bot/format.js";
 import { ResponseWriter } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
 import { ConversationStore, toRequestMessages } from "./llm/history.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
+import { formatToolCall } from "./tools/activity.js";
 import { TOOLS_SYSTEM_NOTE, buildTools } from "./tools/index.js";
 import { runToolTurn } from "./tools/loop.js";
 
@@ -71,6 +71,7 @@ async function main(): Promise<void> {
       log.error(`channel ${channelId} not found or not text-based; skipping turn`);
       return;
     }
+    const textChannel = channel;
 
     const writer = new ResponseWriter({
       channel,
@@ -84,18 +85,38 @@ async function main(): Promise<void> {
       // onToolRound), the tools run, and the next round continues with the
       // results in context. Only the final reply is posted and recorded.
       // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
-      // note is added when tools are registered; the Discord formatting
-      // note is always added (the output destination dictates it).
+      // note is added when tools are registered.
       const hasTools = tools.registry.size > 0;
-      const systemPrompt = [cfg.model.systemPrompt, hasTools ? TOOLS_SYSTEM_NOTE : null, DISCORD_FORMAT_NOTE]
+      const systemPrompt = [cfg.model.systemPrompt, hasTools ? TOOLS_SYSTEM_NOTE : null]
         .filter((p): p is string => p !== null && p.trim().length > 0)
         .join("\n\n");
       const messages = toRequestMessages(history, systemPrompt);
       const outcome = await runToolTurn(messages, {
-        chat: (msgs, _onDelta, t) => llm.chat(msgs, (d) => writer.chunk(d), t),
+        chat: (msgs, _cbs, t) =>
+          llm.chat(
+            msgs,
+            {
+              onDelta: (d) => writer.chunk(d),
+              onReasoning: cfg.discord.showReasoning ? (d) => writer.reason(d) : undefined,
+            },
+            t,
+          ),
         registry: tools.registry,
         maxRounds: cfg.tools.maxRounds,
         onToolRound: () => writer.discard(),
+        onToolCalls: async (calls) => {
+          if (!cfg.discord.showToolActivity) return;
+          // One persistent message per call. Bot messages never enter the
+          // channel history (isTrackable), so the model's context is
+          // untouched — the results, which stay internal, are what matter.
+          for (const call of calls) {
+            try {
+              await textChannel.send(formatToolCall(call));
+            } catch (err) {
+              log.warn(`failed to post tool activity: ${errMsg(err)}`);
+            }
+          }
+        },
       });
       if (outcome.toolRounds > 0) {
         log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);

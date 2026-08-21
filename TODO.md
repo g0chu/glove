@@ -4,7 +4,7 @@ Snapshot (updated after the in-process migration): both tool families now
 run **in-process in the bot** — `src/tools/web/` (ssrf, fetcher, extract,
 search, cache) and `src/tools/file/` (paths, ops). The Python sidecar
 (`tools/`) and `docker-compose.yml` were removed; no Docker anywhere.
-`npm test` (50 check groups) + `npm run typecheck` are green; the migration
+`npm test` (62 check groups) + `npm run typecheck` are green; the migration
 is committed.
 
 ## Done (original sidecar migration — historical; the sidecar was later removed)

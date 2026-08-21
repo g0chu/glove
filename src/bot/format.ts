@@ -2,19 +2,11 @@
  * Discord text formatting for model output.
  *
  * Discord renders CommonMark-ish markdown but has no math support, so any
- * LaTeX a model emits ($...$) would show as raw source. Two layers handle
- * that: DISCORD_FORMAT_NOTE tells the model up front not to emit math
- * markup, and sanitizeForDiscord rewrites the common cases to plain
- * Unicode text as a backstop (the model is not always compliant, and the
- * note does not help a model that has already started emitting math).
+ * LaTeX a model emits ($...$) would show as raw source. sanitizeForDiscord
+ * rewrites the common cases to plain Unicode text before anything is
+ * posted or recorded (the model is not always compliant); anything
+ * unmappable is kept as close to the original as possible.
  */
-
-/** Appended to the system prompt of every request (see index.ts). */
-export const DISCORD_FORMAT_NOTE: string = [
-  "Formatting: your replies are posted to a Discord channel.",
-  "- Discord renders markdown but NOT LaTeX: never use $...$ or \\command math; write math and special symbols as plain Unicode instead (e.g. VO2max -> VO₂max, H+ -> H⁺, use ↑ ↓ ≈ ± α).",
-  "- Each message is limited to 2000 characters; long answers are split into several messages. Keep answers compact and keep tables small enough to fit in one message.",
-].join("\n");
 
 /** LaTeX command names mapped to Unicode (no backslash, case-sensitive). */
 const LATEX_UNICODE: Record<string, string> = {

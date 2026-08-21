@@ -6,6 +6,10 @@ export interface DiscordConfig {
   guildId: string;
   typingIntervalMs: number;
   streamUpdateThrottleMs: number;
+  /** Show the model's streamed reasoning ("thinking") live, when the endpoint sends it. */
+  showReasoning: boolean;
+  /** Show which tools are running while a turn executes (names + args; results never shown). */
+  showToolActivity: boolean;
 }
 
 export interface ModelConfig {
@@ -141,6 +145,8 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       guildId,
       typingIntervalMs: intEnv("DISCORD_TYPING_INTERVAL_MS", 5000, 1000),
       streamUpdateThrottleMs: intEnv("DISCORD_STREAM_UPDATE_THROTTLE_MS", 2000, 500),
+      showReasoning: boolEnv("DISCORD_SHOW_REASONING", true),
+      showToolActivity: boolEnv("DISCORD_SHOW_TOOL_ACTIVITY", true),
     },
     model: {
       apiUrl,

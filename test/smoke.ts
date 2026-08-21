@@ -20,6 +20,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
+import { formatToolCall } from "../src/tools/activity.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
 import { FetchCache } from "../src/tools/web/cache.js";
 import { extractTitle, extractContent } from "../src/tools/web/extract.js";
@@ -58,6 +59,8 @@ const ok = (name: string): void => {
   assert.equal(config.model.apiKey, "k1");
   assert.equal(config.discord.typingIntervalMs, 5000); // default
   assert.equal(config.discord.streamUpdateThrottleMs, 2000); // default
+  assert.equal(config.discord.showReasoning, true); // default
+  assert.equal(config.discord.showToolActivity, true); // default
   ok("config: parses valid env and applies defaults");
 
   const { errors: badErrors } = parseConfig({
@@ -66,8 +69,10 @@ const ok = (name: string): void => {
     MODEL_API_URL: "not a url",
     MODEL_TIMEOUT_S: "abc",
     MODEL_STREAM: "banana",
+    DISCORD_SHOW_REASONING: "maybe",
   });
-  assert.ok(badErrors.length >= 4, `expected >= 4 errors, got ${badErrors.length}`);
+  assert.ok(badErrors.length >= 5, `expected >= 5 errors, got ${badErrors.length}`);
+  assert.ok(badErrors.some((e) => e.includes("DISCORD_SHOW_REASONING")), `got: ${badErrors.join("; ")}`);
   ok("config: reports missing/invalid values");
 
   const { config: tc, errors: te } = parseConfig({
@@ -86,8 +91,12 @@ const ok = (name: string): void => {
     FILETOOLS_READ_MAX_BYTES: "4096",
     TOOLS_MAX_RESULT_CHARS: "12345",
     TOOLS_MAX_ROUNDS: "7",
+    DISCORD_SHOW_REASONING: "false",
+    DISCORD_SHOW_TOOL_ACTIVITY: "false",
   });
   assert.deepEqual(te, []);
+  assert.equal(tc.discord.showReasoning, false);
+  assert.equal(tc.discord.showToolActivity, false);
   assert.equal(tc.tools.web.enabled, true);
   assert.equal(tc.tools.web.timeoutMs, 12000);
   assert.equal(tc.tools.web.fetchMaxBytes, 2048);
@@ -503,6 +512,78 @@ const ok = (name: string): void => {
   assert.equal(f.sent[0], "The rate goes ↑ and H⁺ matters");
   assert.equal(p6!.text, "The rate goes ↑ and H⁺ matters", "history records the sanitized text");
   ok("writer: LaTeX sanitized before posting and recording");
+
+  // reasoning preview: shown live, capped at 2000 chars (tail kept), and
+  // the first content delta takes over the SAME message; reasoning is
+  // never posted or recorded
+  const g = makeChannel();
+  const w7 = new ResponseWriter({
+    channel: g.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w7.start();
+  w7.reason("Let me think step by step. First, the units; ");
+  await ticks(2);
+  assert.equal(g.sent.length, 1, "thinking preview creates the live message");
+  assert.match(g.sent[0], /^🤔 \*thinking: /);
+  assert.ok(g.sent[0].includes("step by step"), "reasoning text visible live");
+  w7.reason("x".repeat(5000));
+  await ticks(2);
+  const thinkLive = g.getLive()!.content;
+  assert.equal(thinkLive.length, 2000, `reasoning preview capped at 2000 (got ${thinkLive.length})`);
+  assert.ok(thinkLive.startsWith("🤔 *thinking: …"), "truncated with a leading …");
+  assert.ok(thinkLive.endsWith("*"));
+  w7.chunk("The answer is 42.");
+  await ticks(2);
+  assert.equal(g.sent.length, 1, "no second message");
+  assert.equal(g.getLive()!.content, "The answer is 42.", "reply replaces the thinking preview");
+  const p7 = await w7.finish("The answer is 42.");
+  assert.equal(p7!.text, "The answer is 42.", "reasoning is not posted or recorded");
+  ok("writer: reasoning preview live-capped, morphs into the reply, never recorded");
+
+  // discard() also clears the reasoning buffer: the next round's thinking
+  // starts fresh instead of continuing the old one
+  const actMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const actChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (content: string) => {
+      const m = { id: `a${String(actMsgs.length)}`, content, deleted: false };
+      actMsgs.push(m);
+      return {
+        id: m.id,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const w8 = new ResponseWriter({
+    channel: actChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w8.start();
+  w8.reason("old round thinking…");
+  await ticks(2);
+  assert.equal(actMsgs.length, 1, "thinking preview creates the live message");
+  assert.match(actMsgs[0].content, /thinking/);
+  w8.discard();
+  await ticks(3);
+  assert.equal(actMsgs[0].deleted, true, "preview deleted on discard");
+  w8.reason("fresh round thinking");
+  await ticks(2);
+  assert.equal(actMsgs.length, 2, "next round gets a fresh message");
+  assert.match(actMsgs[1].content, /fresh round/);
+  assert.doesNotMatch(actMsgs[1].content, /old round/, "cleared reasoning does not leak into the new round");
+  const p8 = await w8.finish("done");
+  assert.equal(p8!.text, "done");
+  ok("writer: discard() clears the reasoning buffer, next round is fresh");
 }
 
 // -------------------------------------------------------------- executor --
@@ -580,14 +661,16 @@ const ok = (name: string): void => {
   ];
   let i = 0;
   const specsSeen: Array<unknown> = [];
+  const callsSeen: Array<unknown> = [];
   const messages: ChatMessage[] = [{ role: "user", content: "go" }];
   const out = await runToolTurn(messages, {
-    chat: async (_msgs, _d, tools) => {
+    chat: async (_msgs, _cb, tools) => {
       specsSeen.push(tools);
       return script[i++];
     },
     registry,
     maxRounds: 3,
+    onToolCalls: (calls) => callsSeen.push(calls),
   });
   assert.equal(out.content, "final answer");
   assert.equal(out.toolRounds, 1);
@@ -601,19 +684,23 @@ const ok = (name: string): void => {
   const prev = messages[messages.length - 2];
   assert.equal(prev.role, "assistant");
   assert.deepEqual(prev.toolCalls, script[0].toolCalls);
+  assert.deepEqual(callsSeen, [script[0].toolCalls], "onToolCalls fires once with the round's calls");
   ok("loop: tool round executed, results appended, final answer returned");
 
   // budget exhausted: the model keeps requesting tools
   let toolRoundSignals = 0;
+  const callsSeen2: Array<unknown> = [];
   const out2 = await runToolTurn([{ role: "user", content: "go" }], {
     chat: async () => ({ content: "", toolCalls: [{ id: "t", name: "echo", arguments: "{}" }] }),
     registry,
     maxRounds: 2,
     onToolRound: () => toolRoundSignals++,
+    onToolCalls: (calls) => callsSeen2.push(calls),
   });
   assert.equal(out2.exhausted, true);
   assert.equal(out2.toolRounds, 2);
   assert.equal(toolRoundSignals, 3, "onToolRound fires for every tool-call response, incl. the cutoff");
+  assert.equal(callsSeen2.length, 2, "onToolCalls fires only for executed rounds, not the cutoff");
   ok("loop: maxRounds cutoff reported as exhausted");
 
   // empty registry: plain chat, no tools argument
@@ -629,6 +716,27 @@ const ok = (name: string): void => {
   assert.equal(out3.content, "hi");
   assert.equal(gotTools, undefined, "no tools argument when the registry is empty");
   ok("loop: empty registry means a plain chat");
+}
+
+// ------------------------------------------------------------- activity --
+{
+  // one persistent line per call: icon, name, up to two args, … for the rest
+  assert.equal(
+    formatToolCall({ id: "a1", name: "web_search", arguments: '{"query":"quantum computing","n":5,"lang":"en"}' }),
+    '🔎 *web_search(query="quantum computing", n=5, …)*',
+  );
+  assert.equal(formatToolCall({ id: "a2", name: "file_read", arguments: '{"path":"notes.md"}' }), '📁 *file_read(path="notes.md")*');
+  assert.equal(formatToolCall({ id: "a3", name: "mystery_tool", arguments: "not json" }), "🔧 *mystery_tool*", "unparseable args tolerated");
+
+  const longUrl = "https://example.com/" + "x".repeat(200);
+  const oneLine = formatToolCall({ id: "b1", name: "web_fetch", arguments: JSON.stringify({ url: longUrl }) });
+  assert.ok(oneLine.includes("…"), "long values truncated");
+  assert.ok(oneLine.length < 200, `line stays short (${oneLine.length})`);
+
+  assert.equal(formatToolCall({ id: "d1", name: "web_search", arguments: '{"query":"a*b*c"}' }), '🔎 *web_search(query="abc")*', "asterisks dropped so the italics stay intact");
+  // JSON-escaped backslash: the parsed query value is the LaTeX `$\alpha$`
+  assert.equal(formatToolCall({ id: "d2", name: "web_search", arguments: '{"query":"$x^2$ and $\\\\alpha$"}' }), '🔎 *web_search(query="x² and α")*', "math in args sanitized");
+  ok("activity: one line per call, args truncated, asterisks dropped, math sanitized");
 }
 
 // ------------------------------------------------------------ web tools --
@@ -947,6 +1055,23 @@ const ok = (name: string): void => {
         res.end();
         return;
       }
+      if (url.includes("reasoning")) {
+        // Some endpoints stream the model's thinking under `reasoning`,
+        // others under `reasoning_content`; both must reach onReasoning.
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning: "Let me " } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "think." } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "42" } }] })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+      if (url.includes("reasonjson")) {
+        // Non-stream: the whole thinking arrives as one field on the message.
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "the answer", reasoning_content: "the thinking" } }] }));
+        return;
+      }
       if (url.includes("tooljson")) {
         // Non-stream: whole tool_calls, arguments as a JSON object (not a string).
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -987,10 +1112,47 @@ const ok = (name: string): void => {
     stream: true,
     timeoutMs: 5000,
   });
-  const full = await streamClient.chat([{ role: "user", content: "hi" }], (d) => deltas.push(d));
+  const full = await streamClient.chat([{ role: "user", content: "hi" }], { onDelta: (d) => deltas.push(d) });
   assert.equal(full.content, "Hello world");
   assert.deepEqual(full.toolCalls, []);
   assert.deepEqual(deltas, ["Hel", "lo ", "world"]);
+
+  // streamed reasoning/thinking: both field names reach onReasoning, never
+  // onDelta, and the result's content is untouched
+  const rDeltas: string[] = [];
+  const rContent: string[] = [];
+  const rRes = await new LlmClient({
+    apiUrl: `${base}/v1/reasoning`,
+    apiKey: "none",
+    model: "local",
+    stream: true,
+    timeoutMs: 5000,
+  }).chat(
+    [{ role: "user", content: "?" }],
+    {
+      onDelta: (d) => rContent.push(d),
+      onReasoning: (d) => rDeltas.push(d),
+    },
+  );
+  assert.equal(rRes.content, "42");
+  assert.deepEqual(rRes.toolCalls, []);
+  assert.deepEqual(rContent, ["42"], "content deltas untouched");
+  assert.deepEqual(rDeltas, ["Let me ", "think."], "reasoning and reasoning_content both picked up");
+  ok("llm: streamed reasoning reaches onReasoning only");
+
+  // non-stream: the reasoning blob is handed over whole
+  const rDeltasNs: string[] = [];
+  const rNs = await new LlmClient({
+    apiUrl: `${base}/v1/reasonjson`,
+    apiKey: "none",
+    model: "m",
+    stream: false,
+    timeoutMs: 5000,
+  }).chat([{ role: "user", content: "?" }], { onReasoning: (d) => rDeltasNs.push(d) });
+  assert.equal(rNs.content, "the answer");
+  assert.deepEqual(rDeltasNs, ["the thinking"], "non-stream reasoning handed over whole");
+  ok("llm: non-stream reasoning handed to onReasoning");
+
   const r0 = seenRequests[0];
   assert.equal(r0.auth, "Bearer none");
   assert.equal(r0.ct, "application/json");
