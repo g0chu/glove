@@ -36,11 +36,21 @@ export interface WebToolsConfig {
   searchMaxResults: number;
 }
 
-/** File tool family: a Dockerized sidecar the bot calls locally. */
+/**
+ * File tool family (in-process): a persistent workspace directory on the
+ * host that the bot can list/read/write/edit/search. All paths are
+ * confined to the workspace (see src/tools/file/paths.ts).
+ */
 export interface FileToolsConfig {
   enabled: boolean;
-  baseUrl: string;
-  timeoutMs: number;
+  workspace: string;
+  readMaxBytes: number;
+  writeMaxBytes: number;
+  listMaxEntries: number;
+  searchMaxResults: number;
+  searchMaxFiles: number;
+  searchMaxFileBytes: number;
+  lineMaxChars: number;
 }
 
 export interface ToolsConfig {
@@ -122,9 +132,6 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
   const apiUrl = required("MODEL_API_URL");
   if (apiUrl) httpUrlOk("MODEL_API_URL", apiUrl);
 
-  const fileBaseUrl = optional("FILETOOLS_BASE_URL", "http://127.0.0.1:8378");
-  httpUrlOk("FILETOOLS_BASE_URL", fileBaseUrl);
-
   const config: Config = {
     discord: {
       token,
@@ -145,7 +152,9 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
     },
     tools: {
       // Off by default: not every Chat Completions endpoint supports
-      // function calling. The file sidecar must also be running first.
+      // function calling. Both families run in-process, so enabling one
+      // only needs the env vars below (and, for file tools, the workspace
+      // directory on disk).
       web: {
         enabled: boolEnv("WEBTOOLS_ENABLED", false),
         timeoutMs: intEnv("WEBTOOLS_TIMEOUT_S", 90, 1) * 1000,
@@ -157,8 +166,14 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       },
       file: {
         enabled: boolEnv("FILETOOLS_ENABLED", false),
-        baseUrl: fileBaseUrl,
-        timeoutMs: intEnv("FILETOOLS_TIMEOUT_S", 30, 1) * 1000,
+        workspace: optional("FILETOOLS_WORKSPACE", "./workspace"),
+        readMaxBytes: intEnv("FILETOOLS_READ_MAX_BYTES", 1_000_000, 1_024),
+        writeMaxBytes: intEnv("FILETOOLS_WRITE_MAX_BYTES", 5_000_000, 1_024),
+        listMaxEntries: intEnv("FILETOOLS_LIST_MAX_ENTRIES", 500, 1),
+        searchMaxResults: intEnv("FILETOOLS_SEARCH_MAX_RESULTS", 500, 1),
+        searchMaxFiles: intEnv("FILETOOLS_SEARCH_MAX_FILES", 10_000, 1),
+        searchMaxFileBytes: intEnv("FILETOOLS_SEARCH_MAX_FILE_BYTES", 5_000_000, 1_024),
+        lineMaxChars: intEnv("FILETOOLS_LINE_MAX_CHARS", 500, 20),
       },
       maxRounds: intEnv("TOOLS_MAX_ROUNDS", 5, 1),
     },

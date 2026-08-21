@@ -48,17 +48,19 @@ npm run dev            # or: npm run build && npm start
 
 ## Tools (web search/fetch + file workspace)
 
-The bot can call two optional Dockerized Python sidecars. Both are **opt-in**
-(default `false`) and need a model endpoint that supports function calling
-(`tools`). With both disabled, the bot behaves exactly as before.
+The bot can run two optional tool families, both **in-process** (no sidecars,
+no Docker). Both are **opt-in** (default `false`) and need a model endpoint
+that supports function calling (`tools`). With both disabled, the bot behaves
+exactly as before.
 
-- **webtools** (`:8377`): `web_search` (DuckDuckGo via `ddgs`) and
-  `web_fetch` (plain pinned-socket HTTP with readability extraction, headless
-  Chromium fallback for JavaScript-heavy pages, result cache with TTL).
-- **filetools** (`:8378`): `file_list`, `file_read`, `file_write`, `file_edit`,
-  `file_delete`, `file_search` over a persistent workspace. The bot's file
-  workspace lives in **`./workspace`** next to the repo (gitignored); it is
-  bind-mounted into the container and survives restarts and rebuilds.
+- **web tools**: `web_search` (DuckDuckGo) and `web_fetch` (plain
+  pinned-socket HTTP fetch with SSRF protection, content extraction, and a
+  TTL-bounded result cache). No browser rendering, so JavaScript-heavy pages
+  may come back incomplete.
+- **file tools**: `file_list`, `file_read`, `file_write`, `file_edit`,
+  `file_delete`, `file_search` over a persistent workspace. The workspace
+  lives in **`./workspace`** next to the repo (gitignored) and survives
+  restarts.
 
 A turn may run several model rounds: rounds that end in tool calls are
 transient (their streamed preview is deleted), the tools execute, and the
@@ -67,31 +69,23 @@ posted and recorded. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
 
 ### Setup
 
-```bash
-docker compose build
-docker compose up -d webtools            # web search + fetch
-docker compose --profile files up -d     # + file workspace
-```
-
-Then set `WEBTOOLS_ENABLED=true` and/or `FILETOOLS_ENABLED=true` in `.env`
-and restart the bot.
+Nothing to build or run — the tools live in the bot process. Just set
+`WEBTOOLS_ENABLED=true` and/or `FILETOOLS_ENABLED=true` in `.env` and restart
+the bot.
 
 ### Notes
 
-- **Security:** the sidecar ports bind to `127.0.0.1` only. `web_fetch`
-  validates every URL against an SSRF blocklist (loopback, RFC1918,
-  link-local/metadata, CGNAT, …) and connects to the *resolved* IP to
-  prevent DNS rebinding; redirects are re-validated hop by hop (max 5).
-  The browser fallback cannot pin DNS (Chromium resolves itself), so it is
-  pre-validation only — a documented residual, fine for a single-user bot.
+- **Security:** `web_fetch` validates every URL against an SSRF blocklist
+  (loopback, RFC1918, link-local/metadata, CGNAT, …) and connects to the
+  *resolved* IP to prevent DNS rebinding; redirects are re-validated hop by
+  hop (max 5).
 - `file_edit` replaces an exact text span; `new_text` may be empty (deleting
   the span). Paths are confined to the workspace; symlink escapes are rejected.
 - The model endpoint must speak function calling (e.g. llama.cpp with a
   tool-supporting chat template). If the endpoint rejects `tools`, keep the
   `*_ENABLED` flags off.
-- Sidecar env vars (`FETCH_TIMEOUT_S`, `CACHE_TTL_S`, `BROWSER_ENABLED`,
-  `WORKSPACE_DIR`, caps, …) are documented in `tools/server/config.py` and
-  have sensible defaults; the bot-side flags are in `.env.example`.
+- Per-tool caps (fetch size, redirect hops, cache, search result caps,
+  workspace limits, …) are in `.env.example` and have sensible defaults.
 
 ## Configuration
 
@@ -105,5 +99,4 @@ See [.env.example](.env.example) for the documented list.
 | `npm run build` | compile TypeScript to `dist/` |
 | `npm start` | run the compiled bot |
 | `npm run typecheck` | type-check without emitting |
-| `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, LLM client incl. tool calls vs. a mock endpoint) |
-| `.venv/bin/python tools/test/smoke.py` | sidecar smoke tests (ssrf, paths, extract, search, cache, all endpoints via TestClient) |
+| `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file tools, LLM client incl. tool calls vs. a mock endpoint) |

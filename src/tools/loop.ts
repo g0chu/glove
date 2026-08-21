@@ -6,7 +6,7 @@ import { executeToolCalls, ToolRegistry } from "./executor.js";
  * content, executing the tools it asks for in between.
  *
  * Kept pure (all I/O via `deps.chat`) so the loop is unit-testable without
- * a model, a sidecar, or Discord. The intermediate assistant/tool messages
+ * a model, the network, or Discord. The intermediate assistant/tool messages
  * live only in this function's `messages` array — the channel history only
  * ever sees the final posted reply, so the sliding-window semantics are
  * untouched.

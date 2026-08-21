@@ -2,9 +2,7 @@ node_modules/
 dist/
 .env
 *.log
-# Bot file workspace (mounted into the filetools container)
+# Bot file workspace (lives on the host; accessed directly by the bot process)
 workspace/
+# obsolete Python venv from the removed sidecar (safe to delete from disk)
 .venv/
-# Python bytecode from running the sidecar smoke tests on the host
-__pycache__/
-*.pyc
