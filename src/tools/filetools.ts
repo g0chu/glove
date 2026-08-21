@@ -11,9 +11,6 @@ import {
   type FileOpsOptions,
 } from "./file/ops.js";
 
-/** Hard cap on one tool result before it is handed to the model. */
-const MAX_RESULT_CHARS = 200_000;
-
 /** String argument that must be present (may be empty, e.g. deleting text). */
 function argPresentString(args: Record<string, unknown>, key: string): string {
   const v = args[key];
@@ -30,13 +27,11 @@ function asBool(v: unknown): boolean {
   return v === true;
 }
 
-function cap(text: string): string {
-  return text.length > MAX_RESULT_CHARS ? `${text.slice(0, MAX_RESULT_CHARS)}\n…[truncated]` : text;
-}
-
 export interface FileToolsOptions extends FileOpsOptions {
   /** Workspace directory the file tools operate in (on the bot's host). */
   workspace: string;
+  /** Hard cap on characters in one tool result. */
+  maxResultChars: number;
 }
 
 /**
@@ -48,11 +43,18 @@ export interface FileToolsOptions extends FileOpsOptions {
 export class FileTools {
   constructor(private readonly opts: FileToolsOptions) {}
 
+  /** Hard-cap one tool result before it is handed to the model. */
+  private cap(text: string): string {
+    return text.length > this.opts.maxResultChars
+      ? `${text.slice(0, this.opts.maxResultChars)}\n…[truncated]`
+      : text;
+  }
+
   /** List a directory (default: workspace root). */
   async list(path: string | undefined): Promise<string> {
     const data = await listFiles(this.opts.workspace, path, this.opts.listMaxEntries);
     const entries = data.entries;
-    if (entries.length === 0) return cap(`Directory "${data.path || "."}" is empty.`);
+    if (entries.length === 0) return this.cap(`Directory "${data.path || "."}" is empty.`);
     const lines = entries.map((e) => {
       const name = asString(e.name);
       if (e.type === "dir") return `- [dir] ${name}/`;
@@ -61,14 +63,14 @@ export class FileTools {
       return `- ${name}${size}${mtime}`;
     });
     const more = data.truncated ? `\n(listing truncated at ${entries.length} entries)` : "";
-    return cap(`Directory listing of "${data.path || "."}" (${entries.length} entries):\n${lines.join("\n")}${more}`);
+    return this.cap(`Directory listing of "${data.path || "."}" (${entries.length} entries):\n${lines.join("\n")}${more}`);
   }
 
   /** Read a text file (with offset/limit for large files). */
   async read(path: string, offset?: number, limit?: number): Promise<string> {
     const data = await readFile(this.opts.workspace, path, offset ?? 0, limit, this.opts.readMaxBytes);
     const more = data.truncated ? ` (more content follows — read on with offset ${data.offset + data.bytesRead})` : "";
-    return cap(`File "${path}" (bytes ${data.offset}-${data.offset + data.bytesRead} of ${data.size}${more}):\n${data.content}`);
+    return this.cap(`File "${path}" (bytes ${data.offset}-${data.offset + data.bytesRead} of ${data.size}${more}):\n${data.content}`);
   }
 
   /** Create or overwrite a file. */
@@ -93,10 +95,10 @@ export class FileTools {
   async search(pattern: string, path: string | undefined, literal: boolean, maxResults: number): Promise<string> {
     const data = await searchFiles(this.opts.workspace, path, pattern, literal, maxResults, this.opts);
     const matches = data.matches;
-    if (matches.length === 0) return cap(`No matches for ${literal ? "text" : "pattern"} "${pattern}".`);
+    if (matches.length === 0) return this.cap(`No matches for ${literal ? "text" : "pattern"} "${pattern}".`);
     const lines = matches.map((m) => `${m.file}:${m.line}: ${m.text.trim()}`);
     const more = data.truncated ? `\n(more matches exist — narrow the pattern or path)` : "";
-    return cap(`${matches.length} match(es) for "${pattern}":\n${lines.join("\n")}${more}`);
+    return this.cap(`${matches.length} match(es) for "${pattern}":\n${lines.join("\n")}${more}`);
   }
 
   /** No-op: local filesystem operations run to completion, nothing to cancel. */

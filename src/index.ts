@@ -2,6 +2,7 @@ import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { QueueStore } from "./bot/queue.js";
+import { DISCORD_FORMAT_NOTE } from "./bot/format.js";
 import { ResponseWriter } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
 import { ConversationStore, toRequestMessages } from "./llm/history.js";
@@ -82,12 +83,13 @@ async function main(): Promise<void> {
       // that ends in tool calls streams transient text (discarded via
       // onToolRound), the tools run, and the next round continues with the
       // results in context. Only the final reply is posted and recorded.
+      // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
+      // note is added when tools are registered; the Discord formatting
+      // note is always added (the output destination dictates it).
       const hasTools = tools.registry.size > 0;
-      const systemPrompt = hasTools
-        ? cfg.model.systemPrompt
-          ? `${cfg.model.systemPrompt}\n\n${TOOLS_SYSTEM_NOTE}`
-          : TOOLS_SYSTEM_NOTE
-        : cfg.model.systemPrompt;
+      const systemPrompt = [cfg.model.systemPrompt, hasTools ? TOOLS_SYSTEM_NOTE : null, DISCORD_FORMAT_NOTE]
+        .filter((p): p is string => p !== null && p.trim().length > 0)
+        .join("\n\n");
       const messages = toRequestMessages(history, systemPrompt);
       const outcome = await runToolTurn(messages, {
         chat: (msgs, _onDelta, t) => llm.chat(msgs, (d) => writer.chunk(d), t),

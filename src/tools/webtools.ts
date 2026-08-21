@@ -7,15 +7,8 @@ import { pinnedFetch } from "./web/fetcher.js";
 import { searchDuckDuckGo, type SearchFetch } from "./web/search.js";
 import { ToolError, type ResolveOptions } from "./web/ssrf.js";
 
-/** Hard cap on one tool result before it is handed to the model. */
-const MAX_RESULT_CHARS = 200_000;
-
 function asString(v: unknown): string {
   return typeof v === "string" ? v : "";
-}
-
-function cap(text: string): string {
-  return text.length > MAX_RESULT_CHARS ? `${text.slice(0, MAX_RESULT_CHARS)}\n…[truncated]` : text;
 }
 
 export interface WebToolsOptions {
@@ -31,6 +24,8 @@ export interface WebToolsOptions {
   cacheMaxEntries: number;
   /** Hard cap on search results (the tool arg is clamped to this). */
   searchMaxResults: number;
+  /** Hard cap on characters in one tool result. */
+  maxResultChars: number;
   /**
    * Escape hatch for tests only: when true, the SSRF guard no longer
    * refuses loopback/private addresses. Never enable in production.
@@ -55,6 +50,13 @@ export class WebTools {
     this.cache = new FetchCache(opts.cacheTtlMs, opts.cacheMaxEntries);
   }
 
+  /** Hard-cap one tool result before it is handed to the model. */
+  private cap(text: string): string {
+    return text.length > this.opts.maxResultChars
+      ? `${text.slice(0, this.opts.maxResultChars)}\n…[truncated]`
+      : text;
+  }
+
   /** Search the web; returns a formatted result list for the model. */
   async search(query: string, maxResults: number): Promise<string> {
     const limit = Math.min(maxResults, this.opts.searchMaxResults);
@@ -62,7 +64,7 @@ export class WebTools {
       fetchImpl: this.opts.searchFetch,
       timeoutMs: this.opts.timeoutMs,
     });
-    if (results.length === 0) return cap(`No web search results for "${query}".`);
+    if (results.length === 0) return this.cap(`No web search results for "${query}".`);
     const lines = results.map((r, i) =>
       `${i + 1}. ${asString(r.title).trim()}\n   ${asString(r.url).trim()}\n   ${asString(r.snippet).trim()}`
         .split("\n")
@@ -70,7 +72,7 @@ export class WebTools {
         .join("\n")
         .trim(),
     );
-    return cap(`Web search results for "${query}":\n\n${lines.join("\n\n")}`);
+    return this.cap(`Web search results for "${query}":\n\n${lines.join("\n\n")}`);
   }
 
   /** Fetch a page; returns title + main content for the model. */
@@ -128,7 +130,7 @@ export class WebTools {
     const header = title
       ? `Fetched ${finalUrl}\nTitle: ${title}\nMethod: ${via} | truncated: ${truncated}`
       : `Fetched ${finalUrl}\nMethod: ${via} | truncated: ${truncated}`;
-    return cap(`${header}\n\n${content}`);
+    return this.cap(`${header}\n\n${content}`);
   }
 }
 

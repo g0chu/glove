@@ -37,9 +37,15 @@ npm run dev            # or: npm run build && npm start
   while generating, message created on the first chunk, edits throttled to
   at least `DISCORD_STREAM_UPDATE_THROTTLE_MS` apart. Set `MODEL_STREAM=false`
   for a single reply instead.
-- **Chunking:** replies longer than Discord's 2000-char limit are split into
-  multiple messages, preferring newlines and never cutting inside a code
-  fence (fences are closed/reopened across the boundary).
+- **Chunking:** replies longer than Discord's 2000-char limit are split
+  into multiple messages, preferring newlines, keeping markdown tables
+  together (a table that must span messages repeats its header row in each
+  part), and never cutting inside a code fence (fences are closed/reopened
+  across the boundary).
+- **Formatting:** a short formatting note is appended to the system prompt
+  of every request (Discord markdown, no LaTeX, Unicode symbols, compact
+  tables), and any math the model still emits as `$...$` LaTeX is rewritten
+  to plain Unicode before posting.
 - **Queue:** one turn per channel at a time. Mentions that arrive while a
   reply is generating are queued and answered in order. Non-mentions on
   their own never trigger a reply, but they are part of the context.

@@ -1,10 +1,16 @@
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import { errMsg, log, truncate } from "../log.js";
+import { sanitizeForDiscord } from "./format.js";
 
 /** Discord hard message limit. */
 export const DISCORD_MAX_MESSAGE_CHARS = 2000;
 
 const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/;
+const TABLE_ROW_RE = /^\s*\|/;
+/** GFM separator row: | --- | :---: | ... (Discord tables need one). */
+const TABLE_SEP_RE = /^\s*\|(?:\s*:?-+:?\s*\|)+\s*$/;
+const HEADING_RE = /^#{1,6}\s/;
+const LIST_RE = /^\s*(?:[-*+]|\d{1,9}[.)])\s/;
 
 /**
  * Split text into Discord-safe chunks (<= maxChars each).
@@ -15,6 +21,13 @@ const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/;
  *    reopened at the start of the next (the opening token keeps its info
  *    string for highlighting; the closing token is bare, which both Common-
  *    Mark and Discord accept);
+ *  - keeps markdown tables together: a table that fits in one chunk is
+ *    never split across messages, and a table too long for one chunk is
+ *    split row by row with the header + separator row repeated in every
+ *    part (so each part still renders as a table);
+ *  - when a break is needed in prose, it prefers the last "block boundary"
+ *    in the current chunk (a blank line, or a heading / list item / table
+ *    row start) so sections, lists, and paragraphs stay intact;
  *  - a single line longer than maxChars is hard-split.
  */
 export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MESSAGE_CHARS): string[] {
@@ -22,18 +35,43 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
     return text.length > 0 ? [text] : [];
   }
 
+  const lines = text.split("\n");
   const chunks: string[] = [];
-  let cur = "";
+  let cur: string[] = []; // lines of the chunk being built
+  let curLen = 0; // length of cur.join("\n")
   let fenceReopen: string | null = null; // opening token of the open fence, e.g. "```ts"
   let fenceClose: string | null = null; // bare closing token, e.g. "```"
 
-  const emit = (): void => {
-    let part = cur;
-    if (fenceReopen && fenceClose) {
-      part = cur.length > 0 ? `${cur}\n${fenceClose}` : fenceClose;
+  /** Exclusive end of the table-row run starting at i, or -1 when not a row. */
+  const tableEnd = new Array<number>(lines.length).fill(-1);
+  for (let i = 0; i < lines.length; ) {
+    if (!TABLE_ROW_RE.test(lines[i])) {
+      i++;
+      continue;
     }
-    chunks.push(part);
-    cur = "";
+    let j = i + 1;
+    while (j < lines.length && TABLE_ROW_RE.test(lines[j])) j++;
+    for (let t = i; t < j; t++) tableEnd[t] = j;
+    i = j;
+  }
+  const isTableStart = (i: number): boolean =>
+    tableEnd[i] !== -1 && (i === 0 || !TABLE_ROW_RE.test(lines[i - 1]));
+
+  const appendLine = (line: string): void => {
+    cur.push(line);
+    curLen += line.length + (cur.length > 1 ? 1 : 0);
+  };
+
+  const emit = (): void => {
+    let part = cur.join("\n");
+    if (fenceReopen !== null && fenceClose !== null) {
+      part = part.length > 0 ? `${part}\n${fenceClose}` : fenceClose;
+    }
+    // Blank lines at a message boundary are invisible; drop leading ones.
+    part = part.replace(/^\n+/, "");
+    if (part.length > 0) chunks.push(part);
+    cur = [];
+    curLen = 0;
   };
 
   const hardSplit = (line: string, budget: number): void => {
@@ -41,34 +79,161 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
     for (let i = 0; i < line.length; i += budget) {
       chunks.push(line.slice(i, i + budget));
     }
-    cur = "";
     fenceReopen = null; // fence state cannot be preserved across raw splits
     fenceClose = null;
   };
 
-  for (const line of text.split("\n")) {
+  /**
+   * `line` does not fit the current chunk (and no fence is open). Try to
+   * break the current chunk at its last block boundary (a blank line, or a
+   * heading / list item / table row start) so the carried-over tail keeps
+   * sections, lists, and paragraphs intact; fall back to a plain flush.
+   */
+  const breakCarryOver = (line: string): void => {
+    const n = cur.length;
+    for (let s = n - 1; s >= 1; s--) {
+      const isBoundary =
+        cur[s] === "" ||
+        cur[s - 1] === "" ||
+        HEADING_RE.test(cur[s]) ||
+        LIST_RE.test(cur[s]) ||
+        TABLE_ROW_RE.test(cur[s]);
+      if (!isBoundary) continue;
+      const suffix = cur.slice(s);
+      if (suffix.join("\n").length + 1 + line.length <= maxChars) {
+        cur = cur.slice(0, s);
+        emit();
+        for (const tail of suffix) appendLine(tail);
+        appendLine(line);
+        return;
+      }
+    }
+    emit();
+    appendLine(line);
+  };
+
+  /** Sum of line lengths plus the newlines between them (0 for empty). */
+  const joinedLen = (arr: string[]): number => arr.reduce((a, l) => a + l.length + 1, -1);
+
+  /**
+   * Trailing lines at the end of cur that read as the table's intro: blank
+   * lines, headings, and a standalone short line (a title like
+   * "Summary Table" that models write without # markup). Returns the
+   * lines without leading blanks, or [] when there is none.
+   */
+  const tableIntro = (): string[] => {
+    const run: string[] = [];
+    for (let k = cur.length - 1; k >= 0; k--) {
+      const l = cur[k];
+      if (HEADING_RE.test(l) || l === "") {
+        run.unshift(l);
+        continue;
+      }
+      // A short line that stands alone (blank line or chunk start before
+      // it) right before the table: almost certainly the table's title.
+      if (run.length === 0 && l.length <= 80 && (k === 0 || cur[k - 1] === "")) {
+        run.unshift(l);
+      }
+      break;
+    }
+    while (run.length > 0 && run[0] === "") run.shift();
+    return run;
+  };
+
+  /**
+   * Emit a whole table run (rows). When the table fits in one chunk it is
+   * appended whole (flushing the current chunk first if needed). Otherwise
+   * it is split row by row, repeating the header + separator row in every
+   * part so each part still renders as a table; the parts are posted as
+   * their own chunks and cur is left empty. A heading line right before
+   * the table is carried into the table's chunk so it stays with it.
+   */
+  const emitTable = (rows: string[]): void => {
+    const hasHeader = rows.length > 1 && TABLE_SEP_RE.test(rows[1]);
+    const repeat = hasHeader ? [rows[0], rows[1]] : [];
+    const body = hasHeader ? rows.slice(2) : rows;
+    const total = joinedLen(rows);
+
+    if (total <= maxChars) {
+      if (cur.length === 0 || curLen + 1 + total <= maxChars) {
+        for (const r of rows) appendLine(r);
+        return;
+      }
+      const intro = tableIntro();
+      if (intro.length > 0 && joinedLen(intro) + 1 + total <= maxChars) {
+        // The trailing heading belongs to the table: keep it with the table.
+        cur = cur.slice(0, cur.length - intro.length);
+        curLen = cur.length > 0 ? joinedLen(cur) : 0;
+        emit();
+        for (const l of intro) appendLine(l);
+        for (const r of rows) appendLine(r);
+        return;
+      }
+      emit();
+      for (const r of rows) appendLine(r);
+      return;
+    }
+
+    // Table is too long for one chunk: pack rows into chunks.
+    const repeatLen = repeat.reduce((a, r) => a + r.length + 1, -1);
+    const parts: string[][] = [];
+    let part: string[] = repeat.length > 0 ? [...repeat] : [];
+    let partLen = repeat.length > 0 ? repeatLen : 0;
+    for (const r of body) {
+      if (r.length > maxChars) {
+        // Pathological: a single row longer than a whole chunk.
+        if (part.length > 0) parts.push(part);
+        for (let i = 0; i < r.length; i += maxChars) parts.push([r.slice(i, i + maxChars)]);
+        part = repeat.length > 0 ? [...repeat] : [];
+        partLen = repeat.length > 0 ? repeatLen : 0;
+        continue;
+      }
+      if (part.length > 0 && partLen + 1 + r.length > maxChars) {
+        parts.push(part);
+        part = repeat.length > 0 ? [...repeat] : [];
+        partLen = repeat.length > 0 ? repeatLen : 0;
+        if (partLen + 1 + r.length > maxChars) {
+          part = []; // row doesn't fit even under the repeated header
+          partLen = 0;
+        }
+      }
+      part = [...part, r];
+      partLen += r.length + 1;
+    }
+    if (part.length > 0) parts.push(part);
+
+    if (cur.length > 0) emit();
+    for (const p of parts) chunks.push(p.join("\n"));
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const fenceMatch = FENCE_RE.exec(line);
 
     if (line.length > maxChars) {
       hardSplit(line, maxChars);
+    } else if (fenceReopen === null && !fenceMatch && isTableStart(i)) {
+      const end = tableEnd[i];
+      emitTable(lines.slice(i, end));
+      i = end - 1; // continue with the line after the table
     } else {
-      const candidate = cur.length > 0 ? cur + "\n" + line : line;
-      if (candidate.length <= maxChars) {
-        cur = candidate;
+      const fits = cur.length === 0 || curLen + 1 + line.length <= maxChars;
+      if (fits) {
+        appendLine(line);
       } else if (fenceReopen !== null && fenceClose !== null) {
         // Must break inside a code fence: close this chunk, reopen in the next.
         const reopened = `${fenceReopen}\n${line}`;
         if (reopened.length <= maxChars) {
           emit();
-          cur = reopened;
+          cur = [reopened];
+          curLen = reopened.length;
         } else {
           // Pathological: the line alone is too long to share a chunk with
           // the fence token. Emit raw pieces and abandon fence tracking.
           hardSplit(line, maxChars);
         }
       } else {
-        emit();
-        cur = line;
+        breakCarryOver(line);
       }
     }
 
@@ -177,7 +342,7 @@ export class ResponseWriter {
     this.stopTyping();
     await this.chain.catch(() => {});
 
-    const text = fullText.trim() || this.buffer.trim();
+    const text = sanitizeForDiscord(fullText.trim() || this.buffer.trim());
     const posted: Message[] = [];
     try {
       if (!text) {
@@ -217,7 +382,7 @@ export class ResponseWriter {
     await this.chain.catch(() => {});
 
     const note = `⚠️ *generation failed:* ${truncate(errMsg(err), 400)}`;
-    const partial = this.buffer.trim();
+    const partial = sanitizeForDiscord(this.buffer.trim());
     const text = partial ? `${partial}\n\n${note}` : note;
     const posted: Message[] = [];
     try {
@@ -274,10 +439,11 @@ export class ResponseWriter {
   /** Live preview capped at 2000 chars: the head while it fits, the tail once it doesn't. */
   private livePreview(): string {
     const max = DISCORD_MAX_MESSAGE_CHARS;
-    if (this.buffer.length <= max) {
-      return this.buffer.trim().length > 0 ? this.buffer : "…";
+    const text = sanitizeForDiscord(this.buffer);
+    if (text.length <= max) {
+      return text.trim().length > 0 ? text : "…";
     }
-    return "…" + this.buffer.slice(this.buffer.length - (max - 3));
+    return "…" + text.slice(text.length - (max - 3));
   }
 
   private stopTyping(): void {
