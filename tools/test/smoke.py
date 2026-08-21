@@ -6,7 +6,8 @@ Covers: ssrf guard (fake resolver), workspace path confinement (symlink
 escape), HTML extraction (fixture), search normalization, fetch cache,
 all /file/* endpoints via TestClient (temp workspace), web /search with an
 injected backend, web /fetch against a local http.server (SSRF_ALLOW_PRIVATE),
-/health, and the 400 {"ok": false, "error"} failure shape.
+the browser fallback (injected fake browser), /health, and the 400
+{"ok": false, "error"} failure shape.
 """
 from __future__ import annotations
 
@@ -371,6 +372,21 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", "/page")
             self.end_headers()
             return
+        if self.path == "/empty":
+            # No text anywhere (not even a <title>): every extraction stage
+            # yields "", which is what triggers the browser fallback.
+            body = b"<!doctype html><html><head></head><body></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/gone":
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path == "/big":
             para = b"<p>" + b"lorem ipsum dolor sit " * 6 + b"</p>"
             body = (
@@ -466,6 +482,75 @@ def test_web_fetch():
         server.server_close()
 
 
+class _FakeBrowser:
+    """Stands in for Browser: records calls, returns fixed rendered HTML."""
+
+    def __init__(self, *, fail=False):
+        self.fail = fail
+        self.calls: list[str] = []
+
+    async def fetch(self, url: str) -> tuple[str, str]:
+        self.calls.append(url)
+        if self.fail:
+            raise ToolError("browser down")
+        return (
+            "Rendered Title",
+            "<html><head><title>Rendered Title</title></head>"
+            "<body><p>only the browser can see this text</p></body></html>",
+        )
+
+
+def test_browser_fallback():
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    server.hits = 0  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+
+    try:
+        browser = _FakeBrowser()
+        client = TestClient(
+            create_app(cfg=make_cfg(role="webtools", ssrf_allow_private=True), browser=browser)
+        )
+
+        # Plain HTTP succeeds but yields no extractable content -> the
+        # injected browser renders the page instead.
+        r = client.post("/fetch", json={"url": f"{base_url}/empty"})
+        data = r.json()
+        assert r.status_code == 200 and data["ok"] is True, data
+        assert data["method"] == "browser", data
+        assert data["title"] == "Rendered Title", data
+        assert "only the browser can see this text" in data["content"], data
+        assert browser.calls == [f"{base_url}/empty"], browser.calls
+        assert server.hits >= 1, "the plain HTTP fetch must have reached the server"  # type: ignore[attr-defined]
+        ok("webtools: empty plain-HTML page falls back to the browser")
+
+        # Plain HTTP errors AND the browser fails -> the root-cause HTTP
+        # error is reported (it is always set whenever the fallback triggers).
+        failing = _FakeBrowser(fail=True)
+        client2 = TestClient(
+            create_app(cfg=make_cfg(role="webtools", ssrf_allow_private=True), browser=failing)
+        )
+        r = client2.post("/fetch", json={"url": f"{base_url}/gone"})
+        assert r.status_code == 400 and r.json()["ok"] is False, r.json()
+        assert "404" in r.json()["error"], r.json()
+        assert failing.calls == [f"{base_url}/gone"], failing.calls
+        ok("webtools: plain-HTTP error takes precedence over browser error")
+
+        # Browser disabled (the default): the empty page is an honest 400
+        # carrying the root-cause plain-HTTP error (http_error is always set
+        # when the fallback triggers, so it takes precedence over the
+        # browser's own error).
+        client3 = TestClient(create_app(cfg=make_cfg(role="webtools", ssrf_allow_private=True)))
+        r = client3.post("/fetch", json={"url": f"{base_url}/empty"})
+        assert r.status_code == 400 and r.json()["ok"] is False, r.json()
+        assert "no extractable content" in r.json()["error"], r.json()
+        ok("webtools: disabled browser -> honest 400, not a silent empty page")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -477,6 +562,7 @@ def main() -> None:
         test_file_endpoints(tmp)
         test_web_search()
         test_web_fetch()
+        test_browser_fallback()
     print(f"\n{PASS} check groups passed")
 
 

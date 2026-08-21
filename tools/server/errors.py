@@ -2,7 +2,9 @@
 
 The bot's TS clients treat every non-2xx with a JSON ``error`` field as a
 tool error and hand the message to the model, so all failures in both
-sidecars raise :class:`ToolError` and are rendered as::
+sidecars raise :class:`ToolError` (or hit the :class:`OSError` handler for
+filesystem-level problems such as a workspace the container user cannot
+write) and are rendered as::
 
     400  {"ok": false, "error": "<message>"}
 """
@@ -42,3 +44,9 @@ def register_error_handlers(app: FastAPI) -> None:
             loc = ".".join(str(x) for x in e.get("loc", []) if str(x) != "body")
             parts.append(f"{loc}: {e.get('msg', 'invalid')}" if loc else str(e.get("msg", "invalid")))
         return _error_json("invalid request: " + "; ".join(parts))
+
+        @app.exception_handler(OSError)
+        async def _os_error(request: Request, exc: OSError) -> JSONResponse:  # noqa: ARG001
+            # e.g. PermissionError when the container user cannot write the
+            # bind-mounted workspace (host directory owned by another user).
+            return _error_json(f"filesystem error: {exc}")
