@@ -90,7 +90,7 @@ function parseV6(ip: string): Buffer | null {
     const h = [nums[0] * 256 + nums[1], nums[2] * 256 + nums[3]]
       .map((x) => x.toString(16).padStart(4, "0"))
       .join(":");
-    s = s.slice(0, v4Tail.index) + h;
+    s = s.slice(0, v4Tail.index) + ":" + h;
   }
   if (!s.includes(":")) return null;
   const halves = s.split("::");
