@@ -1,10 +1,11 @@
 import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
+import { buildChannelContext } from "./bot/context.js";
 import { isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { QueueStore } from "./bot/queue.js";
 import { ResponseWriter } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
-import { ConversationStore, toRequestMessages } from "./llm/history.js";
+import { ConversationStore } from "./llm/history.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
 import { formatToolCall } from "./tools/activity.js";
@@ -19,6 +20,7 @@ async function main(): Promise<void> {
     `model=${cfg.model.name}`,
     `endpoint=${cfg.model.apiUrl}`,
     `stream=${cfg.model.stream}`,
+    `images=${cfg.model.enableImages}`,
     `window=${cfg.model.contextMaxMessages}`,
   );
 
@@ -41,10 +43,11 @@ async function main(): Promise<void> {
   }
 
   /**
-   * One full turn for a queued mention. The mention is already in the
-   * channel history (every trackable message is appended on arrival); the
-   * request is built from the *current* snapshot, so edits that happened
-   * while the turn was queued are picked up.
+   * One full turn for a queued mention. The model's context is built at
+   * turn time from the channel's last N Discord messages (fetched live, so
+   * it survives bot restarts and is exactly what is in the channel); the
+   * mention itself is part of that window, so edits that happened while
+   * the turn was queued are picked up automatically.
    */
   const runTurn = async (channelId: string, mentionId: string): Promise<void> => {
     const history = histories.get(channelId);
@@ -79,7 +82,13 @@ async function main(): Promise<void> {
       throttleMs: cfg.discord.streamUpdateThrottleMs,
     });
     try {
-      writer.start();
+      // Build the context before the typing indicator starts: it is a
+      // channel fetch (+ image downloads), not model generation.
+      const botId = client.user?.id;
+      if (!botId) {
+        log.error(`turn in ${channelId}: bot user not available; skipping turn`);
+        return;
+      }
       // With tools enabled, the model may answer in several rounds: a round
       // that ends in tool calls streams transient text (discarded via
       // onToolRound), the tools run, and the next round continues with the
@@ -90,7 +99,19 @@ async function main(): Promise<void> {
       const systemPrompt = [cfg.model.systemPrompt, hasTools ? TOOLS_SYSTEM_NOTE : null]
         .filter((p): p is string => p !== null && p.trim().length > 0)
         .join("\n\n");
-      const messages = toRequestMessages(history, systemPrompt);
+      const messages = await buildChannelContext(textChannel, history, mentionId, {
+        botId,
+        systemPrompt,
+        maxMessages: cfg.model.contextMaxMessages,
+        enableImages: cfg.model.enableImages,
+        imagesMaxBytes: cfg.model.imagesMaxBytes,
+      });
+      if (messages === null) {
+        // Deleted, or pushed out of the channel's last N messages while queued.
+        log.info(`mention ${mentionId} in ${channelId} left the channel window; skipping turn`);
+        return;
+      }
+      writer.start();
       const outcome = await runToolTurn(messages, {
         chat: (msgs, _cbs, t) =>
           llm.chat(
@@ -140,7 +161,9 @@ async function main(): Promise<void> {
     log.info(`connected as ${client.user?.tag} (id ${client.user?.id})`);
     log.info(`responding to @mentions in guild ${cfg.discord.guildId}`);
     if (cfg.model.enableImages) {
-      log.warn("MODEL_ENABLE_IMAGES=true but image input is not implemented in v1; ignoring attachments");
+      log.info(
+        `image input enabled (png/jpeg/webp/gif, max ${cfg.model.imagesMaxBytes} bytes per image)`,
+      );
     }
   });
 

@@ -1,9 +1,12 @@
 /**
  * Smoke tests: config parsing, history window, code-fence-aware chunk
- * splitting, queue semantics, response writer behavior, the tool executor
- * and tool loop, the in-process web/file tools, and the LLM client
- * (stream + non-stream + tool calls + errors) against a local mock
- * OpenAI-compatible server. Run with: npm test
+ * splitting, image attachment downloads, turn-context building (last-N
+ * channel messages), queue semantics, response writer behavior (incl.
+ * multi-message streaming of long replies), the tool executor and tool
+ * loop, the in-process web/file/zim tools (against a synthetic ZIM file
+ * built in a temp dir), and the LLM client (stream +
+ * non-stream + tool calls + errors + multimodal wire shape) against a
+ * local mock OpenAI-compatible server. Run with: npm test
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -18,6 +21,8 @@ import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.
 import { ChannelQueue } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
+import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
+import { buildChannelContext, contextFromMessages, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -27,6 +32,9 @@ import { extractTitle, extractContent } from "../src/tools/web/extract.js";
 import { searchDuckDuckGo } from "../src/tools/web/search.js";
 import { resolveInWorkspace } from "../src/tools/file/paths.js";
 import * as fileOps from "../src/tools/file/ops.js";
+import { ZimReader } from "../src/tools/zim/reader.js";
+import { ZimTools, registerZimTools } from "../src/tools/zimtools.js";
+import { zstdCompressSync } from "node:zlib";
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 const ticks = async (n: number): Promise<void> => {
@@ -49,6 +57,7 @@ const ok = (name: string): void => {
     MODEL_TIMEOUT_S: "5",
     MODEL_CONTEXT_MAX_MESSAGES: "7",
     MODEL_API_KEY: "k1",
+    MODEL_IMAGES_MAX_BYTES: "2048",
   });
   assert.deepEqual(errors, []);
   assert.equal(config.discord.token, "tok");
@@ -57,6 +66,8 @@ const ok = (name: string): void => {
   assert.equal(config.model.timeoutMs, 5000);
   assert.equal(config.model.contextMaxMessages, 7);
   assert.equal(config.model.apiKey, "k1");
+  assert.equal(config.model.enableImages, false); // default
+  assert.equal(config.model.imagesMaxBytes, 2048);
   assert.equal(config.discord.typingIntervalMs, 5000); // default
   assert.equal(config.discord.streamUpdateThrottleMs, 2000); // default
   assert.equal(config.discord.showReasoning, true); // default
@@ -70,9 +81,11 @@ const ok = (name: string): void => {
     MODEL_TIMEOUT_S: "abc",
     MODEL_STREAM: "banana",
     DISCORD_SHOW_REASONING: "maybe",
+    MODEL_IMAGES_MAX_BYTES: "0",
   });
-  assert.ok(badErrors.length >= 5, `expected >= 5 errors, got ${badErrors.length}`);
+  assert.ok(badErrors.length >= 6, `expected >= 6 errors, got ${badErrors.length}`);
   assert.ok(badErrors.some((e) => e.includes("DISCORD_SHOW_REASONING")), `got: ${badErrors.join("; ")}`);
+  assert.ok(badErrors.some((e) => e.includes("MODEL_IMAGES_MAX_BYTES")), `got: ${badErrors.join("; ")}`);
   ok("config: reports missing/invalid values");
 
   const { config: tc, errors: te } = parseConfig({
@@ -123,6 +136,8 @@ const ok = (name: string): void => {
   assert.equal(td.tools.web.searchMaxResults, 10); // default
   assert.equal(td.tools.maxResultChars, 200_000); // default
   assert.equal(td.tools.maxRounds, 5);
+  assert.equal(td.model.enableImages, false, "image input off by default");
+  assert.equal(td.model.imagesMaxBytes, 10_485_760); // default
   ok("config: tools disabled by default");
 
   const { errors: toolErrs } = parseConfig({
@@ -315,6 +330,188 @@ const ok = (name: string): void => {
   assert.equal(sanitizeForDiscord("$$\\text{VO}_2 = \\text{CO} \\times a$$"), "VO₂ = CO × a");
   assert.equal(sanitizeForDiscord("$\\label{eq1} y$"), "y");
   ok("format: LaTeX math converted to Unicode, non-math $ left alone");
+}
+
+// --------------------------------------------------------------- images --
+{
+  // Production URL validation: only https on Discord's own CDN is trusted.
+  assert.equal(isDiscordCdnUrl("https://cdn.discordapp.com/attachments/1/2/3/x.png"), true);
+  assert.equal(isDiscordCdnUrl("http://cdn.discordapp.com/attachments/1/2/3/x.png"), false, "http refused");
+  assert.equal(isDiscordCdnUrl("https://evil.example.com/attachments/x.png"), false, "other hosts refused");
+  assert.equal(isDiscordCdnUrl("not a url"), false);
+  // Without an injected fetch, a non-CDN URL is refused before any network call.
+  const nonCdn = await fetchMessageImages(
+    [{ url: "https://evil.example.com/x.png", name: "x.png", size: 10, contentType: "image/png" }],
+    1024,
+  );
+  assert.equal(nonCdn.images.length, 0);
+  assert.match(nonCdn.notes[0], /not a discord attachment/);
+  ok("images: only https Discord-CDN URLs are trusted");
+
+  const att = (over: Partial<MessageAttachmentLike> = {}): MessageAttachmentLike => ({
+    url: "https://cdn.discordapp.com/attachments/1/2/3/img.png",
+    name: "img.png",
+    size: 3,
+    contentType: "image/png",
+    ...over,
+  });
+  const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+  const fetchImpl: ImageFetch = () => Promise.resolve(new Response(bytes));
+
+  // Success: a base64 data URI with the right MIME.
+  const ok1 = await fetchMessageImages([att()], 1024, { fetchImpl });
+  assert.equal(ok1.images.length, 1);
+  assert.equal(ok1.images[0].url, `data:image/png;base64,${bytes.toString("base64")}`);
+  assert.deepEqual(ok1.notes, []);
+  // Unsupported type -> note, no download.
+  const ok2 = await fetchMessageImages([att({ name: "x.bmp", contentType: "image/bmp" })], 1024, { fetchImpl });
+  assert.equal(ok2.images.length, 0);
+  assert.match(ok2.notes[0], /unsupported type image\/bmp/);
+  // Declared size over the cap -> note, no download.
+  const ok3 = await fetchMessageImages([att({ name: "big.png", size: 2048 })], 1024, { fetchImpl });
+  assert.equal(ok3.images.length, 0);
+  assert.match(ok3.notes[0], /2 KB exceeds the 1 KB limit/);
+  // Declared small but actually over the cap -> note after the download.
+  const ok4 = await fetchMessageImages([att({ name: "lie.png", size: 1 })], 2, { fetchImpl });
+  assert.equal(ok4.images.length, 0);
+  assert.match(ok4.notes[0], /exceeds/);
+  // Non-2xx and thrown fetch failures become notes, never exceptions.
+  const ok5 = await fetchMessageImages([att()], 1024, {
+    fetchImpl: () => Promise.resolve(new Response("nope", { status: 404 })),
+  });
+  assert.equal(ok5.images.length, 0);
+  assert.match(ok5.notes[0], /download failed \(HTTP 404\)/);
+  const ok6 = await fetchMessageImages([att()], 1024, {
+    fetchImpl: () => Promise.reject(new Error("dns down")),
+  });
+  assert.equal(ok6.images.length, 0);
+  assert.match(ok6.notes[0], /download failed/);
+  // More than the per-message cap: the rest are noted.
+  const ok7 = await fetchMessageImages(
+    [att({ name: "a.png" }), att({ name: "b.png" }), att({ name: "c.png" }), att({ name: "d.png" }), att({ name: "e.png" })],
+    1024,
+    { fetchImpl },
+  );
+  assert.equal(ok7.images.length, 4);
+  assert.equal(ok7.notes.length, 1);
+  assert.match(ok7.notes[0], /more than 4 images per message/);
+  ok("images: data URIs, type/size/HTTP failures become notes, per-message cap");
+}
+
+// ---------------------------------------------------------------- context --
+{
+  const authors = {
+    alice: { id: "alice", bot: false },
+    carl: { id: "carl", bot: true }, // another bot: unfiltered, enters as user
+    bot: { id: "bot1", bot: true },
+  };
+  let n = 0;
+  const m = (author: { id: string; bot: boolean }, content: string, attachments: MessageAttachmentLike[] = []): MessageLike => ({
+    id: `x${String(++n)}`,
+    content,
+    author,
+    attachments,
+  });
+
+  const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+  const imageFetch: ImageFetch = () => Promise.resolve(new Response(imgBytes));
+  const imgAtt: MessageAttachmentLike = { url: "https://cdn.discordapp.com/attachments/1/2/3/i.png", name: "img.png", size: imgBytes.length, contentType: "image/png" };
+  const bigAtt: MessageAttachmentLike = { url: "https://cdn.discordapp.com/attachments/1/2/3/b.png", name: "big.png", size: 2048, contentType: "image/png" };
+
+  const hello = m(authors.alice, "hello");
+  const oldReply = m(authors.bot, "old reply"); // not in history (bot restarted since)
+  const beep = m(authors.carl, "beep");
+  const think = m(authors.bot, "🤔 *thought for 3s*"); // our UI line
+  const activity = m(authors.bot, "🔎 *web_search(query=\"x\")*"); // our UI line
+  const chunkA = m(authors.bot, "part one");
+  const chunkB = m(authors.bot, "part two");
+  const thanks = m(authors.alice, "thanks");
+  const imgOnly = m(authors.alice, "", [imgAtt]);
+  const sure = m(authors.bot, "sure!");
+  const big = m(authors.alice, "look at this", [bigAtt]);
+  const errNote = m(authors.bot, "⚠️ *generation failed: boom*");
+  // the mention carries an image too: it must survive the history lookup
+  const mention = m(authors.alice, "<@bot1> describe this", [imgAtt]);
+  const fetchedList = [hello, oldReply, beep, think, activity, chunkA, chunkB, thanks, imgOnly, sure, big, errNote, mention];
+
+  const hist = new ChannelHistory(20);
+  hist.push("assistant", "full reply", [chunkA.id, chunkB.id], ["part one", "part two"]);
+  hist.push("assistant", "sure!", [sure.id]);
+  hist.push("assistant", "⚠️ *generation failed: boom*", [errNote.id]);
+  hist.push("user", "describe this", [mention.id]);
+
+  const opts = {
+    botId: "bot1",
+    systemPrompt: "sys",
+    maxMessages: 20,
+    enableImages: true,
+    imagesMaxBytes: 1024,
+    imageFetch,
+  };
+  const imgPart = { type: "image_url", image_url: { url: `data:image/png;base64,${imgBytes.toString("base64")}` } };
+  const res = await contextFromMessages(fetchedList, hist, mention.id, opts);
+  assert.deepEqual(res, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "old reply" },
+    { role: "user", content: "beep" },
+    { role: "assistant", content: "full reply" },
+    { role: "user", content: [{ type: "text", text: "thanks" }, imgPart] },
+    { role: "assistant", content: "sure!" },
+    { role: "user", content: "look at this\n*[attachment \"big.png\" not sent: 2 KB exceeds the 1 KB limit]*" },
+    { role: "assistant", content: "⚠️ *generation failed: boom*" },
+    { role: "user", content: [{ type: "text", text: "describe this" }, imgPart] },
+  ]);
+  ok("context: last-N mapping (roles, UI lines skipped, chunked reply once, merges, images, mention stripped)");
+
+  // Images disabled: attachments ignored entirely (no images, no notes).
+  const res2 = await contextFromMessages(fetchedList, hist, mention.id, { ...opts, enableImages: false });
+  assert.deepEqual(res2, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "old reply" },
+    { role: "user", content: "beep" },
+    { role: "assistant", content: "full reply" },
+    { role: "user", content: "thanks" },
+    { role: "assistant", content: "sure!" },
+    { role: "user", content: "look at this" },
+    { role: "assistant", content: "⚠️ *generation failed: boom*" },
+    { role: "user", content: "describe this" },
+  ]);
+  // The mention gone from the window (deleted / pushed out) -> null: skip the turn.
+  assert.equal(await contextFromMessages(fetchedList.slice(0, -1), hist, mention.id, opts), null);
+  ok("context: images disabled ignores attachments; mention gone -> null");
+
+  // Wrapper: fetches with limit = maxMessages, sorts oldest-first, and a
+  // fetch failure falls back to the in-memory window (bot keeps working).
+  const apiList = [
+    { id: "b", content: "second", createdTimestamp: 200, author: authors.alice, attachments: [] },
+    { id: "a", content: "first", createdTimestamp: 100, author: authors.alice, attachments: [] },
+  ];
+  let seenLimit: number | undefined;
+  const chan = {
+    messages: {
+      fetch: async (o: { limit?: number }) => {
+        seenLimit = o.limit;
+        return { values: () => apiList.values() };
+      },
+    },
+  } as unknown as GuildTextBasedChannel;
+  const wOpts = { botId: "bot1", systemPrompt: "", maxMessages: 20, enableImages: false, imagesMaxBytes: 1024 };
+  const wr = await buildChannelContext(chan, new ChannelHistory(20), "b", wOpts);
+  assert.equal(seenLimit, 20, "fetch limit is the window size");
+  assert.deepEqual(wr, [{ role: "user", content: "first\nsecond" }], "sorted oldest-first, same role merged");
+  assert.equal(await buildChannelContext(chan, new ChannelHistory(20), "nope", wOpts), null);
+
+  const throwing = { messages: { fetch: async () => { throw new Error("api down"); } } } as unknown as GuildTextBasedChannel;
+  const fh = new ChannelHistory(20);
+  fh.push("user", "hi", ["1"]);
+  const fb = await buildChannelContext(throwing, fh, "1", { ...wOpts, systemPrompt: "sys" });
+  assert.deepEqual(fb, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "hi" },
+  ], "fetch failure falls back to the in-memory window");
+  ok("context: wrapper fetch (limit, ordering) and in-memory fallback");
 }
 
 // ----------------------------------------------------------------- queue --
@@ -686,6 +883,54 @@ const ok = (name: string): void => {
   assert.equal(raceMsgs.length, 1, "the preview message was created");
   assert.equal(raceMsgs[0].deleted, true, "in-flight preview deleted on discard");
   ok("writer: discard() also deletes a preview whose initial send is in flight");
+
+  // long streaming reply: a fresh live message is created per ~2000-char
+  // slice, and the final post settles the live messages in place (no re-post)
+  const e = makeChannel();
+  const w12 = new ResponseWriter({
+    channel: e.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w12.start();
+  w12.chunk("a".repeat(2500));
+  await ticks(2);
+  assert.equal(e.sent.length, 2, "a second live message is created past 2000 chars");
+  assert.equal(e.sent[0].length, 2000, "first slice is exactly 2000");
+  assert.equal(e.sent[1].length, 500, "second slice holds the rest");
+  w12.chunk("b".repeat(2000));
+  await ticks(2);
+  assert.equal(e.sent.length, 3, "third live message as the reply keeps growing");
+  const full12 = "a".repeat(2500) + "b".repeat(2000);
+  const p12 = await w12.finish(full12);
+  assert.equal(e.sent.length, 3, "final chunks settle into the existing live messages");
+  assert.deepEqual(e.messages.map((c) => c.content.length), [2000, 2000, 500], "each slice holds its final chunk");
+  assert.equal(p12!.text, full12, "canonical reply recorded");
+  assert.equal(p12!.messageIds.length, 3, "one id per slice, in send order");
+  ok("writer: long reply streams as multiple live messages, settles in place");
+
+  // code fence spanning a slice boundary: every live message shows balanced
+  // fences while streaming (the preview uses the same splitter as the post)
+  const f2 = makeChannel();
+  const w13 = new ResponseWriter({
+    channel: f2.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w13.start();
+  const codeLines = Array.from({ length: 40 }, (_, i) => `const value${String(i).padStart(2, "0")} = ${"x".repeat(50)};`);
+  const codeText = ["Here is the code:", "```ts", ...codeLines, "```", "Done."].join("\n");
+  w13.chunk(codeText);
+  await ticks(2);
+  assert.ok(f2.sent.length >= 2, `fence spans a slice boundary (got ${f2.sent.length} messages)`);
+  for (const c of f2.sent) {
+    const fenceLines = c.split("\n").filter((l) => /^\s*(`{3,}|~{3,})/.test(l)).length;
+    assert.equal(fenceLines % 2, 0, `unbalanced fences in live message: ${JSON.stringify(c.slice(0, 40))}`);
+  }
+  const p13 = await w13.finish(codeText);
+  assert.ok(p13!.text.includes("```ts"), "final reply keeps the fence");
+  assert.equal(p13!.messageIds.length, f2.sent.length);
+  ok("writer: live slices keep code fences balanced across messages");
 }
 
 // -------------------------------------------------------------- executor --
@@ -1080,6 +1325,309 @@ const ok = (name: string): void => {
   }
 }
 
+// ------------------------------------------------------------ zim tools --
+// The ZIM (offline Wikipedia) reader and tools, exercised against a small
+// synthetic ZIM v6 archive built in a temp dir (one zstd whole-frame
+// cluster, one raw cluster, redirects, a non-C namespace).
+{
+  // -- synthetic archive writer
+  const wikiHtml = (inner: string): string =>
+    "<!doctype html><html><head><title>t</title></head><body>" +
+    '<div id="mw-content-text" class="mw-body-content"><div class="mw-parser-output">' +
+    inner +
+    '<div class="reflist"><ol class="references"><li>[1] a fake citation</li></ol></div>' +
+    '<div class="navbox">nav junk</div>' +
+    '<div class="zim-footer">This article is issued from Wikipedia.</div>' +
+    "</div></div></body></html>";
+
+  const clusterTable = (blobs: Buffer[], osz: number): Buffer => {
+    const n = blobs.length + 1; // one more offset than blobs
+    const table = Buffer.alloc(n * osz);
+    let pos = n * osz;
+    for (let i = 0; i < n; i++) {
+      if (osz === 4) table.writeUInt32LE(pos, i * 4);
+      else table.writeBigUInt64LE(BigInt(pos), i * 8);
+      if (i < blobs.length) pos += blobs[i].length;
+    }
+    return table;
+  };
+  const zstdCluster = (blobs: Buffer[]): Buffer =>
+    Buffer.concat([Buffer.from([0x05]), zstdCompressSync(Buffer.concat([clusterTable(blobs, 4), ...blobs]))]);
+  const rawCluster = (blobs: Buffer[]): Buffer =>
+    Buffer.concat([Buffer.from([0x01]), clusterTable(blobs, 4), ...blobs]);
+
+  const contentDirent = (ns: string, pathName: string, title: string, cluster: number, blob: number): Buffer => {
+    const fixed = Buffer.alloc(16);
+    fixed.writeUInt16LE(0, 0); // mime 0 = text/html
+    fixed[2] = 0;
+    fixed[3] = ns.charCodeAt(0);
+    fixed.writeUInt32LE(1, 4); // revision
+    fixed.writeUInt32LE(cluster, 8);
+    fixed.writeUInt32LE(blob, 12);
+    return Buffer.concat([fixed, Buffer.from(pathName + "\0"), Buffer.from(title + "\0")]);
+  };
+  const redirectDirent = (ns: string, pathName: string, title: string, target: number): Buffer => {
+    // A redirect dirent has a 12-byte fixed part (no cluster/blob fields).
+    const fixed = Buffer.alloc(12);
+    fixed.writeUInt16LE(0xffff, 0);
+    fixed[2] = 0;
+    fixed[3] = ns.charCodeAt(0);
+    fixed.writeUInt32LE(1, 4);
+    fixed.writeUInt32LE(target, 8);
+    return Buffer.concat([fixed, Buffer.from(pathName + "\0"), Buffer.from(title + "\0")]);
+  };
+
+  // Generic archive writer: [header][mime list][clusters][dirents]
+  // [pathPtr list][clusterPtr list][16 zero bytes]. Dirents must be
+  // pre-sorted by namespace+path.
+  const writeZimArchive = (file: string, clusters: Buffer[], dirents: Buffer[]): void => {
+    const mime = Buffer.concat([Buffer.from("text/html\0"), Buffer.from("text/plain\0"), Buffer.from("\0")]);
+    const base = 80 + mime.length;
+    const clusterPtr = Buffer.alloc(8 * clusters.length);
+    let cpos = base;
+    for (let i = 0; i < clusters.length; i++) {
+      clusterPtr.writeBigUInt64LE(BigInt(cpos), i * 8);
+      cpos += clusters[i].length;
+    }
+    const pathPtr = Buffer.alloc(8 * dirents.length);
+    let off = cpos;
+    for (let i = 0; i < dirents.length; i++) {
+      pathPtr.writeBigUInt64LE(BigInt(off), i * 8);
+      off += dirents[i].length;
+    }
+    const pathPtrPos = BigInt(off);
+    const clusterPtrPos = pathPtrPos + BigInt(pathPtr.length);
+    const header = Buffer.alloc(80);
+    header.writeUInt32LE(0x044d495a, 0); // magic
+    header.writeUInt16LE(6, 4);
+    header.writeUInt16LE(1, 6);
+    header.writeUInt32LE(dirents.length, 24);
+    header.writeUInt32LE(clusters.length, 28);
+    header.writeBigUInt64LE(pathPtrPos, 32);
+    header.writeBigUInt64LE(0xffffffffffffffffn, 40); // titlePtrPos (unused)
+    header.writeBigUInt64LE(clusterPtrPos, 48);
+    header.writeBigUInt64LE(80n, 56);
+    header.writeUInt32LE(0xffffffff, 64); // mainPage (unused)
+    header.writeUInt32LE(0xffffffff, 68); // layoutPage (unused);
+    header.writeBigUInt64LE(pathPtrPos + BigInt(pathPtr.length + clusterPtr.length), 72); // checksumPos
+    fs.writeFileSync(
+      file,
+      Buffer.concat([header, mime, ...clusters, ...dirents, pathPtr, clusterPtr, Buffer.alloc(16)]),
+    );
+  };
+
+  const writeSmallZim = (file: string): void => {
+    const aardvark = wikiHtml(
+      '<div role="note" class="hatnote">"Aardvark" redirects here. For other uses, see <a>other</a>.</div>' +
+        "<h1>Aardvark</h1>" +
+        "<p>The aardvark is a stocky, long-snouted African mammal.</p>" +
+        '<p>It is related to the <a href="Hyrax">hyrax</a> and the <i>porcupine</i>.</p>' +
+        '<span class="mw-editsection">[edit]</span><math alttext="a^{2}">img</math>' +
+        "<h2>References</h2>", // empty section after stripping: heading must vanish
+    );
+    const einstein = wikiHtml(
+      '<h1>Albert Einstein</h1><p>Albert Einstein was a German-born theoretical physicist.</p>' +
+        "<ul><li>special relativity</li><li>general relativity</li></ul>",
+    );
+    const zebra = wikiHtml("<h1>Zebra</h1><p>A zebra is a striped equine.</p>");
+    const mainPage = wikiHtml("<h1>Main Page</h1><p>Welcome to the main page.</p>");
+    writeZimArchive(
+      file,
+      [
+        zstdCluster([Buffer.from(aardvark), Buffer.from(einstein)]),
+        rawCluster([Buffer.from(zebra), Buffer.from(mainPage)]),
+      ],
+      [
+        contentDirent("C", "Aardvark", "Aardvark", 0, 0),
+        contentDirent("C", "Albert_Einstein", "Albert Einstein", 0, 1),
+        redirectDirent("C", "Banana", "Banana", 1),
+        redirectDirent("C", "Loop_A", "Loop A", 4),
+        redirectDirent("C", "Loop_B", "Loop B", 3),
+        contentDirent("C", "Zebra", "Zebra", 1, 0),
+        contentDirent("W", "MainPage", "Main Page", 1, 1),
+      ],
+    );
+  };
+
+  const zimDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "glove-zimtest-")));
+  const zimFile = path.join(zimDir, "wiki.zim");
+  const bigFile = path.join(zimDir, "big.zim");
+  try {
+    writeSmallZim(zimFile);
+    // A 123-entry archive: > 64 entries forces the sequential byte-walk
+    // scan path (the small archive only exercises the random-access path).
+    {
+      const n = 120;
+      const blobs: Buffer[] = [];
+      const dirents: Buffer[] = [];
+      for (let i = 0; i < n; i++) {
+        const name = `Article ${String(i).padStart(3, "0")}`;
+        blobs.push(Buffer.from(wikiHtml(`<h1>${name}</h1><p>Synthetic body ${i}.</p>`)));
+        dirents.push(contentDirent("C", `Article_${String(i).padStart(3, "0")}`, name, 0, i));
+      }
+      blobs.push(Buffer.from(wikiHtml("<h1>Whale</h1><p>A whale is a large marine mammal.</p>")));
+      blobs.push(Buffer.from(wikiHtml("<h1>Xylophone</h1><p>A xylophone is a percussion instrument.</p>")));
+      dirents.push(contentDirent("C", "Whale", "Whale", 0, n));
+      dirents.push(contentDirent("C", "Xylophone", "Xylophone", 0, n + 1));
+      dirents.push(contentDirent("C", "Yak", "Yak", 1, 0));
+      writeZimArchive(
+        bigFile,
+        [zstdCluster(blobs), rawCluster([Buffer.from(wikiHtml("<h1>Yak</h1><p>A yak is a bovine.</p>"))])],
+        dirents,
+      );
+    }
+    const reader = await ZimReader.open(zimFile, { scanBudgetMs: 5000 });
+    assert.equal(reader.entries, 7);
+
+    // -- search
+    let r = await reader.search("Aardvark", 5);
+    assert.equal(r.results.length, 1);
+    assert.equal(r.results[0].title, "Aardvark");
+    assert.equal(r.results[0].match, "exact");
+    assert.equal(r.partial, false);
+    r = await reader.search("albert einstein", 5);
+    assert.equal(r.results.length, 1);
+    assert.equal(r.results[0].title, "Albert Einstein");
+    assert.equal(r.results[0].match, "exact");
+    r = await reader.search("albert", 5);
+    assert.equal(r.results.length, 1);
+    assert.equal(r.results[0].title, "Albert Einstein");
+    assert.equal(r.results[0].match, "prefix");
+    r = await reader.search("ebra", 5);
+    assert.equal(r.results.length, 1);
+    assert.equal(r.results[0].title, "Zebra");
+    assert.equal(r.results[0].match, "substring");
+    r = await reader.search("loop", 5);
+    assert.equal(r.results.length, 2);
+    assert.deepEqual(r.results.map((x) => x.title).sort(), ["Loop A", "Loop B"]);
+    assert.ok(r.results.every((x) => x.redirect));
+    r = await reader.search("Main Page", 5);
+    assert.equal(r.results.length, 1);
+    assert.equal(r.results[0].ns, "W");
+    r = await reader.search("zebrafish", 5);
+    assert.equal(r.results.length, 0);
+    await assert.rejects(reader.search("   ", 5), /must not be empty/);
+    ok("zim reader: search exact/case-insensitive/prefix/substring/multi/none");
+
+    // -- read
+    let art = await reader.read("Aardvark", 10_000);
+    assert.equal(art.title, "Aardvark");
+    assert.ok(art.text.includes("long-snouted African mammal"), art.text);
+    assert.ok(art.text.includes("# Aardvark"), "heading marked");
+    assert.ok(art.text.includes("[a^{2}]"), "math alttext kept");
+    assert.ok(art.text.includes("It is related to the hyrax and the porcupine."), "inline content stays on one line");
+    assert.ok(!art.text.includes("redirects here"), "hatnote dropped");
+    assert.ok(!art.text.includes("issued from"), "zim footer dropped");
+    assert.ok(!art.text.includes("# References"), "empty section heading dropped");
+    assert.ok(!art.text.includes("fake citation"), "references dropped");
+    assert.ok(!art.text.includes("nav junk"), "navbox dropped");
+    assert.ok(!art.text.includes("[edit]"), "edit spans dropped");
+    assert.equal(art.truncated, false);
+    art = await reader.read("Albert Einstein", 10_000);
+    assert.equal(art.title, "Albert Einstein");
+    assert.ok(art.text.includes("theoretical physicist"));
+    art = await reader.read("Albert_Einstein", 10_000);
+    assert.equal(art.title, "Albert Einstein"); // wiki-style path works too
+    art = await reader.read("Zebra", 10_000);
+    assert.ok(art.text.includes("striped equine"), "raw cluster readable");
+    art = await reader.read("Banana", 10_000);
+    assert.equal(art.title, "Albert Einstein", "redirect followed");
+    assert.ok(art.text.includes("theoretical physicist"));
+    art = await reader.read("Zebra", 10);
+    assert.equal(art.truncated, true);
+    assert.equal(art.text.length, 10);
+    await assert.rejects(reader.read("Loop A", 100), /redirect loop/);
+    await assert.rejects(reader.read("Pigeon", 100), /no article/);
+    await assert.rejects(reader.read("", 100), /must not be empty/);
+    ok("zim reader: read zstd/raw clusters, redirects, truncation, errors");
+    await reader.close();
+
+    // -- big archive: exercises the sequential byte-walk scan path
+    const bigReader = await ZimReader.open(bigFile, { scanBudgetMs: 5000 });
+    assert.equal(bigReader.entries, 123);
+    let br = await bigReader.search("Article_042", 5);
+    assert.equal(br.results.length, 1);
+    assert.equal(br.results[0].title, "Article 042");
+    assert.equal(br.results[0].match, "exact");
+    br = await bigReader.search("a", 5);
+    assert.equal(br.results.length, 5, "capped to the limit");
+    assert.ok(br.results.every((x) => x.title.startsWith("Article ")), JSON.stringify(br.results));
+    br = await bigReader.search("xylo", 5);
+    assert.equal(br.results.length, 1);
+    assert.equal(br.results[0].title, "Xylophone");
+    assert.equal(br.results[0].match, "prefix");
+    const bart = await bigReader.read("Xylophone", 10_000);
+    assert.ok(bart.text.includes("percussion instrument"));
+    const bakt = await bigReader.read("Yak", 10_000);
+    assert.ok(bakt.text.includes("bovine"), "raw cluster");
+    await bigReader.close();
+    ok("zim reader: big archive exact/prefix/capped search and reads via sequential walk");
+
+    // -- bad files
+    const badFile = path.join(zimDir, "bad.zim");
+    fs.writeFileSync(badFile, Buffer.from("definitely not a zim archive, just some bytes"));
+    await assert.rejects(ZimReader.open(badFile, { scanBudgetMs: 1000 }), /not a ZIM file/);
+    const truncFile = path.join(zimDir, "trunc.zim");
+    fs.writeFileSync(truncFile, fs.readFileSync(zimFile).subarray(0, 100));
+    await assert.rejects(ZimReader.open(truncFile, { scanBudgetMs: 1000 }), /ZIM/);
+    await assert.rejects(ZimReader.open(path.join(zimDir, "missing.zim"), { scanBudgetMs: 1000 }), /cannot open/);
+    ok("zim reader: bad magic, truncated file, missing file rejected");
+
+    // -- tool layer
+    const tools = new ZimTools({ file: zimFile, maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000 });
+    const registry = new ToolRegistry();
+    registerZimTools(registry, tools);
+    assert.equal(registry.size, 2);
+    assert.ok(registry.has("wikipedia_search"));
+    assert.ok(registry.has("wikipedia_read"));
+    const results = await executeToolCalls(registry, [
+      { id: "z1", name: "wikipedia_search", arguments: '{"query": "loop"}' },
+      { id: "z2", name: "wikipedia_read", arguments: '{"title": "Banana"}' },
+    ]);
+    assert.equal(results.length, 2);
+    assert.ok(results[0].content.includes('2 match(es) for "loop"'), results[0].content);
+    assert.ok(results[0].content.includes("Loop A [redirect]") || results[0].content.includes("Loop A"));
+    assert.ok(results[0].content.includes("wikipedia_read"), "suggests the read tool");
+    assert.ok(results[1].content.startsWith("Wikipedia: Albert Einstein"), results[1].content);
+    assert.ok(results[1].content.includes("theoretical physicist"));
+    const broken = new ZimTools({ file: path.join(zimDir, "missing.zim"), maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000 });
+    await assert.rejects(broken.search("x", 5), /cannot open/);
+    tools.abort();
+    ok("zim tools: registry wiring, search/read results, broken file surfaces as error");
+
+    // -- config
+    const { config: zc, errors: ze } = parseConfig({
+      DISCORD_TOKEN: "t",
+      DISCORD_GUILD_ID: "g",
+      MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+      ZIMTOOLS_ENABLED: "true",
+      ZIM_FILE: "/tmp/wiki.zim",
+      ZIMTOOLS_SEARCH_MAX_RESULTS: "4",
+      ZIMTOOLS_SCAN_BUDGET_S: "3",
+    });
+    assert.deepEqual(ze, []);
+    assert.equal(zc.tools.zim.enabled, true);
+    assert.equal(zc.tools.zim.file, "/tmp/wiki.zim");
+    assert.equal(zc.tools.zim.searchMaxResults, 4);
+    assert.equal(zc.tools.zim.scanBudgetMs, 3000);
+    const { errors: zbad } = parseConfig({
+      DISCORD_TOKEN: "t",
+      DISCORD_GUILD_ID: "g",
+      MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+      ZIMTOOLS_ENABLED: "true",
+    });
+    assert.ok(zbad.some((e) => e.includes("ZIM_FILE")), `got: ${zbad.join("; ")}`);
+    ok("config: zim tools env parsing and ZIM_FILE requirement");
+
+    // -- activity icon
+    const line = formatToolCall({ id: "z3", name: "wikipedia_read", arguments: '{"title": "Zebra"}' });
+    assert.ok(line.startsWith("📚"), line);
+    ok("activity: wikipedia tools get the book icon");
+  } finally {
+    fs.rmSync(zimDir, { recursive: true, force: true });
+  }
+}
+
 // ------------------------------------------------------------------- llm --
 {
   const seenRequests: Array<{ auth: string | undefined; ct: string | undefined; body: unknown; url: string }> = [];
@@ -1384,6 +1932,17 @@ const ok = (name: string): void => {
     { id: "call_3", name: "web_fetch", arguments: '{"url":"http://example.com"}' },
   ]);
   ok("llm: non-stream tool_calls normalized (object args stringified)");
+
+  // multimodal: an array of text/image parts passes through to the wire
+  // unchanged (string content is still sent as a string)
+  const mmParts: unknown = [
+    { type: "text", text: "what is this?" },
+    { type: "image_url", image_url: { url: "data:image/png;base64,QUJD" } },
+  ];
+  await streamClient.chat([{ role: "user", content: mmParts as ChatMessage["content"] }]);
+  const mmBody = seenRequests.at(-1)!.body as Record<string, unknown>;
+  assert.deepEqual(mmBody.messages, [{ role: "user", content: mmParts }], "parts sent as-is");
+  ok("llm: multimodal content parts pass through to the wire");
 
   server.close();
 }

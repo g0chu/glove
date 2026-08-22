@@ -6,6 +6,7 @@ import { parseToolArgs } from "./executor.js";
 function iconFor(name: string): string {
   if (name.startsWith("web_")) return "🔎";
   if (name.startsWith("file_")) return "📁";
+  if (name.startsWith("wikipedia_")) return "📚";
   return "🔧";
 }
 
