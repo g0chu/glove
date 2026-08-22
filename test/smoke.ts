@@ -365,6 +365,7 @@ const ok = (name: string): void => {
   }
   const makeChannel = () => {
     const sent: string[] = [];
+    const messages: FakeMessage[] = [];
     let live: FakeMessage | null = null;
     let nextId = 0;
     const channel = {
@@ -379,11 +380,12 @@ const ok = (name: string): void => {
           },
         };
         live = m;
+        messages.push(m);
         sent.push(content);
         return m;
       },
     };
-    return { channel, sent, getLive: () => live };
+    return { channel, sent, messages, getLive: () => live };
   };
 
   // first chunk creates the message; final edit applies the full text
@@ -514,8 +516,9 @@ const ok = (name: string): void => {
   ok("writer: LaTeX sanitized before posting and recording");
 
   // reasoning preview: shown live, capped at 2000 chars (tail kept), and
-  // the first content delta takes over the SAME message; reasoning is
-  // never posted or recorded
+  // when the reply starts the thinking message completes in place ("🤔
+  // *thought for Ns*") while the reply streams in a fresh message;
+  // reasoning is never posted or recorded
   const g = makeChannel();
   const w7 = new ResponseWriter({
     channel: g.channel as unknown as GuildTextBasedChannel,
@@ -536,11 +539,32 @@ const ok = (name: string): void => {
   assert.ok(thinkLive.endsWith("*"));
   w7.chunk("The answer is 42.");
   await ticks(2);
-  assert.equal(g.sent.length, 1, "no second message");
-  assert.equal(g.getLive()!.content, "The answer is 42.", "reply replaces the thinking preview");
+  assert.equal(g.sent.length, 2, "reply streams in a fresh message");
+  assert.match(g.messages[0].content, /^🤔 \*thought for \d+s\*$/, "thinking message completes in place");
+  assert.equal(g.getLive()!.content, "The answer is 42.", "reply takes over in its own message");
   const p7 = await w7.finish("The answer is 42.");
   assert.equal(p7!.text, "The answer is 42.", "reasoning is not posted or recorded");
-  ok("writer: reasoning preview live-capped, morphs into the reply, never recorded");
+  assert.deepEqual(p7!.messageIds, [g.messages[1].id], "only the reply message is recorded");
+  ok("writer: reasoning preview live-capped, completes into a 'thought for' line, never recorded");
+
+  // long multi-line thinking: header + "N lines hidden" + the last 5 lines
+  const h = makeChannel();
+  const w7b = new ResponseWriter({
+    channel: h.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w7b.start();
+  const longThinking = Array.from({ length: 30 }, (_, i) => `thinking step ${String(i + 1).padStart(2, "0")} ${"z".repeat(50)}`).join("\n");
+  w7b.reason(longThinking);
+  await ticks(2);
+  const thinkLong = h.getLive()!.content;
+  assert.ok(thinkLong.startsWith("🤔 *thinking: …*\n*25 lines hidden*\n"), "hidden-line header");
+  assert.ok(thinkLong.includes("step 26"), "last 5 lines kept");
+  assert.ok(thinkLong.includes("step 30"), "last line kept");
+  assert.ok(!thinkLong.includes("step 25"), "hidden lines dropped");
+  assert.ok(thinkLong.length <= 2000, `long preview capped at 2000 (got ${thinkLong.length})`);
+  ok("writer: long thinking shows 'N lines hidden' + the last 5 lines");
 
   // discard() also clears the reasoning buffer: the next round's thinking
   // starts fresh instead of continuing the old one
@@ -584,6 +608,84 @@ const ok = (name: string): void => {
   const p8 = await w8.finish("done");
   assert.equal(p8!.text, "done");
   ok("writer: discard() clears the reasoning buffer, next round is fresh");
+
+  // non-stream mode: the whole reasoning arrives at once (one reason() call,
+  // no chunks); on finish the thinking line completes in place and the
+  // reply posts as a fresh message below it
+  const n = makeChannel();
+  const w9 = new ResponseWriter({
+    channel: n.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w9.start();
+  w9.reason("Let me check the units first.");
+  await ticks(2);
+  assert.equal(n.sent.length, 1, "thinking preview creates the live message");
+  const p9 = await w9.finish("The answer is 7.");
+  assert.equal(n.sent.length, 2, "reply posts as a fresh message");
+  assert.match(n.messages[0].content, /^🤔 \*thought for \d+s\*$/, "thinking line completed on finish");
+  assert.equal(n.getLive()!.content, "The answer is 7.");
+  assert.equal(p9!.text, "The answer is 7.");
+  assert.deepEqual(p9!.messageIds, [n.messages[1].id], "only the reply message is recorded");
+  ok("writer: non-stream reasoning completes into a line, reply posted fresh");
+
+  // reasoning-only response (no content at all): the thinking line survives
+  // and the "no response" note posts below it
+  const o = makeChannel();
+  const w10 = new ResponseWriter({
+    channel: o.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w10.start();
+  w10.reason("hmm, nothing to say…");
+  await ticks(2);
+  const p10 = await w10.finish("");
+  assert.equal(o.sent.length, 2, "thinking line + note");
+  assert.match(o.messages[0].content, /^🤔 \*thought for \d+s\*$/, "thinking line completed");
+  assert.match(o.messages[1].content, /no response/i, "note posts as its own message");
+  assert.equal(p10!.messageIds.length, 1, "only the note is recorded");
+  ok("writer: reasoning-only turn keeps the thinking line, note posted fresh");
+
+  // discard() must delete even a live message whose initial send is still in
+  // flight when discard() runs (the capture happens in the chain step, which
+  // is queued behind the pending updateLive)
+  const raceMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const raceChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: (content: string) =>
+      new Promise((resolve) => {
+        setImmediate(() => {
+          const m = { id: `r${String(raceMsgs.length)}`, content, deleted: false };
+          raceMsgs.push(m);
+          resolve({
+            id: m.id,
+            edit: async (u: { content: string }) => {
+              m.content = u.content;
+              return { id: m.id };
+            },
+            delete: async () => {
+              m.deleted = true;
+              return true;
+            },
+          });
+        });
+      }),
+  };
+  const w11 = new ResponseWriter({
+    channel: raceChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w11.start();
+  w11.chunk("transient");
+  await ticks(1); // the initial send is in flight (its setImmediate has not run)
+  w11.discard();
+  await ticks(4);
+  assert.equal(raceMsgs.length, 1, "the preview message was created");
+  assert.equal(raceMsgs[0].deleted, true, "in-flight preview deleted on discard");
+  ok("writer: discard() also deletes a preview whose initial send is in flight");
 }
 
 // -------------------------------------------------------------- executor --
