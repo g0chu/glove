@@ -1,7 +1,9 @@
 /**
  * Smoke tests: config parsing, history window, code-fence-aware chunk
  * splitting, image attachment downloads, turn-context building (last-N
- * channel messages), queue semantics, response writer behavior (incl.
+ * channel messages) incl. the compaction mode (persistent per-channel
+ * context: seed, growth, summarization, emergency trim), queue semantics,
+ * response writer behavior (incl.
  * multi-message streaming of long replies), the tool executor and tool
  * loop, the in-process web/file/zim tools (against a synthetic ZIM file
  * built in a temp dir), and the LLM client (stream +
@@ -17,12 +19,13 @@ import type { AddressInfo } from "node:net";
 import type { GuildTextBasedChannel } from "discord.js";
 import { parseConfig } from "../src/config.js";
 import { ChannelHistory, toRequestMessages } from "../src/llm/history.js";
+import { ChannelContext, COMPACTION_SYSTEM_PROMPT, estimateTokens } from "../src/llm/context.js";
 import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
 import { ChannelQueue } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
-import { buildChannelContext, contextFromMessages, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, contextFromMessages, contextToMessages, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -58,6 +61,8 @@ const ok = (name: string): void => {
     MODEL_CONTEXT_MAX_MESSAGES: "7",
     MODEL_API_KEY: "k1",
     MODEL_IMAGES_MAX_BYTES: "2048",
+    CONTEXT_COMPACTION_MAX_TOKENS: "1234",
+    CONTEXT_COMPACTION_KEEP_MESSAGES: "5",
   });
   assert.deepEqual(errors, []);
   assert.equal(config.discord.token, "tok");
@@ -68,6 +73,8 @@ const ok = (name: string): void => {
   assert.equal(config.model.apiKey, "k1");
   assert.equal(config.model.enableImages, false); // default
   assert.equal(config.model.imagesMaxBytes, 2048);
+  assert.equal(config.model.compactionMaxTokens, 1234);
+  assert.equal(config.model.compactionKeepMessages, 5);
   assert.equal(config.discord.typingIntervalMs, 5000); // default
   assert.equal(config.discord.streamUpdateThrottleMs, 2000); // default
   assert.equal(config.discord.showReasoning, true); // default
@@ -82,10 +89,12 @@ const ok = (name: string): void => {
     MODEL_STREAM: "banana",
     DISCORD_SHOW_REASONING: "maybe",
     MODEL_IMAGES_MAX_BYTES: "0",
+    CONTEXT_COMPACTION_MAX_TOKENS: "abc",
   });
-  assert.ok(badErrors.length >= 6, `expected >= 6 errors, got ${badErrors.length}`);
+  assert.ok(badErrors.length >= 7, `expected >= 7 errors, got ${badErrors.length}`);
   assert.ok(badErrors.some((e) => e.includes("DISCORD_SHOW_REASONING")), `got: ${badErrors.join("; ")}`);
   assert.ok(badErrors.some((e) => e.includes("MODEL_IMAGES_MAX_BYTES")), `got: ${badErrors.join("; ")}`);
+  assert.ok(badErrors.some((e) => e.includes("CONTEXT_COMPACTION_MAX_TOKENS")), `got: ${badErrors.join("; ")}`);
   ok("config: reports missing/invalid values");
 
   const { config: tc, errors: te } = parseConfig({
@@ -106,6 +115,7 @@ const ok = (name: string): void => {
     TOOLS_MAX_ROUNDS: "7",
     DISCORD_SHOW_REASONING: "false",
     DISCORD_SHOW_TOOL_ACTIVITY: "false",
+    CONTEXT_COMPACTION_ENABLED: "false",
   });
   assert.deepEqual(te, []);
   assert.equal(tc.discord.showReasoning, false);
@@ -123,6 +133,7 @@ const ok = (name: string): void => {
   assert.equal(tc.tools.file.listMaxEntries, 500); // default
   assert.equal(tc.tools.maxResultChars, 12345);
   assert.equal(tc.tools.maxRounds, 7);
+  assert.equal(tc.model.compactionEnabled, false);
   ok("config: tools section parses env and applies defaults");
 
   const { config: td } = parseConfig({
@@ -138,6 +149,9 @@ const ok = (name: string): void => {
   assert.equal(td.tools.maxRounds, 5);
   assert.equal(td.model.enableImages, false, "image input off by default");
   assert.equal(td.model.imagesMaxBytes, 10_485_760); // default
+  assert.equal(td.model.compactionEnabled, true, "compaction on by default");
+  assert.equal(td.model.compactionMaxTokens, 4000); // default
+  assert.equal(td.model.compactionKeepMessages, 20); // default
   ok("config: tools disabled by default");
 
   const { errors: toolErrs } = parseConfig({
@@ -408,6 +422,7 @@ const ok = (name: string): void => {
   let n = 0;
   const m = (author: { id: string; bot: boolean }, content: string, attachments: MessageAttachmentLike[] = []): MessageLike => ({
     id: `x${String(++n)}`,
+    createdTimestamp: 1_000_000 + n * 1000,
     content,
     author,
     attachments,
@@ -501,7 +516,7 @@ const ok = (name: string): void => {
     },
   } as unknown as GuildTextBasedChannel;
   const wOpts = { botId: "bot1", systemPrompt: "", maxMessages: 20, enableImages: false, imagesMaxBytes: 1024 };
-  const wr = await buildChannelContext(chan, new ChannelHistory(20), "b", wOpts);
+  const wr = await buildChannelContext(chan, new ChannelContext(), new ChannelHistory(20), "b", wOpts);
   assert.equal(seenLimit, 20, "fetch limit is the window size");
   assert.deepEqual(
     wr,
@@ -511,17 +526,184 @@ const ok = (name: string): void => {
     ],
     "sorted oldest-first, one message per Discord message (no merging)",
   );
-  assert.equal(await buildChannelContext(chan, new ChannelHistory(20), "nope", wOpts), null);
+  assert.equal(await buildChannelContext(chan, new ChannelContext(), new ChannelHistory(20), "nope", wOpts), null);
 
   const throwing = { messages: { fetch: async () => { throw new Error("api down"); } } } as unknown as GuildTextBasedChannel;
   const fh = new ChannelHistory(20);
   fh.push("user", "hi", ["1"], undefined, "Alice");
-  const fb = await buildChannelContext(throwing, fh, "1", { ...wOpts, systemPrompt: "sys" });
+  const fb = await buildChannelContext(throwing, new ChannelContext(), fh, "1", { ...wOpts, systemPrompt: "sys" });
   assert.deepEqual(fb, [
     { role: "system", content: "sys" },
     { role: "user", content: "Alice: hi" },
   ], "fetch failure falls back to the in-memory window (speakers labeled)");
   ok("context: wrapper fetch (limit, ordering) and in-memory fallback");
+}
+
+// ----------------------------------------------------------- compaction --
+{
+  const noFetch = { messages: { fetch: async () => { throw new Error("no"); } } } as unknown as GuildTextBasedChannel;
+
+  // The startup seed merges with what already arrived, in chronological
+  // order, and never duplicates an already-tracked id.
+  const store = new ChannelContext();
+  store.pushUser("Alice", "hello from the past", "s1", 1000, []);
+  store.pushUser("Bob", "new message", "s2", 5000, []);
+  store.seedFrom([
+    { id: "s1", ts: 1000, role: "user", content: "old copy", name: "Alice", attachments: [] },
+    { id: "s3", ts: 3000, role: "user", content: "between", name: "Carol", attachments: [] },
+    { id: "s4", ts: 9000, role: "user", content: "after", name: "Dan", attachments: [] },
+  ]);
+  assert.deepEqual(
+    store.snapshot().map((e) => `${e.name}:${e.content}`),
+    ["Alice:hello from the past", "Carol:between", "Bob:new message", "Dan:after"],
+  );
+  assert.equal(store.seeded, true);
+  // Token estimate: ~4 chars/token + a fixed cost per image in the window.
+  assert.equal(estimateTokens("12345678"), 2);
+  const est = new ChannelContext();
+  est.pushUser("A", "a".repeat(800), "e1", 1, [
+    { url: "https://cdn.discordapp.com/attachments/1/2/3/i.png", name: "i.png", size: 10, contentType: "image/png" },
+  ]);
+  assert.equal(est.estimateTokens("", 10), 1200, "200 text tokens + 1000 image tokens");
+  ok("compaction store: seed merges chronologically (tracked ids win), token estimate");
+
+  // A turn build compacts: the older part becomes a summary message, the
+  // newest keep messages stay verbatim, and the summary rides ahead of them.
+  const cstore = new ChannelContext();
+  cstore.seedFrom(
+    Array.from({ length: 8 }, (_, i) => ({
+      id: `c${String(i + 1)}`,
+      ts: 1000 + i * 100,
+      role: "user" as const,
+      content: `old message ${String(i + 1)}`,
+      name: `P${String(i + 1)}`,
+      attachments: [],
+    })),
+  );
+  cstore.pushUser("Alice", "what was I saying?", "m1", 9000, []);
+  const seenTranscripts: string[] = [];
+  let summaryRequest: ChatMessage[] | null = null;
+  const summarize = async (msgs: ChatMessage[]): Promise<string> => {
+    summaryRequest = msgs;
+    seenTranscripts.push(String(msgs[1].content));
+    return "they discussed the launch plan";
+  };
+  const cOpts = {
+    botId: "bot1",
+    systemPrompt: "sys",
+    maxMessages: 20,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    compaction: { maxTokens: 20, keepMessages: 3, summarize },
+  };
+  const cres = await buildChannelContext(noFetch, cstore, new ChannelHistory(20), "m1", cOpts);
+  assert.deepEqual(cres, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "Summary of the earlier messages in this channel (older messages were compacted):\nthey discussed the launch plan" },
+    { role: "user", content: "P7: old message 7" },
+    { role: "user", content: "P8: old message 8" },
+    { role: "user", content: "Alice: what was I saying?" },
+  ]);
+  assert.equal(cstore.getSummary(), "they discussed the launch plan");
+  assert.equal(cstore.length, 3, "only the newest 3 entries survive");
+  assert.equal(seenTranscripts.length, 1, "one summarization call");
+  assert.equal(summaryRequest![0].role, "system");
+  assert.equal(summaryRequest![0].content, COMPACTION_SYSTEM_PROMPT, "plain (tool-less) summarization request");
+  const transcript = seenTranscripts[0];
+  assert.ok(transcript.includes("P1: old message 1"), "oldest messages in the transcript");
+  assert.ok(!transcript.includes("old message 7"), "kept messages are not re-summarized");
+  ok("compaction: old messages become a summary, newest kept verbatim");
+
+  // A later compaction folds the previous summary into the new one.
+  cstore.pushUser("Bob", "more talk", "m2", 10000, []);
+  const cres2 = await buildChannelContext(noFetch, cstore, new ChannelHistory(20), "m2", cOpts);
+  assert.equal(seenTranscripts.length, 2, "second compaction runs");
+  assert.ok(seenTranscripts[1].includes("Running summary of the older messages:"), "previous summary folded in");
+  assert.ok(seenTranscripts[1].includes("they discussed the launch plan"));
+  assert.ok(seenTranscripts[1].includes("P7: old message 7"), "now-old messages summarized");
+  assert.deepEqual(
+    cres2!.slice(2).map((x) => String(x.content)),
+    ["P8: old message 8", "Alice: what was I saying?", "Bob: more talk"],
+  );
+  assert.equal(cstore.length, 3);
+  ok("compaction: repeated compaction folds the running summary");
+
+  // The mention deleted before its turn -> null (the turn is skipped).
+  const dstore = new ChannelContext();
+  dstore.pushUser("Alice", "hi", "d1", 1, []);
+  assert.equal(await buildChannelContext(noFetch, dstore, new ChannelHistory(20), "gone", cOpts), null);
+  ok("compaction: mention deleted before its turn -> null");
+
+  // Summarizer failure (or nothing to fold): the emergency trim drops the
+  // oldest messages until the estimate fits, and the mention survives.
+  const fstore = new ChannelContext();
+  for (let i = 0; i < 6; i++) fstore.pushUser("U", "x".repeat(200), `f${String(i)}`, i, []);
+  fstore.pushUser("Alice", "the mention", "fm", 99, []);
+  const fOpts = {
+    ...cOpts,
+    compaction: {
+      maxTokens: 50,
+      keepMessages: 2,
+      summarize: async (): Promise<string> => {
+        throw new Error("llm down");
+      },
+    },
+  };
+  const fres = await buildChannelContext(noFetch, fstore, new ChannelHistory(20), "fm", fOpts);
+  assert.ok(fres !== null, "the turn still runs");
+  assert.ok(fstore.has("fm"), "the mention survived the trim");
+  assert.ok(!fstore.has("f0"), "the oldest message was trimmed");
+  assert.equal(fstore.getSummary(), null, "no summary when the summarizer failed");
+  assert.ok(fres!.some((msg) => msg.content === "Alice: the mention"));
+  // Nothing older than the keep window to fold: the trim applies directly.
+  const tstore = new ChannelContext();
+  tstore.pushUser("A", "a".repeat(400), "t1", 1, []);
+  tstore.pushUser("B", "b".repeat(400), "t2", 2, []);
+  const tOpts = { ...cOpts, compaction: { maxTokens: 150, keepMessages: 5, summarize: async () => "s" } };
+  await buildChannelContext(noFetch, tstore, new ChannelHistory(20), "t2", tOpts);
+  assert.equal(tstore.getSummary(), null, "nothing was folded");
+  assert.ok(!tstore.has("t1"), "the oldest was trimmed to fit the budget");
+  assert.ok(tstore.has("t2"), "the mention was protected");
+  ok("compaction: summarizer failure falls back to an emergency trim (mention protected)");
+
+  // Image window: older image attachments leave a note, recent ones are
+  // downloaded and sent as parts; the summary renders ahead of the entries.
+  const istore = new ChannelContext();
+  const imgAtt: MessageAttachmentLike = {
+    url: "https://cdn.discordapp.com/attachments/1/2/3/i.png",
+    name: "img.png",
+    size: 6,
+    contentType: "image/png",
+  };
+  istore.seedFrom([
+    { id: "i1", ts: 1, role: "user", content: "old image", name: "Alice", attachments: [imgAtt] },
+    { id: "i2", ts: 2, role: "user", content: "recent one", name: "Bob", attachments: [imgAtt] },
+    { id: "i3", ts: 3, role: "user", content: "recent two", name: "Carol", attachments: [imgAtt] },
+  ]);
+  const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x50, 0x0d, 0x0a]);
+  const ires = await contextToMessages(istore, {
+    systemPrompt: "",
+    maxMessages: 2,
+    enableImages: true,
+    imagesMaxBytes: 1024,
+    imageFetch: () => Promise.resolve(new Response(imgBytes)),
+  });
+  const iPart = { type: "image_url", image_url: { url: `data:image/png;base64,${imgBytes.toString("base64")}` } };
+  assert.deepEqual(ires, [
+    { role: "user", content: 'Alice: old image\n*[attachment "img.png" not sent: older than the image window]*' },
+    { role: "user", content: [{ type: "text", text: "Bob: recent one" }, iPart] },
+    { role: "user", content: [{ type: "text", text: "Carol: recent two" }, iPart] },
+  ]);
+  const sstore = new ChannelContext();
+  sstore.pushUser("A", "x", "s1", 1, []);
+  sstore.pushUser("B", "y", "s2", 2, []);
+  assert.deepEqual(await sstore.compact(1, async () => "the summary"), { ok: true });
+  const sres = await contextToMessages(sstore, { systemPrompt: "", maxMessages: 10, enableImages: false, imagesMaxBytes: 1024 });
+  assert.deepEqual(sres, [
+    { role: "user", content: "Summary of the earlier messages in this channel (older messages were compacted):\nthe summary" },
+    { role: "user", content: "B: y" },
+  ]);
+  ok("compaction: image window notes, recent image parts, summary rendered first");
 }
 
 // ----------------------------------------------------------------- queue --

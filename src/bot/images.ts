@@ -9,13 +9,11 @@
  * model knows an attachment was there but was not sent.
  */
 
-/** A Discord attachment as the image loader sees it (the real Attachment fits this shape). */
-export interface MessageAttachmentLike {
-  url: string;
-  name: string;
-  size: number;
-  contentType: string | null;
-}
+import { SUPPORTED_IMAGE_TYPES } from "../llm/client.js";
+import type { MessageAttachmentLike } from "../llm/client.js";
+
+export { isImageAttachment } from "../llm/client.js";
+export type { MessageAttachmentLike } from "../llm/client.js";
 
 /** One downloaded image, ready to send as an image_url content part. */
 export interface AttachmentImage {
@@ -41,14 +39,6 @@ export interface FetchImagesOptions {
    */
   fetchImpl?: ImageFetch;
 }
-
-/** MIME types a Chat Completions endpoint can take as image_url. */
-const SUPPORTED_TYPES: Record<string, string> = {
-  "image/png": "image/png",
-  "image/jpeg": "image/jpeg",
-  "image/webp": "image/webp",
-  "image/gif": "image/gif",
-};
 
 /** Only Discord's own CDN is a trusted attachment source. */
 const CDN_HOST = "cdn.discordapp.com";
@@ -93,7 +83,7 @@ export async function fetchMessageImages(
       note(att, `more than ${MAX_IMAGES_PER_MESSAGE} images per message`);
       continue;
     }
-    const mime = SUPPORTED_TYPES[att.contentType ?? ""];
+    const mime = SUPPORTED_IMAGE_TYPES[att.contentType ?? ""];
     if (!mime) {
       note(att, `unsupported type ${att.contentType ?? "unknown"}`);
       continue;

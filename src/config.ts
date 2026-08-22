@@ -21,7 +21,14 @@ export interface ModelConfig {
   imagesMaxBytes: number;
   stream: boolean;
   systemPrompt: string;
+  /** Last-N seed size / image window (and the sliding window in classic mode). */
   contextMaxMessages: number;
+  /** Compaction mode (persistent growing context + summaries) vs the classic sliding window. */
+  compactionEnabled: boolean;
+  /** Estimated tokens at which the channel context is compacted. */
+  compactionMaxTokens: number;
+  /** How many of the newest messages survive a compaction verbatim. */
+  compactionKeepMessages: number;
   timeoutMs: number;
 }
 
@@ -174,6 +181,9 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       stream: boolEnv("MODEL_STREAM", true),
       systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),
+      compactionEnabled: boolEnv("CONTEXT_COMPACTION_ENABLED", true),
+      compactionMaxTokens: intEnv("CONTEXT_COMPACTION_MAX_TOKENS", 4000, 128),
+      compactionKeepMessages: intEnv("CONTEXT_COMPACTION_KEEP_MESSAGES", 20, 1),
       timeoutMs: intEnv("MODEL_TIMEOUT_S", 120, 1) * 1000,
     },
     tools: {

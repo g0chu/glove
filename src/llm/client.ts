@@ -17,6 +17,27 @@ export type ContentPart =
   | { type: "text"; text: string }
   | { type: "image_url"; image_url: { url: string } };
 
+/** A Discord attachment as the context builder sees it (the real Attachment fits this shape). */
+export interface MessageAttachmentLike {
+  url: string;
+  name: string;
+  size: number;
+  contentType: string | null;
+}
+
+/** MIME types a Chat Completions endpoint can take as image_url. */
+export const SUPPORTED_IMAGE_TYPES: Record<string, string> = {
+  "image/png": "image/png",
+  "image/jpeg": "image/jpeg",
+  "image/webp": "image/webp",
+  "image/gif": "image/gif",
+};
+
+/** True when the attachment is an image type the model can take (png/jpeg/webp/gif). */
+export function isImageAttachment(att: MessageAttachmentLike): boolean {
+  return att.contentType != null && att.contentType in SUPPORTED_IMAGE_TYPES;
+}
+
 /** A message in the conversation sent to the model (wire shape on request). */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
