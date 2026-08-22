@@ -37,11 +37,16 @@ npm run dev            # or: npm run build && npm start
   while generating, message created on the first chunk, edits throttled to
   at least `DISCORD_STREAM_UPDATE_THROTTLE_MS` apart. Set `MODEL_STREAM=false`
   for a single reply instead.
-- **Live peek at the work:** while generating, the live message shows the
-  model's streamed reasoning ("🤔 *thinking: …*", tail-capped to 2000 chars)
-  when the endpoint sends reasoning deltas (`DISCORD_SHOW_REASONING`,
-  default on) — it is transient and replaced by the reply. Tool activity is
-  different: each tool call is posted as its own **persistent** short
+- **Live peek at the work:** while generating, a live message shows the
+  model's streamed reasoning ("🤔 *thinking: …*" — the whole thinking while
+  it fits, then a "N lines hidden" line + the last 5 lines, capped at 2000
+  chars) when the endpoint sends reasoning deltas (`DISCORD_SHOW_REASONING`,
+   default on). When the reply starts, that message completes in place into a
+   "🤔 *thought for Ns*" line that stays above the reply, which streams in
+   its own message (with `MODEL_STREAM=false` the line completes when the
+   reply is ready and the reply posts as a separate message). The reasoning
+   text is never posted or recorded. Tool
+  activity is different: each tool call is posted as its own **persistent** short
   message ("🔎 *web_search(query=\"…\")*" — name + arguments only, results
   never shown; `DISCORD_SHOW_TOOL_ACTIVITY`, default on). These are bot
   messages and never enter the channel context.

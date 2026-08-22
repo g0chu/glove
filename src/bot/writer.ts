@@ -5,6 +5,9 @@ import { sanitizeForDiscord } from "./format.js";
 /** Discord hard message limit. */
 export const DISCORD_MAX_MESSAGE_CHARS = 2000;
 
+/** How many trailing thinking lines the long-form reasoning preview keeps. */
+const REASONING_TAIL_LINES = 5;
+
 const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/;
 const TABLE_ROW_RE = /^\s*\|/;
 /** GFM separator row: | --- | :---: | ... (Discord tables need one). */
@@ -272,16 +275,20 @@ export interface PostedReply {
 /**
  * Posts a model reply to a channel with Discord-specific concerns:
  *  - typing indicator refreshed every `typingIntervalMs`;
- *  - one live message per round, created on the first update, showing in
- *    priority order: the streamed reply, or the model's streamed reasoning
- *    ("🤔 *thinking: …*");
- *  - while streaming, the live message is edited no more often than
- *    `throttleMs` (edits are serialized; a change of what is shown —
- *    thinking → reply — lands immediately; when the text exceeds 2000 chars
- *    the live preview shows the most recent tail);
+ *  - while the model is thinking (reasoning deltas, no reply content yet),
+ *    a thinking live message shows the streamed reasoning
+ *    ("🤔 *thinking: …*"); when the reply starts — or, when no reply
+ *    content ever streams (non-stream mode, reasoning-only response), at
+ *    finish — that message is edited to a terminal line ("🤔 *thought
+ *    for Ns*") that stays in the channel above the reply, which is posted
+ *    as a fresh message;
+ *  - the reply streams in its own live message, created on the first
+ *    content delta and edited no more often than `throttleMs` (edits are
+ *    serialized; when the text exceeds 2000 chars the preview shows the
+ *    most recent tail);
  *  - on completion the final text is chunked (code-fence aware) and posted
  *    as one message per chunk; reasoning never lands in the final message
- *    or the history;
+ *    or the history (only the reply's message ids are reported);
  *  - `finish()`/`reportError()` return the ids and text of whatever was
  *    actually posted, so the caller can record the reply in the channel
  *    history (making it editable/deletable like any other message).
@@ -289,11 +296,15 @@ export interface PostedReply {
 export class ResponseWriter {
   private buffer = "";
   private reasoningBuffer = "";
-  /** What the live message currently shows (null when it shows nothing). */
-  private shownKind: "reasoning" | "content" | null = null;
+  /** The reply's live message (null until the first content delta). */
   private message: Message | null = null;
+  /** The thinking live message (null once the reply has taken over). */
+  private thinkingMessage: Message | null = null;
+  /** When the current round's thinking started (for the "thought for Ns" line). */
+  private reasoningStartedAt: number | null = null;
   private typingTimer: NodeJS.Timeout | null = null;
-  private lastEditAt = 0;
+  private lastThinkingEditAt = 0;
+  private lastReplyEditAt = 0;
   private finished = false;
   private chain: Promise<void> = Promise.resolve();
 
@@ -317,36 +328,46 @@ export class ResponseWriter {
 
   /**
    * Feed a streamed reasoning delta (the model's "thinking", when the
-   * endpoint sends it). Shown live in the same message that will carry the
-   * reply; reasoning is never posted or recorded.
+   * endpoint sends it). Shown live in a thinking message that completes
+   * into a "🤔 *thought for Ns*" line when the reply starts; reasoning is
+   * never posted or recorded.
    */
   reason(delta: string): void {
     if (this.finished) return;
+    if (this.reasoningStartedAt === null && this.buffer.length === 0) {
+      this.reasoningStartedAt = Date.now();
+    }
     this.reasoningBuffer += delta;
     this.chain = this.chain.then(() => this.updateLive()).catch(() => {});
   }
 
   /**
-   * Discard the in-progress live message without finishing the turn.
-   * Used when a streamed response turns out to contain tool calls: the
-   * text streamed so far is transient, and the next round streams its own
-   * live message. No-op when nothing has been posted or the turn finished.
+   * Discard the in-progress live messages (thinking + reply preview)
+   * without finishing the turn. Used when a streamed response turns out to
+   * contain tool calls: the text streamed so far is transient, and the next
+   * round streams its own live messages. No-op when nothing has been posted
+   * or the turn finished.
    */
   discard(): void {
     if (this.finished) return;
-    const target = this.message;
-    this.message = null;
     this.buffer = "";
     this.reasoningBuffer = "";
-    this.shownKind = null;
-    this.lastEditAt = 0;
-    if (target) {
-      // Delete the captured message object (not this.message): a pending
-      // updateLive may recreate a fresh live message, which must survive.
-      this.chain = this.chain.then(async () => {
-        await target.delete().catch(() => {});
-      });
-    }
+    this.reasoningStartedAt = null;
+    this.lastThinkingEditAt = 0;
+    this.lastReplyEditAt = 0;
+    // The messages are captured when the delete step runs, not now: a
+    // pending updateLive from this round (e.g. an initial send still in
+    // flight) is queued before the step, so the messages it creates are
+    // deleted too, while next-round updates queue after the step and their
+    // fresh messages survive.
+    this.chain = this.chain.then(async () => {
+      const targets = [this.thinkingMessage, this.message].filter((m): m is Message => m !== null);
+      this.thinkingMessage = null;
+      this.message = null;
+      for (const m of targets) {
+        await m.delete().catch(() => {});
+      }
+    });
   }
 
   /**
@@ -361,27 +382,20 @@ export class ResponseWriter {
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
+    await this.completeThinking();
 
     const text = sanitizeForDiscord(fullText.trim() || this.buffer.trim());
     const posted: Message[] = [];
     try {
       if (!text) {
         const note = "*(the model returned no response)*";
-        posted.push(
-          this.message ? await this.message.edit({ content: note }) : await this.opts.channel.send(note),
-        );
+        posted.push(await this.postInto(this.finalTarget(), note));
         return { messageIds: [posted[0].id], text: note };
       }
       const chunks = splitForDiscord(text);
-      if (this.message) {
-        posted.push(await this.message.edit({ content: chunks[0] }));
-        for (const c of chunks.slice(1)) {
-          posted.push(await this.opts.channel.send(c));
-        }
-      } else {
-        for (const c of chunks) {
-          posted.push(await this.opts.channel.send(c));
-        }
+      posted.push(await this.postInto(this.finalTarget(), chunks[0]));
+      for (const c of chunks.slice(1)) {
+        posted.push(await this.opts.channel.send(c));
       }
       return this.reported(posted, text);
     } catch (err) {
@@ -400,6 +414,7 @@ export class ResponseWriter {
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
+    await this.completeThinking();
 
     const note = `⚠️ *generation failed:* ${truncate(errMsg(err), 400)}`;
     const partial = sanitizeForDiscord(this.buffer.trim());
@@ -407,15 +422,9 @@ export class ResponseWriter {
     const posted: Message[] = [];
     try {
       const chunks = splitForDiscord(text);
-      if (this.message) {
-        posted.push(await this.message.edit({ content: chunks[0] }));
-        for (const c of chunks.slice(1)) {
-          posted.push(await this.opts.channel.send(c));
-        }
-      } else {
-        for (const c of chunks) {
-          posted.push(await this.opts.channel.send(c));
-        }
+      posted.push(await this.postInto(this.finalTarget(), chunks[0]));
+      for (const c of chunks.slice(1)) {
+        posted.push(await this.opts.channel.send(c));
       }
       return this.reported(posted, text);
     } catch (err2) {
@@ -440,22 +449,50 @@ export class ResponseWriter {
 
   private async updateLive(): Promise<void> {
     if (this.finished) return;
-    const preview = this.preview();
-    if (preview === null) return;
-    // A change of what is shown (activity → thinking → reply) lands
-    // immediately; updates of the same kind respect the throttle.
-    const force = this.shownKind !== preview.kind;
+    if (this.buffer.length > 0) {
+      await this.updateReply();
+      return;
+    }
+    await this.updateThinking();
+  }
+
+  /**
+   * The thinking preview: the live message while the model is still
+   * thinking. Once the reply starts it is edited to its terminal line and
+   * left in the channel (never deleted, never updated again).
+   */
+  private async updateThinking(): Promise<void> {
+    if (this.reasoningBuffer.length === 0) return;
+    try {
+      if (!this.thinkingMessage) {
+        this.thinkingMessage = await this.opts.channel.send(this.reasoningPreview());
+      } else if (Date.now() - this.lastThinkingEditAt >= this.opts.throttleMs) {
+        this.lastThinkingEditAt = Date.now();
+        await this.thinkingMessage.edit({ content: this.reasoningPreview() });
+      }
+    } catch (err) {
+      log.warn(`thinking preview update failed: ${errMsg(err)}`);
+      // keep going; finish()/reportError() make the final attempt
+    }
+  }
+
+  /**
+   * The reply preview: its own live message once content has started. On
+   * the first content delta the thinking message (when there was one)
+   * completes in place, then the reply is created as a fresh message.
+   */
+  private async updateReply(): Promise<void> {
     try {
       if (!this.message) {
-        this.message = await this.opts.channel.send(preview.text);
-        this.shownKind = preview.kind;
-      } else {
-        const now = Date.now();
-        if (force || now - this.lastEditAt >= this.opts.throttleMs) {
-          this.lastEditAt = now;
-          this.shownKind = preview.kind;
-          await this.message.edit({ content: preview.text });
+        if (this.thinkingMessage) {
+          const done = this.thinkingMessage;
+          this.thinkingMessage = null;
+          await done.edit({ content: this.thinkingDoneLine() }).catch(() => {});
         }
+        this.message = await this.opts.channel.send(this.contentPreview());
+      } else if (Date.now() - this.lastReplyEditAt >= this.opts.throttleMs) {
+        this.lastReplyEditAt = Date.now();
+        await this.message.edit({ content: this.contentPreview() });
       }
     } catch (err) {
       log.warn(`live message update failed: ${errMsg(err)}`);
@@ -464,17 +501,36 @@ export class ResponseWriter {
   }
 
   /**
-   * What the live message shows right now, highest priority first: the
-   * streamed reply, then the streamed reasoning.
+   * If no reply ever took over (non-stream mode, or a reasoning-only
+   * response), the thinking line still completes in place at
+   * finish()/reportError() time, so the final post lands in a fresh message
+   * below it instead of overwriting it.
    */
-  private preview(): { kind: "reasoning" | "content"; text: string } | null {
-    if (this.buffer.length > 0) {
-      return { kind: "content", text: this.contentPreview() };
-    }
-    if (this.reasoningBuffer.length > 0) {
-      return { kind: "reasoning", text: this.reasoningPreview() };
-    }
-    return null;
+  private async completeThinking(): Promise<void> {
+    if (!this.thinkingMessage) return;
+    const done = this.thinkingMessage;
+    this.thinkingMessage = null;
+    await done.edit({ content: this.thinkingDoneLine() }).catch(() => {});
+  }
+
+  /**
+   * Where the final post lands: the reply's live message, or a fresh post
+   * (any thinking line has already been completed by completeThinking()).
+   */
+  private finalTarget(): Message | null {
+    return this.message ?? this.thinkingMessage;
+  }
+
+  private async postInto(target: Message | null, content: string): Promise<Message> {
+    return target ? await target.edit({ content }) : await this.opts.channel.send(content);
+  }
+
+  /** The thinking message's terminal line: how long the model thought. */
+  private thinkingDoneLine(): string {
+    const startedAt = this.reasoningStartedAt;
+    if (startedAt === null) return "🤔 *thought…*";
+    const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+    return `🤔 *thought for ${secs}s*`;
   }
 
   /** Reply preview capped at 2000 chars: the head while it fits, the tail once it doesn't. */
@@ -488,19 +544,34 @@ export class ResponseWriter {
   }
 
   /**
-   * Reasoning preview: the most recent tail of the thinking, wrapped in an
-   * italic "🤔 *thinking: …*" header, capped at 2000 chars.
+   * Reasoning preview, capped at 2000 chars: the whole thinking while it
+   * fits inline ("🤔 *thinking: …*"); once it doesn't, a header + a
+   * "*N lines hidden*" line + the last REASONING_TAIL_LINES lines of the
+   * thinking (cut from the front with a "…" when even those don't fit; a
+   * thinking without newlines falls back to the plain character tail).
    */
   private reasoningPreview(): string {
-    const prefix = "🤔 *thinking: ";
     const max = DISCORD_MAX_MESSAGE_CHARS;
     const text = sanitizeForDiscord(this.reasoningBuffer).trim();
     if (text.length === 0) {
       return "🤔 *thinking…*";
     }
+    const prefix = "🤔 *thinking: ";
+    if (text.length <= max - prefix.length - 1 /* closing * */) {
+      return prefix + text + "*";
+    }
+    const lines = text.split("\n");
+    if (lines.length > REASONING_TAIL_LINES) {
+      const header = "🤔 *thinking: …*";
+      const hidden = lines.length - REASONING_TAIL_LINES;
+      const hiddenLine = `*${hidden} line${hidden === 1 ? "" : "s"} hidden*`;
+      const tail = lines.slice(-REASONING_TAIL_LINES).join("\n");
+      const bodyBudget = max - header.length - hiddenLine.length - 2 /* newlines */;
+      const body = tail.length > bodyBudget ? "…" + tail.slice(tail.length - (bodyBudget - 1)) : tail;
+      return header + "\n" + hiddenLine + "\n" + body;
+    }
     const budget = max - prefix.length - 1 /* closing * */ - 1 /* leading … */;
-    const tail = text.length > budget ? "…" + text.slice(text.length - budget) : text;
-    return prefix + tail + "*";
+    return prefix + "…" + text.slice(text.length - budget) + "*";
   }
 
   private stopTyping(): void {
