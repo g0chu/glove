@@ -19,8 +19,8 @@ export interface QueueDeps {
  *  - mentions arriving while a turn is in flight are queued, not dropped;
  *  - turns run in arrival order;
  *  - ambient (non-mention) messages never trigger a turn;
- *  - a mention whose message was deleted (or evicted out of the history
- *    window) before its turn runs is skipped by runTurn.
+ *  - a mention whose message left the channel context (deleted) before its
+ *    turn runs is skipped by runTurn.
  */
 export class ChannelQueue {
   private pending: string[] = [];

@@ -5,7 +5,8 @@ import { isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { QueueStore } from "./bot/queue.js";
 import { ResponseWriter } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
-import { ConversationStore } from "./llm/history.js";
+import { ChannelContextStore, type ChannelContext } from "./llm/context.js";
+import { ConversationStore, type ChannelHistory } from "./llm/history.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
 import { formatToolCall } from "./tools/activity.js";
@@ -14,6 +15,9 @@ import { runToolTurn } from "./tools/loop.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
+  // Classic mode: the per-channel sliding window. Compaction mode: the
+  // persistent per-channel context (seeded once, growing, compacted).
+  const compaction = cfg.model.compactionEnabled;
   log.info(
     "config loaded:",
     `guild=${cfg.discord.guildId}`,
@@ -22,6 +26,9 @@ async function main(): Promise<void> {
     `stream=${cfg.model.stream}`,
     `images=${cfg.model.enableImages}`,
     `window=${cfg.model.contextMaxMessages}`,
+    compaction
+      ? `compaction=on (budget ~${cfg.model.compactionMaxTokens} est. tokens, keep ${cfg.model.compactionKeepMessages})`
+      : "compaction=off (classic sliding window)",
   );
 
   const client = createDiscordClient();
@@ -33,6 +40,7 @@ async function main(): Promise<void> {
     timeoutMs: cfg.model.timeoutMs,
   });
   const histories = new ConversationStore(cfg.model.contextMaxMessages);
+  const contexts = new ChannelContextStore();
   const tools = buildTools(cfg);
   if (tools.registry.size > 0) {
     log.info(
@@ -43,17 +51,20 @@ async function main(): Promise<void> {
   }
 
   /**
-   * One full turn for a queued mention. The model's context is built at
-   * turn time from the channel's last N Discord messages (fetched live, so
-   * it survives bot restarts and is exactly what is in the channel); the
-   * mention itself is part of that window, so edits that happened while
-   * the turn was queued are picked up automatically.
+   * One full turn for a queued mention. In compaction mode the model's
+   * context is the channel's persistent context (seeded once with the
+   * channel's last N messages, grown by every arrival, compacted when it
+   * fills the token budget); in classic mode it is built from the channel's
+   * last N Discord messages, fetched live each turn. The mention itself is
+   * part of the context, so edits that happened while the turn was queued
+   * are picked up automatically.
    */
   const runTurn = async (channelId: string, mentionId: string): Promise<void> => {
+    const context = contexts.get(channelId);
     const history = histories.get(channelId);
-    if (!history.has(mentionId)) {
-      // Deleted (or evicted out of the context window) before its turn ran.
-      log.info(`mention ${mentionId} in ${channelId} left the context window; skipping turn`);
+    if (compaction ? !context.has(mentionId) : !history.has(mentionId)) {
+      // Deleted before its turn ran.
+      log.info(`mention ${mentionId} in ${channelId} left the channel context; skipping turn`);
       return;
     }
 
@@ -83,7 +94,8 @@ async function main(): Promise<void> {
     });
     try {
       // Build the context before the typing indicator starts: it is a
-      // channel fetch (+ image downloads), not model generation.
+      // channel fetch (+ image downloads, + one summarization call when the
+      // context compacts), not the reply generation itself.
       const botId = client.user?.id;
       if (!botId) {
         log.error(`turn in ${channelId}: bot user not available; skipping turn`);
@@ -99,16 +111,25 @@ async function main(): Promise<void> {
       const systemPrompt = [cfg.model.systemPrompt, hasTools ? TOOLS_SYSTEM_NOTE : null]
         .filter((p): p is string => p !== null && p.trim().length > 0)
         .join("\n\n");
-      const messages = await buildChannelContext(textChannel, history, mentionId, {
+      const messages = await buildChannelContext(textChannel, context, history, mentionId, {
         botId,
         systemPrompt,
         maxMessages: cfg.model.contextMaxMessages,
         enableImages: cfg.model.enableImages,
         imagesMaxBytes: cfg.model.imagesMaxBytes,
+        compaction: compaction
+          ? {
+              maxTokens: cfg.model.compactionMaxTokens,
+              keepMessages: cfg.model.compactionKeepMessages,
+              // The summarizer is the same endpoint as the replies: one
+              // plain (tool-less) chat call over the old transcript.
+              summarize: async (msgs) => (await llm.chat(msgs)).content,
+            }
+          : undefined,
       });
       if (messages === null) {
-        // Deleted, or pushed out of the channel's last N messages while queued.
-        log.info(`mention ${mentionId} in ${channelId} left the channel window; skipping turn`);
+        // Deleted while queued.
+        log.info(`mention ${mentionId} in ${channelId} left the channel context; skipping turn`);
         return;
       }
       writer.start();
@@ -147,12 +168,24 @@ async function main(): Promise<void> {
           ? "*(stopped: the model kept requesting tools past the round limit)*"
           : outcome.content;
       const posted = await writer.finish(finalText);
-      if (posted) history.push("assistant", posted.text, posted.messageIds, posted.chunks);
+      if (posted) recordReply(channelId, posted);
     } catch (err) {
       log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
       const posted = await writer.reportError(err);
-      if (posted) history.push("assistant", posted.text, posted.messageIds, posted.chunks);
+      if (posted) recordReply(channelId, posted);
     }
+  };
+
+  /** Record the bot's posted reply in the channel's conversation store. */
+  const recordReply = (channelId: string, posted: { text: string; messageIds: string[]; chunks?: string[] }): void => {
+    if (compaction) contexts.get(channelId).pushAssistant(posted.text, posted.messageIds, posted.chunks);
+    else histories.get(channelId).push("assistant", posted.text, posted.messageIds, posted.chunks);
+  };
+
+  /** The conversation store that tracks a channel (one is active per mode). */
+  const conversationFor = (channelId: string): ChannelHistory | ChannelContext | null => {
+    if (compaction) return contexts.has(channelId) ? contexts.get(channelId) : null;
+    return histories.has(channelId) ? histories.get(channelId) : null;
   };
 
   const queues = new QueueStore({ runTurn });
@@ -176,9 +209,25 @@ async function main(): Promise<void> {
     if (!botId) return;
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
     // The display name (guild nickname when set, else the global username)
-    // labels this message in the in-memory fallback context.
+    // labels this message in the context; the attachment metadata is what
+    // the image parts are downloaded from at turn time.
     const name = message.member?.displayName ?? message.author.username;
-    histories.get(message.channelId).push("user", stripMention(message, botId), [message.id], undefined, name);
+    if (compaction) {
+      contexts.get(message.channelId).pushUser(
+        name,
+        stripMention(message, botId),
+        message.id,
+        message.createdTimestamp,
+        [...message.attachments.values()].map((a) => ({
+          url: a.url,
+          name: a.name,
+          size: a.size,
+          contentType: a.contentType ?? null,
+        })),
+      );
+    } else {
+      histories.get(message.channelId).push("user", stripMention(message, botId), [message.id], undefined, name);
+    }
     if (isMentionOf(message, botId)) {
       queues.get(message.channelId).push(message.id);
     }
@@ -194,39 +243,42 @@ async function main(): Promise<void> {
     const botId = client.user?.id;
     if (!botId) return;
     const channelId = message.channel?.id;
-    if (!channelId || !histories.has(channelId)) return;
-    const history = histories.get(channelId);
-    const entry = history.find(message.id);
-    if (!entry) return; // not in this channel's context window
+    if (!channelId) return;
+    const conv = conversationFor(channelId);
+    if (!conv) return; // the channel has no context yet
+    const entry = conv.find(message.id);
+    if (!entry) return; // not in this channel's context
     const newContent = stripMention(message, botId);
     if (entry.ids.length === 1) {
-      if (newContent !== entry.content) history.updateContent(message.id, newContent);
+      if (newContent !== entry.content) conv.updateContent(message.id, newContent);
     } else if (entry.chunks) {
       const i = entry.ids.indexOf(message.id);
       if (i !== -1 && entry.chunks[i] !== newContent) {
-        history.updateChunk(message.id, newContent);
+        conv.updateChunk(message.id, newContent);
       }
     }
   });
 
-  // Deletions: drop the entry, wherever it is in the window. (A delete of
+  // Deletions: drop the entry, wherever it is in the context. (A delete of
   // any chunk of a chunked reply drops the whole reply.)
   client.on("messageDelete", (message) => {
     const channelId = message.channel?.id;
-    if (!channelId || !histories.has(channelId)) return;
-    histories.get(channelId).removeById(message.id);
+    if (!channelId) return;
+    conversationFor(channelId)?.removeById(message.id);
   });
 
   client.on("messageDeleteBulk", (messages, channel) => {
-    if (!histories.has(channel.id)) return;
+    const conv = conversationFor(channel.id);
+    if (!conv) return;
     for (const m of messages.values()) {
-      histories.get(channel.id).removeById(m.id);
+      conv.removeById(m.id);
     }
   });
 
-  // A deleted channel's history is gone; forget it.
+  // A deleted channel's context is gone; forget it.
   client.on("channelDelete", (channel) => {
     histories.clear(channel.id);
+    contexts.clear(channel.id);
   });
 
   // Lifecycle: cancel in-flight generation, destroy the client, exit cleanly.
