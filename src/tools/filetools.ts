@@ -81,7 +81,15 @@ export class FileTools {
 
   /** Replace an exact text span in a file. */
   async edit(path: string, oldText: string, newText: string, replaceAll: boolean): Promise<string> {
-    const data = await editFile(this.opts.workspace, path, oldText, newText, replaceAll);
+    const data = await editFile(
+      this.opts.workspace,
+      path,
+      oldText,
+      newText,
+      replaceAll,
+      this.opts.readMaxBytes,
+      this.opts.writeMaxBytes,
+    );
     return `Replaced ${data.replacements} occurrence(s) in "${data.path || path}".`;
   }
 

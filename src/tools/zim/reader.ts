@@ -630,8 +630,16 @@ export class ZimReader {
     }
     // Exclusive upper bound: increment the last char of the hi variant.
     hi = hi.slice(0, -1) + String.fromCharCode(hi.charCodeAt(hi.length - 1) + 1);
-    const a = await this.lowerBound("\x00" + lo);
-    const b = await this.lowerBound("\xff" + hi);
+    // Keys are ns + path and the namespace is a single byte, so the window
+    // must span the candidate namespaces: the narrowest per-namespace
+    // bounds (entries of other namespaces inside the window are filtered by
+    // the verifier, as always).
+    let a = this.pathPtrLen;
+    let b = 0;
+    for (const c of this.nsCandidates) {
+      a = Math.min(a, await this.lowerBound(c + lo));
+      b = Math.max(b, await this.lowerBound(c + hi));
+    }
     return [a, b];
   }
 
@@ -926,7 +934,7 @@ async function readMimeList(fd: Awaited<ReturnType<typeof fs.open>>, pos: number
       p = e + 1;
       lastComplete = p;
     }
-    off += buf.length;
+    off += bytesRead; // the file advanced by the chunk, not by acc + chunk
     acc = lastComplete < buf.length ? buf.subarray(lastComplete) : Buffer.alloc(0);
   }
   return out;

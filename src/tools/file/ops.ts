@@ -202,15 +202,31 @@ export async function writeFile(
   return { path: rel, bytesWritten: encoded.length };
 }
 
-/** Replace an exact text span in a file (first occurrence, or all of them). */
+/**
+ * Replace an exact text span in a file (first occurrence, or all of them).
+ * The read is size-capped (an uncapped read of a large workspace file would
+ * be an uncatchable OOM) and the result by the write cap, like the other
+ * operations.
+ */
 export async function editFile(
   workspace: string,
   rel: string,
   oldText: string,
   newText: string,
   replaceAll: boolean,
+  readMaxBytes: number,
+  writeMaxBytes: number,
 ): Promise<{ path: string; replacements: number }> {
   const target = resolveInWorkspace(workspace, rel);
+  let st;
+  try {
+    st = await fs.stat(target);
+  } catch {
+    throw new ToolError(`not a file: ${rel}`);
+  }
+  if (st.size > readMaxBytes) {
+    throw new ToolError(`file ${rel} is too large to edit (${st.size} bytes, cap ${readMaxBytes})`);
+  }
   let buf: Buffer;
   try {
     buf = await fs.readFile(target);
@@ -229,7 +245,11 @@ export async function editFile(
     throw new ToolError("old_text not found in the file (it must match exactly, whitespace included)");
   }
   const updated = replaceAll ? text.split(oldText).join(newText) : replaceFirst(text, oldText, newText);
-  await fs.writeFile(target, updated, "utf8");
+  const encoded = Buffer.from(updated, "utf8");
+  if (encoded.length > writeMaxBytes) {
+    throw new ToolError(`the edited content is larger than the write cap (${writeMaxBytes} bytes)`);
+  }
+  await fs.writeFile(target, encoded);
   return { path: rel, replacements: replaceAll ? occurrences : 1 };
 }
 
