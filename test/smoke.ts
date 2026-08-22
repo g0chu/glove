@@ -261,6 +261,25 @@ const ok = (name: string): void => {
   }
   ok("split: code fence closed/reopened across chunks, lines in order");
 
+  // Regression: a chunk boundary inside a fence must reserve room for the
+  // closing token (emit() appends it), so no chunk may exceed maxChars.
+  const tightFence = "```ts\n" + "a".repeat(1994) + "\nb";
+  const c4 = splitForDiscord(tightFence);
+  assert.ok(c4.every((x) => x.length <= 2000), `oversized chunk: ${c4.map((x) => x.length).join(",")}`);
+  const tightFence2 = "~~~~\n" + "b".repeat(1995) + "\n";
+  const c5 = splitForDiscord(tightFence2);
+  assert.ok(c5.every((x) => x.length <= 2000), `oversized chunk: ${c5.map((x) => x.length).join(",")}`);
+
+  // A carried-over tail + a fence-opener line must leave room for the closing
+  // token: the carry check used to allow suffix+line == maxChars, then emit()
+  // appended the token (maxChars+4) -> Discord 400, tail of reply lost.
+  const carryOpener = "\n" + "x".repeat(1994) + "\n```ts";
+  const c6 = splitForDiscord(carryOpener);
+  assert.ok(c6.every((x) => x.length <= 2000), `oversized chunk: ${c6.map((x) => x.length).join(",")}`);
+  const c7 = splitForDiscord(carryOpener + "\n" + "y".repeat(500));
+  assert.ok(c7.every((x) => x.length <= 2000), `oversized chunk: ${c7.map((x) => x.length).join(",")}`);
+  ok("split: fence-boundary chunks never exceed maxChars (closing token accounted for)");
+
   // A table that fits in one chunk is never split across messages, even
   // when the preceding text fills the chunk.
   const row = (tag: string, fill: number): string => `| ${tag} | ${"z".repeat(fill)} |`;
@@ -340,6 +359,14 @@ const ok = (name: string): void => {
   assert.equal(sanitizeForDiscord("$x_1 + x_2$"), "x₁ + x₂");
   assert.equal(sanitizeForDiscord("$\\frac{a}{b}$"), "a/b");
   assert.equal(sanitizeForDiscord("$\\sqrt{x}$"), "√x");
+  // Unmapped sub/superscript characters keep the original span (the marker
+  // is not dropped: a_b must not become ab, and a partial mix like xₐb is
+  // worse than the source).
+  assert.equal(sanitizeForDiscord("$a_b$"), "a_b");
+  assert.equal(sanitizeForDiscord("$x^y$"), "x^y");
+  // (braces are dropped by the leftover-braces cleanup, the text is not)
+  assert.equal(sanitizeForDiscord("$x_{ab}$"), "x_ab");
+  assert.equal(sanitizeForDiscord("$a_{b1}$"), "a_b1");
   // Display math and noise commands.
   assert.equal(sanitizeForDiscord("$$\\text{VO}_2 = \\text{CO} \\times a$$"), "VO₂ = CO × a");
   assert.equal(sanitizeForDiscord("$\\label{eq1} y$"), "y");
@@ -438,6 +465,7 @@ const ok = (name: string): void => {
   const beep = m(authors.carl, "beep");
   const think = m(authors.bot, "🤔 *thought for 3s*"); // our UI line
   const activity = m(authors.bot, "🔎 *web_search(query=\"x\")*"); // our UI line
+  const wiki = m(authors.bot, "📚 *wikipedia_search(query=\"loop\")*"); // our UI line
   const chunkA = m(authors.bot, "part one");
   const chunkB = m(authors.bot, "part two");
   const thanks = m(authors.alice, "thanks");
@@ -447,7 +475,7 @@ const ok = (name: string): void => {
   const errNote = m(authors.bot, "⚠️ *generation failed: boom*");
   // the mention carries an image too: it must survive the history lookup
   const mention = m(authors.alice, "<@bot1> describe this", [imgAtt]);
-  const fetchedList = [hello, oldReply, beep, think, activity, chunkA, chunkB, thanks, imgOnly, sure, big, errNote, mention];
+  const fetchedList = [hello, oldReply, beep, think, activity, wiki, chunkA, chunkB, thanks, imgOnly, sure, big, errNote, mention];
 
   const hist = new ChannelHistory(20);
   hist.push("assistant", "full reply", [chunkA.id, chunkB.id], ["part one", "part two"]);
@@ -497,6 +525,49 @@ const ok = (name: string): void => {
   // The mention gone from the window (deleted / pushed out) -> null: skip the turn.
   assert.equal(await contextFromMessages(fetchedList.slice(0, -1), hist, mention.id, opts), null);
   ok("context: images disabled ignores attachments; mention gone -> null");
+
+  // A chunked reply from before a restart (no history entry): the
+  // consecutive own messages posted close together (the reply's chunks) are
+  // one assistant entry again; a reply posted later stays separate.
+  const gm = (content: string, ts: number): MessageLike => ({
+    id: `g${String(++n)}`,
+    createdTimestamp: ts,
+    content,
+    author: authors.bot,
+    attachments: [],
+  });
+  const um = (content: string, ts: number): MessageLike => ({
+    id: `u${String(++n)}`,
+    createdTimestamp: ts,
+    content,
+    author: authors.alice,
+    attachments: [],
+  });
+  const ga = gm("chunk one", 2_000_000);
+  const gb = gm("chunk two", 2_000_000 + 1500);
+  const gc = gm("chunk three", 2_000_000 + 3000);
+  const gd = gm("a later reply", 2_000_000 + 20_000); // 17 s after gc: a distinct reply
+  const gq = um("the question", 2_000_000 + 30_000);
+  const glist = [ga, gb, gc, gd, gq];
+  const gres = await contextFromMessages(glist, new ChannelHistory(20), gq.id, opts);
+  assert.deepEqual(gres, [
+    { role: "system", content: "sys" },
+    { role: "assistant", content: "chunk one\nchunk two\nchunk three" },
+    { role: "assistant", content: "a later reply" },
+    { role: "user", content: "Alice: the question" },
+  ]);
+  // A user message between two chunks breaks the group.
+  const gs = gm("chunk one", 3_000_000);
+  const gt = um("interrupting", 3_000_000 + 500);
+  const gu = gm("chunk two", 3_000_000 + 1000);
+  const gres2 = await contextFromMessages([gs, gt, gu], new ChannelHistory(20), gt.id, opts);
+  assert.deepEqual(gres2, [
+    { role: "system", content: "sys" },
+    { role: "assistant", content: "chunk one" },
+    { role: "user", content: "Alice: interrupting" },
+    { role: "assistant", content: "chunk two" },
+  ]);
+  ok("context: unrecorded chunked reply (close-together own messages) is one assistant entry again");
 
   // Wrapper: fetches with limit = maxMessages, sorts oldest-first, and a
   // fetch failure falls back to the in-memory window (bot keeps working).
@@ -566,6 +637,34 @@ const ok = (name: string): void => {
   ]);
   assert.equal(est.estimateTokens("", 10), 1200, "200 text tokens + 1000 image tokens");
   ok("compaction store: seed merges chronologically (tracked ids win), token estimate");
+
+  // A chunked reply in the channel before the bot started (its chunks are
+  // separate Discord messages): the seed groups the close-together bot
+  // entries back into one entry — one id per chunk, the per-chunk text — so
+  // chunk edit/delete bookkeeping matches a live chunked reply. A bot
+  // message posted later stays a separate entry.
+  const rstore = new ChannelContext();
+  rstore.seedFrom([
+    { id: "r0", ts: 1000, role: "user", content: "question", name: "Alice", attachments: [] },
+    { id: "r1", ts: 2000, role: "assistant", content: "reply part one", attachments: [] },
+    { id: "r2", ts: 2500, role: "assistant", content: "reply part two", attachments: [] },
+    { id: "r3", ts: 3000, role: "assistant", content: "reply part three", attachments: [] },
+    { id: "r4", ts: 30_000, role: "assistant", content: "a later reply", attachments: [] },
+    { id: "r5", ts: 40_000, role: "user", content: "thanks", name: "Alice", attachments: [] },
+  ]);
+  const rsnap = rstore.snapshot();
+  assert.equal(rsnap.length, 4, "question + grouped reply + later reply + thanks");
+  const grouped = rsnap[1];
+  assert.deepEqual(grouped.ids, ["r1", "r2", "r3"], "one id per chunk");
+  assert.equal(grouped.content, "reply part one\nreply part two\nreply part three");
+  assert.deepEqual(grouped.chunks, ["reply part one", "reply part two", "reply part three"]);
+  assert.equal(rsnap[2].content, "a later reply", "a far-apart bot message stays separate");
+  // Chunk edit/delete bookkeeping on the grouped entry:
+  rstore.updateChunk("r2", "reply part two (edited)");
+  assert.equal(grouped.content, "reply part one\nreply part two (edited)\nreply part three");
+  assert.ok(rstore.removeById("r1"), "any chunk id removes the whole reply");
+  assert.equal(rstore.length, 3);
+  ok("compaction store: seeded chunked reply groups into one entry (ids, chunks, edit, delete)");
 
   // A turn build compacts: the older part becomes a summary message, the
   // newest keep messages stay verbatim, and the summary rides ahead of them.
@@ -759,10 +858,10 @@ const ok = (name: string): void => {
     let nextId = 0;
     const channel = {
       sendTyping: async (): Promise<void> => {},
-      send: async (content: string) => {
+      send: async (data: { content: string }) => {
         const m: FakeMessage = {
           id: `msg${String(++nextId)}`,
-          content,
+          content: data.content,
           edit: async (u) => {
             m.content = u.content;
             return m;
@@ -770,7 +869,7 @@ const ok = (name: string): void => {
         };
         live = m;
         messages.push(m);
-        sent.push(content);
+        sent.push(data.content);
         return m;
       },
     };
@@ -847,13 +946,125 @@ const ok = (name: string): void => {
   assert.equal(p4!.messageIds.length, 1, "the error note is recorded in history too");
   ok("writer: error keeps partial text + note");
 
+  // A chunk that fails mid-settle must not strand the remaining chunks:
+  // they are still posted, and the reported text is what actually landed
+  // (not the canonical reply, which includes the missing chunk).
+  const emsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  let esends = 0;
+  const echan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      esends++;
+      if (esends === 2) throw new Error("rate limited");
+      const m = { id: `e${String(esends)}`, content: data.content, deleted: false };
+      emsgs.push(m);
+      return {
+        id: m.id,
+        content: m.content,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return m;
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const w4b = new ResponseWriter({
+    channel: echan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w4b.start();
+  const long7 = "q".repeat(6000); // 3 chunks; the middle one fails
+  const p4b = await w4b.finish(long7);
+  assert.equal(emsgs.length, 2, "the failed chunk is missing, the others landed");
+  assert.equal(p4b!.messageIds.length, 2, "only what landed is reported");
+  assert.equal(p4b!.text, emsgs.map((m) => m.content).join("\n"), "visible text reported, not the canonical reply");
+  ok("writer: a failed chunk does not strand the remaining ones");
+
+  // Bot posts carry allowedMentions: user pings stay active, @everyone/@here
+  // and role pings are suppressed (a stray mention must not ping the server).
+  const amsgs: Array<{ id: string; content: string }> = [];
+  const asendOpts: Array<Record<string, unknown>> = [];
+  const aeditOpts: Array<Record<string, unknown>> = [];
+  const achan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string; allowedMentions?: unknown }) => {
+      const m = { id: `a${String(amsgs.length + 1)}`, content: data.content };
+      amsgs.push(m);
+      asendOpts.push(data);
+      return {
+        id: m.id,
+        content: m.content,
+        edit: async (u: { content: string; allowedMentions?: unknown }) => {
+          m.content = u.content;
+          aeditOpts.push(u);
+          return m;
+        },
+        delete: async () => true,
+      };
+    },
+  };
+  const w4c = new ResponseWriter({
+    channel: achan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  w4c.start();
+  w4c.chunk("hello @everyone");
+  await ticks(2);
+  const p4c = await w4c.finish("hello @everyone");
+  assert.equal(p4c!.text, "hello @everyone", "the text itself is unchanged");
+  assert.deepEqual(asendOpts[0].allowedMentions, { parse: ["users"] }, "sends suppress everyone/role pings");
+  assert.deepEqual(aeditOpts[0].allowedMentions, { parse: ["users"] }, "edits (the settle) do too");
+  ok("writer: posts suppress @everyone/@here pings (allowedMentions, user pings kept)");
+
+  // A long reasoning stream keeps the preview bounded: the buffer holds a
+  // tail, the last lines are visible, and the hidden count spans the whole
+  // stream.
+  const rmsgs: Array<{ id: string; content: string }> = [];
+  const rchan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `r${String(rmsgs.length + 1)}`, content: data.content };
+      rmsgs.push(m);
+      return {
+        id: m.id,
+        content: m.content,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return m;
+        },
+        delete: async () => true,
+      };
+    },
+  };
+  const w4d = new ResponseWriter({
+    channel: rchan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 1,
+  });
+  w4d.start();
+  const manyLines = Array.from({ length: 2000 }, (_, i) => `thought line ${String(i)} ${"x".repeat(20)}`).join("\n");
+  w4d.reason(manyLines);
+  await ticks(3);
+  const preview = (w4d as unknown as { reasoningPreview(): string }).reasoningPreview();
+  assert.ok(preview.length <= 2000, `preview is bounded (got ${preview.length})`);
+  assert.ok(preview.includes("thought line 1999"), "the last line is visible");
+  assert.ok(preview.includes("1995 lines hidden"), `the hidden count spans the whole stream: ${preview.slice(0, 60)}`);
+  assert.ok((w4d as unknown as { reasoningBuffer: string }).reasoningBuffer.length <= 8000, "the buffer holds only a tail");
+  ok("writer: long reasoning keeps the preview bounded (tail + line count)");
+
   // discard(): a tool-call round's streamed preview is deleted, and the
   // next round streams a fresh live message
   const msgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const dchan = {
     sendTyping: async (): Promise<void> => {},
-    send: async (content: string) => {
-      const m = { id: `w${String(msgs.length)}`, content, deleted: false };
+    send: async (data: { content: string }) => {
+      const m = { id: `w${String(msgs.length)}`, content: data.content, deleted: false };
       msgs.push(m);
       return {
         id: m.id,
@@ -960,8 +1171,8 @@ const ok = (name: string): void => {
   const actMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const actChan = {
     sendTyping: async (): Promise<void> => {},
-    send: async (content: string) => {
-      const m = { id: `a${String(actMsgs.length)}`, content, deleted: false };
+    send: async (data: { content: string }) => {
+      const m = { id: `a${String(actMsgs.length)}`, content: data.content, deleted: false };
       actMsgs.push(m);
       return {
         id: m.id,
@@ -1465,18 +1676,41 @@ const ok = (name: string): void => {
 
     // -- edit
     fs.writeFileSync(path.join(ws, "e.txt"), "aXbXcXa");
-    const eAll = await fileOps.editFile(ws, "e.txt", "X", "Y", true);
+    const eAll = await fileOps.editFile(ws, "e.txt", "X", "Y", true, ops.readMaxBytes, ops.writeMaxBytes);
     assert.equal(eAll.replacements, 3);
     assert.equal(fs.readFileSync(path.join(ws, "e.txt"), "utf8"), "aYbYcYa");
-    const eFirst = await fileOps.editFile(ws, "e.txt", "Y", "Z", false);
+    const eFirst = await fileOps.editFile(ws, "e.txt", "Y", "Z", false, ops.readMaxBytes, ops.writeMaxBytes);
     assert.equal(eFirst.replacements, 1);
     assert.equal(fs.readFileSync(path.join(ws, "e.txt"), "utf8"), "aZbYcYa");
-    await assert.rejects(fileOps.editFile(ws, "e.txt", "", "x", false), /must not be empty/);
-    await assert.rejects(fileOps.editFile(ws, "e.txt", "nope", "x", false), /not found/);
+    await assert.rejects(
+      fileOps.editFile(ws, "e.txt", "", "x", false, ops.readMaxBytes, ops.writeMaxBytes),
+      /must not be empty/,
+    );
+    await assert.rejects(
+      fileOps.editFile(ws, "e.txt", "nope", "x", false, ops.readMaxBytes, ops.writeMaxBytes),
+      /not found/,
+    );
     fs.writeFileSync(path.join(ws, "bad.txt"), Buffer.from([0xff, 0xfe, 0xfd]));
-    await assert.rejects(fileOps.editFile(ws, "bad.txt", "x", "y", false), /not valid UTF-8/);
-    await assert.rejects(fileOps.editFile(ws, "missing.txt", "x", "y", false), /not a file/);
-    ok("file edit: exact span, replace_all, empty new_text, errors");
+    await assert.rejects(
+      fileOps.editFile(ws, "bad.txt", "x", "y", false, ops.readMaxBytes, ops.writeMaxBytes),
+      /not valid UTF-8/,
+    );
+    await assert.rejects(
+      fileOps.editFile(ws, "missing.txt", "x", "y", false, ops.readMaxBytes, ops.writeMaxBytes),
+      /not a file/,
+    );
+    // Caps: a file larger than the read cap is refused before reading, and
+    // an edit that grows the content past the write cap is refused (the
+    // file is left untouched).
+    fs.writeFileSync(path.join(ws, "bigedit.txt"), "Q".repeat(1500));
+    await assert.rejects(
+      fileOps.editFile(ws, "bigedit.txt", "Q", "R", false, 1000, 10),
+      /too large to edit/,
+    );
+    fs.writeFileSync(path.join(ws, "ecap.txt"), "ab");
+    await assert.rejects(fileOps.editFile(ws, "ecap.txt", "ab", "a".repeat(11), false, 1000, 10), /write cap/);
+    assert.equal(fs.readFileSync(path.join(ws, "ecap.txt"), "utf8"), "ab", "rejected edit leaves the file untouched");
+    ok("file edit: exact span, replace_all, empty new_text, caps, errors");
 
     // -- delete
     fs.writeFileSync(path.join(ws, "del.txt"), "x");
@@ -1572,8 +1806,12 @@ const ok = (name: string): void => {
   // Generic archive writer: [header][mime list][clusters][dirents]
   // [pathPtr list][clusterPtr list][16 zero bytes]. Dirents must be
   // pre-sorted by namespace+path.
-  const writeZimArchive = (file: string, clusters: Buffer[], dirents: Buffer[]): void => {
-    const mime = Buffer.concat([Buffer.from("text/html\0"), Buffer.from("text/plain\0"), Buffer.from("\0")]);
+  const writeZimArchive = (
+    file: string,
+    clusters: Buffer[],
+    dirents: Buffer[],
+    mime: Buffer = Buffer.concat([Buffer.from("text/html\0"), Buffer.from("text/plain\0"), Buffer.from("\0")]),
+  ): void => {
     const base = 80 + mime.length;
     const clusterPtr = Buffer.alloc(8 * clusters.length);
     let cpos = base;
@@ -1748,6 +1986,14 @@ const ok = (name: string): void => {
     assert.equal(br.results.length, 1);
     assert.equal(br.results[0].title, "Xylophone");
     assert.equal(br.results[0].match, "prefix");
+    // The prefix scan window must be bounded, not the whole directory
+    // (the old code padded the keys with \x00/\xff, which always yielded
+    // [0, pathPtrLen)): for a mid-archive prefix it starts after the first
+    // entries and spans far less than the directory.
+    const win = bigReader as unknown as { pathPtrLen: number; prefixWindow: (q: string) => Promise<[number, number]> };
+    const [wa, wb] = await win.prefixWindow("Xylo");
+    assert.ok(wa > 0, `window start ${wa} is not after the first entries`);
+    assert.ok(wb - wa < win.pathPtrLen, `window [${wa}, ${wb}) spans the whole directory`);
     const bart = await bigReader.read("Xylophone", 10_000);
     assert.ok(bart.text.includes("percussion instrument"));
     const bakt = await bigReader.read("Yak", 10_000);
@@ -1764,6 +2010,37 @@ const ok = (name: string): void => {
     await assert.rejects(ZimReader.open(truncFile, { scanBudgetMs: 1000 }), /ZIM/);
     await assert.rejects(ZimReader.open(path.join(zimDir, "missing.zim"), { scanBudgetMs: 1000 }), /cannot open/);
     ok("zim reader: bad magic, truncated file, missing file rejected");
+
+    // A mime list whose entries straddle the 64 KB read chunks: the carried
+    // bytes must not be double-counted into the file offset (which used to
+    // skip the tail, silently truncating the list).
+    {
+      const longMime1 = "a".repeat(70000);
+      const longMime2 = "b".repeat(70000);
+      const bigMime = Buffer.concat([
+        Buffer.from("text/html\0"),
+        Buffer.from(longMime1 + "\0"),
+        Buffer.from("aaa\0"),
+        Buffer.from(longMime2 + "\0"),
+        Buffer.from("\0"),
+      ]);
+      const mimeFile = path.join(zimDir, "bigmime.zim");
+      writeZimArchive(
+        mimeFile,
+        [rawCluster([Buffer.from("<h1>Mime</h1>")])],
+        [contentDirent("C", "Mime", "Mime", 0, 0)],
+        bigMime,
+      );
+      const mimeReader = await ZimReader.open(mimeFile, { scanBudgetMs: 1000 });
+      assert.deepEqual((mimeReader as unknown as { mimeList: string[] }).mimeList, [
+        "text/html",
+        longMime1,
+        "aaa",
+        longMime2,
+      ]);
+      await mimeReader.close();
+      ok("zim reader: mime list straddling read chunks is parsed whole");
+    }
 
     // -- tool layer
     const tools = new ZimTools({ file: zimFile, maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000 });

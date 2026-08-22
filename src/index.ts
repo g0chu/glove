@@ -3,7 +3,7 @@ import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext } from "./bot/context.js";
 import { isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { QueueStore } from "./bot/queue.js";
-import { ResponseWriter } from "./bot/writer.js";
+import { ResponseWriter, SAFE_MENTIONS } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
 import { ChannelContextStore, type ChannelContext } from "./llm/context.js";
 import { ConversationStore, type ChannelHistory } from "./llm/history.js";
@@ -153,7 +153,9 @@ async function main(): Promise<void> {
           // untouched — the results, which stay internal, are what matter.
           for (const call of calls) {
             try {
-              await textChannel.send(formatToolCall(call));
+              // The activity line shows tool args, which may carry a stray
+              // mention: suppress everyone/role pings (see SAFE_MENTIONS).
+              await textChannel.send({ content: formatToolCall(call), allowedMentions: SAFE_MENTIONS });
             } catch (err) {
               log.warn(`failed to post tool activity: ${errMsg(err)}`);
             }

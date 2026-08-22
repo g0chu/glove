@@ -184,13 +184,16 @@ const SUPERSCRIPT: Record<string, string> = {
 function replaceScript(s: string, marker: string, map: Record<string, string>): string {
   const escaped = marker === "^" ? "\\^" : marker;
   const re = new RegExp(`${escaped}(\\{[^{}]*\\}|[0-9a-zA-Z+\\-=])`, "g");
-  return s.replace(re, (_m, body: string) => {
+  return s.replace(re, (m, body: string) => {
     const inner = body.startsWith("{") ? body.slice(1, -1) : body;
     if (inner.length === 0) return "";
-    if (inner.length === 1) return map[inner] ?? inner;
-    return Array.from(inner)
-      .map((ch) => map[ch] ?? ch)
-      .join("");
+    const chars = Array.from(inner);
+    const mapped = chars.map((ch) => map[ch]);
+    // All-or-nothing: when any character has no Unicode mapping, keep the
+    // original span (dropping the marker would silently change the text,
+    // e.g. a_b -> ab, and a partial mix like xₐb is worse than the source).
+    if (mapped.some((u) => u === undefined)) return m;
+    return mapped.join("");
   });
 }
 

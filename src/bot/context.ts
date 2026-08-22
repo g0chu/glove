@@ -1,6 +1,6 @@
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
-import { type ChannelContext, type SeedEntry } from "../llm/context.js";
+import { BOT_REPLY_GROUP_GAP_MS, type ChannelContext, type SeedEntry } from "../llm/context.js";
 import { ChannelHistory, speakerLabel, toRequestMessages } from "../llm/history.js";
 import { errMsg, log } from "../log.js";
 import {
@@ -78,11 +78,11 @@ interface ContextEntry {
 }
 
 /**
- * The bot's own UI lines — tool activity ("🔎 *…*", "📁 *…*", "🔧 *…*")
- * and the thinking line ("🤔 *thought for Ns*") — are posted for humans,
+ * The bot's own UI lines — tool activity ("🔎 *…*", "📁 *…*", "📚 *…*",
+ * "🔧 *…*") and the thinking line ("🤔 *thought for Ns*") — are posted for humans,
  * not part of the conversation: they never enter the model context.
  */
-const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧) \*/;
+const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚) \*/;
 
 /**
  * Build the `messages` array for a turn.
@@ -99,10 +99,14 @@ const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧) \*/;
  *
  * Classic mode (opts.compaction unset): the channel's last `maxMessages`
  * Discord messages, fetched live each turn. Mapping (chronological order;
- * every Discord message is its own request message, never merged, so the
- * model sees the chat as it actually went):
+ * every Discord message is its own request message — except our own
+ * unrecorded replies, whose chunks are grouped back into one entry — so
+ * the model sees the chat as it actually went):
  *  - our recorded replies (in the channel history) appear once with their
  *    canonical text, no matter how many Discord messages back them;
+ *  - our unrecorded replies (posted before a restart) appear once as well:
+ *    consecutive own messages posted close together (<= 5 s) are the chunks
+ *    of one chunked reply and are joined into a single assistant entry;
  *  - our other posted lines (tool activity, thinking) are skipped;
  *  - everything else (humans, other bots, webhooks — including the mention
  *    itself) is a user message built from the fetched message (so its
@@ -299,6 +303,20 @@ export async function contextFromMessages(
 
   const entries: ContextEntry[] = [];
   const emitted = new Set<string>();
+  let lastTs = 0; // the last message that could continue a reply group
+  // A chunked reply from before a restart (no history entry) is several
+  // consecutive own messages: group the close-together ones back into one
+  // assistant entry (the live stores keep a chunked reply as one entry,
+  // one id per chunk). The assistant role says who, so it is not labeled.
+  let group: { texts: string[]; images: AttachmentImage[]; notes: string[] } | null = null;
+  const flushGroup = (): void => {
+    if (!group) return;
+    const body = [group.texts.join("\n"), ...group.notes].filter((s) => s.length > 0).join("\n");
+    if (body.length > 0 || group.images.length > 0) {
+      entries.push({ role: "assistant", text: body, images: group.images });
+    }
+    group = null;
+  };
   for (const m of fetched) {
     const entry = history.find(m.id);
     if (entry && entry.role === "assistant") {
@@ -306,6 +324,8 @@ export async function contextFromMessages(
       // the first of its message ids (a chunked reply is one assistant
       // message). User entries are built from the fetched message instead,
       // so attachments (images) are seen.
+      flushGroup();
+      lastTs = m.createdTimestamp;
       if (entry.ids.some((id) => emitted.has(id))) continue;
       for (const id of entry.ids) emitted.add(id);
       entries.push({ role: "assistant", text: entry.content, images: [] });
@@ -324,19 +344,26 @@ export async function contextFromMessages(
       images.push(...res.images);
       notes.push(...res.notes);
     }
-    const body = [text, ...notes].filter((s) => s.length > 0).join("\n");
-    if (body.length === 0 && images.length === 0) continue; // carries nothing
     if (own) {
-      // A bot reply from before a restart (no history entry): the assistant
-      // role says who, so it is not labeled.
-      entries.push({ role: "assistant", text: body, images });
+      if (text.length === 0 && images.length === 0) continue; // carries nothing
+      if (group === null || m.createdTimestamp - lastTs > BOT_REPLY_GROUP_GAP_MS) flushGroup();
+      group ??= { texts: [], images: [], notes: [] };
+      group.texts.push(text);
+      group.images.push(...images);
+      group.notes.push(...notes);
+      lastTs = m.createdTimestamp;
       continue;
     }
+    flushGroup();
+    const body = [text, ...notes].filter((s) => s.length > 0).join("\n");
+    if (body.length === 0 && images.length === 0) continue; // carries nothing
     // Who said what: prefix the author's display name (a "(bot)" marker for
     // other bots); an image-only message is just the label.
     const label = speakerLabel(m.author.name, m.author.bot);
     entries.push({ role: "user", text: body.length > 0 ? `${label}: ${body}` : `${label}:`, images });
+    lastTs = m.createdTimestamp;
   }
+  flushGroup();
 
   const out: ChatMessage[] = [];
   if (opts.systemPrompt.trim().length > 0) out.push({ role: "system", content: opts.systemPrompt });

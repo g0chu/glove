@@ -8,6 +8,21 @@ export const DISCORD_MAX_MESSAGE_CHARS = 2000;
 /** How many trailing thinking lines the long-form reasoning preview keeps. */
 const REASONING_TAIL_LINES = 5;
 
+/**
+ * The reasoning buffer keeps only a generous tail of the thinking (the
+ * preview needs at most ~2000 chars); the "N lines hidden" count comes
+ * from the tracked total line count, so capping loses nothing visible.
+ */
+const REASONING_BUFFER_MAX = 8000;
+
+/**
+ * Mentions allowed in the bot's own posts: user pings stay active (the
+ * model can address a specific person), while @everyone/@here and role
+ * pings are suppressed — a stray mention in model or reasoning output must
+ * not ping the whole server.
+ */
+export const SAFE_MENTIONS = { parse: ["users"] as const };
+
 const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/;
 const TABLE_ROW_RE = /^\s*\|/;
 /** GFM separator row: | --- | :---: | ... (Discord tables need one). */
@@ -91,8 +106,16 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
    * break the current chunk at its last block boundary (a blank line, or a
    * heading / list item / table row start) so the carried-over tail keeps
    * sections, lists, and paragraphs intact; fall back to a plain flush.
+   * `closeOverhead` is the closing-fence-token overhead of the fence state
+   * AFTER `line` is appended (non-zero only when `line` opens a fence): the
+   * carried chunk ends with `line`, so its eventual emit must still fit
+   * once the token is appended.
    */
-  const breakCarryOver = (line: string): void => {
+  const breakCarryOver = (line: string, closeOverhead: number): void => {
+    if (line.length + closeOverhead > maxChars) {
+      hardSplit(line, Math.max(1, maxChars - closeOverhead));
+      return;
+    }
     const n = cur.length;
     for (let s = n - 1; s >= 1; s--) {
       const isBoundary =
@@ -103,7 +126,7 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
         TABLE_ROW_RE.test(cur[s]);
       if (!isBoundary) continue;
       const suffix = cur.slice(s);
-      if (suffix.join("\n").length + 1 + line.length <= maxChars) {
+      if (suffix.join("\n").length + 1 + line.length + closeOverhead <= maxChars) {
         cur = cur.slice(0, s);
         emit();
         for (const tail of suffix) appendLine(tail);
@@ -111,6 +134,9 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
         return;
       }
     }
+    // No boundary worked: emit everything and start fresh with just the
+    // line. Safe: line.length + closeOverhead <= maxChars (checked above),
+    // so the chunk ends at maxChars even when the line opens a fence.
     emit();
     appendLine(line);
   };
@@ -220,13 +246,21 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
       emitTable(lines.slice(i, end));
       i = end - 1; // continue with the line after the table
     } else {
-      const fits = cur.length === 0 || curLen + 1 + line.length <= maxChars;
+      // A chunk emitted while the fence is open gains a closing token, so
+      // reserve its room: without it the emitted part could exceed maxChars.
+      // The token is the one of the fence state AFTER this line (a fence
+      // line toggles it), since this line is what the chunk would end with.
+      const postClose = fenceMatch ? (fenceReopen === null ? fenceMatch[1] : null) : fenceClose;
+      const closeOverhead = postClose !== null ? 1 + postClose.length : 0;
+      const fits = cur.length === 0 ? line.length + closeOverhead <= maxChars : curLen + 1 + line.length + closeOverhead <= maxChars;
       if (fits) {
         appendLine(line);
       } else if (fenceReopen !== null && fenceClose !== null) {
         // Must break inside a code fence: close this chunk, reopen in the next.
+        // The reopened chunk keeps the fence open, so it too must leave room
+        // for the closing token.
         const reopened = `${fenceReopen}\n${line}`;
-        if (reopened.length <= maxChars) {
+        if (reopened.length + closeOverhead <= maxChars) {
           emit();
           cur = [reopened];
           curLen = reopened.length;
@@ -236,7 +270,7 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
           hardSplit(line, maxChars);
         }
       } else {
-        breakCarryOver(line);
+        breakCarryOver(line, closeOverhead);
       }
     }
 
@@ -298,6 +332,9 @@ export interface PostedReply {
 export class ResponseWriter {
   private buffer = "";
   private reasoningBuffer = "";
+  private reasoningCapped = false;
+  private reasoningNewlines = 0;
+  private reasoningEndedNewline = false;
   /**
    * The reply's live messages, in send order. Each holds its own slice
    * (<= 2000 chars, the same chunks the final post will use); a fresh
@@ -344,7 +381,18 @@ export class ResponseWriter {
     if (this.reasoningStartedAt === null && this.buffer.length === 0) {
       this.reasoningStartedAt = Date.now();
     }
+    let newlines = 0;
+    for (let i = 0; i < delta.length; i++) {
+      if (delta[i] === "\n") newlines++;
+    }
+    this.reasoningNewlines += newlines;
+    if (delta.length > 0) this.reasoningEndedNewline = delta[delta.length - 1] === "\n";
     this.reasoningBuffer += delta;
+    if (this.reasoningBuffer.length > REASONING_BUFFER_MAX) {
+      // Keep only the tail: the preview shows the last few lines anyway.
+      this.reasoningBuffer = this.reasoningBuffer.slice(-REASONING_BUFFER_MAX);
+      this.reasoningCapped = true;
+    }
     this.chain = this.chain.then(() => this.updateLive()).catch(() => {});
   }
 
@@ -359,6 +407,9 @@ export class ResponseWriter {
     if (this.finished) return;
     this.buffer = "";
     this.reasoningBuffer = "";
+    this.reasoningCapped = false;
+    this.reasoningNewlines = 0;
+    this.reasoningEndedNewline = false;
     this.reasoningStartedAt = null;
     this.lastThinkingEditAt = 0;
     this.lastReplyEditAt = 0;
@@ -397,11 +448,15 @@ export class ResponseWriter {
       if (!text) {
         const note = "*(the model returned no response)*";
         await this.clearLive(); // defensive: nothing streamed, so none exist
-        posted.push(await this.opts.channel.send(note));
+        posted.push(await this.opts.channel.send({ content: note, allowedMentions: SAFE_MENTIONS }));
         return { messageIds: [posted[0].id], text: note };
       }
-      for (const m of await this.settle(splitForDiscord(text))) posted.push(m);
-      return this.reported(posted, text);
+      const chunks = splitForDiscord(text);
+      const landed = await this.settle(chunks);
+      for (const m of landed) posted.push(m);
+      // The canonical text is what the model wrote — honest only when every
+      // chunk landed; otherwise report the visible text of what was posted.
+      return this.reported(posted, landed.length === chunks.length ? text : undefined);
     } catch (err) {
       log.error(`failed to finalize reply: ${errMsg(err)}`);
       // Partial post: keep an honest record of whatever did land in the channel.
@@ -425,8 +480,10 @@ export class ResponseWriter {
     const text = partial ? `${partial}\n\n${note}` : note;
     const posted: Message[] = [];
     try {
-      for (const m of await this.settle(splitForDiscord(text))) posted.push(m);
-      return this.reported(posted, text);
+      const chunks = splitForDiscord(text);
+      const landed = await this.settle(chunks);
+      for (const m of landed) posted.push(m);
+      return this.reported(posted, landed.length === chunks.length ? text : undefined);
     } catch (err2) {
       log.error(`failed to post error message: ${errMsg(err2)}`);
       return this.reported(posted);
@@ -465,10 +522,10 @@ export class ResponseWriter {
     if (this.reasoningBuffer.length === 0) return;
     try {
       if (!this.thinkingMessage) {
-        this.thinkingMessage = await this.opts.channel.send(this.reasoningPreview());
+        this.thinkingMessage = await this.opts.channel.send({ content: this.reasoningPreview(), allowedMentions: SAFE_MENTIONS });
       } else if (Date.now() - this.lastThinkingEditAt >= this.opts.throttleMs) {
         this.lastThinkingEditAt = Date.now();
-        await this.thinkingMessage.edit({ content: this.reasoningPreview() });
+        await this.thinkingMessage.edit({ content: this.reasoningPreview(), allowedMentions: SAFE_MENTIONS });
       }
     } catch (err) {
       log.warn(`thinking preview update failed: ${errMsg(err)}`);
@@ -491,19 +548,19 @@ export class ResponseWriter {
       if (this.liveMessages.length === 0 && this.thinkingMessage) {
         const done = this.thinkingMessage;
         this.thinkingMessage = null;
-        await done.edit({ content: this.thinkingDoneLine() }).catch(() => {});
+        await done.edit({ content: this.thinkingDoneLine(), allowedMentions: SAFE_MENTIONS }).catch(() => {});
       }
       // A new slice appeared: start its live message with the slice as it
       // stands now; it keeps growing in the edits that follow.
       while (this.liveMessages.length < chunks.length) {
         const i = this.liveMessages.length;
-        this.liveMessages.push(await this.opts.channel.send(chunks[i]));
+        this.liveMessages.push(await this.opts.channel.send({ content: chunks[i], allowedMentions: SAFE_MENTIONS }));
       }
       const last = this.liveMessages.length - 1;
       if (Date.now() - this.lastReplyEditAt >= this.opts.throttleMs) {
         this.lastReplyEditAt = Date.now();
         const target = this.liveMessages[last];
-        if (target.content !== chunks[last]) await target.edit({ content: chunks[last] });
+        if (target.content !== chunks[last]) await target.edit({ content: chunks[last], allowedMentions: SAFE_MENTIONS });
       }
     } catch (err) {
       log.warn(`live message update failed: ${errMsg(err)}`);
@@ -521,11 +578,13 @@ export class ResponseWriter {
     if (!this.thinkingMessage) return;
     const done = this.thinkingMessage;
     this.thinkingMessage = null;
-    await done.edit({ content: this.thinkingDoneLine() }).catch(() => {});
+    await done.edit({ content: this.thinkingDoneLine(), allowedMentions: SAFE_MENTIONS }).catch(() => {});
   }
 
   private async postInto(target: Message | null, content: string): Promise<Message> {
-    return target ? await target.edit({ content }) : await this.opts.channel.send(content);
+    return target
+      ? await target.edit({ content, allowedMentions: SAFE_MENTIONS })
+      : await this.opts.channel.send({ content, allowedMentions: SAFE_MENTIONS });
   }
 
   /**
@@ -541,7 +600,14 @@ export class ResponseWriter {
     for (let i = 0; i < n; i++) {
       const live = this.liveMessages[i];
       if (i < chunks.length) {
-        posted.push(live ? await this.postInto(live, chunks[i]) : await this.opts.channel.send(chunks[i]));
+        try {
+          posted.push(live ? await this.postInto(live, chunks[i]) : await this.opts.channel.send({ content: chunks[i], allowedMentions: SAFE_MENTIONS }));
+        } catch (err) {
+          // Best effort: one failed chunk (rate limit, API hiccup) must not
+          // strand the rest — the remaining chunks are still posted, and a
+          // live message that failed to settle keeps its last preview.
+          log.warn(`final post: chunk ${i + 1}/${chunks.length} failed: ${errMsg(err)}`);
+        }
       } else if (live) {
         await live.delete().catch(() => {});
       }
@@ -567,10 +633,12 @@ export class ResponseWriter {
 
   /**
    * Reasoning preview, capped at 2000 chars: the whole thinking while it
-   * fits inline ("🤔 *thinking: …*"); once it doesn't, a header + a
-   * "*N lines hidden*" line + the last REASONING_TAIL_LINES lines of the
-   * thinking (cut from the front with a "…" when even those don't fit; a
-   * thinking without newlines falls back to the plain character tail).
+   * fits inline ("🤔 *thinking: …*", only while the buffer is complete);
+   * otherwise a header + a "*N lines hidden*" line + the last
+   * REASONING_TAIL_LINES lines of the thinking (cut from the front with a
+   * "…" when even those don't fit; a thinking without newlines falls back
+   * to the plain character tail). The hidden count spans the whole
+   * thinking, not just the kept tail.
    */
   private reasoningPreview(): string {
     const max = DISCORD_MAX_MESSAGE_CHARS;
@@ -579,13 +647,13 @@ export class ResponseWriter {
       return "🤔 *thinking…*";
     }
     const prefix = "🤔 *thinking: ";
-    if (text.length <= max - prefix.length - 1 /* closing * */) {
+    if (!this.reasoningCapped && text.length <= max - prefix.length - 1 /* closing * */) {
       return prefix + text + "*";
     }
     const lines = text.split("\n");
     if (lines.length > REASONING_TAIL_LINES) {
       const header = "🤔 *thinking: …*";
-      const hidden = lines.length - REASONING_TAIL_LINES;
+      const hidden = Math.max(this.reasoningTotalLines(), lines.length) - REASONING_TAIL_LINES;
       const hiddenLine = `*${hidden} line${hidden === 1 ? "" : "s"} hidden*`;
       const tail = lines.slice(-REASONING_TAIL_LINES).join("\n");
       const bodyBudget = max - header.length - hiddenLine.length - 2 /* newlines */;
@@ -594,6 +662,12 @@ export class ResponseWriter {
     }
     const budget = max - prefix.length - 1 /* closing * */ - 1 /* leading … */;
     return prefix + "…" + text.slice(text.length - budget) + "*";
+  }
+
+  /** The total lines of the reasoning so far (the buffer may hold only the tail). */
+  private reasoningTotalLines(): number {
+    if (this.reasoningBuffer.length === 0) return 0;
+    return this.reasoningNewlines + (this.reasoningEndedNewline ? 0 : 1);
   }
 
   private stopTyping(): void {

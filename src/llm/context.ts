@@ -48,6 +48,17 @@ export interface SeedEntry {
 }
 
 /**
+ * Max gap between two consecutive bot messages for them to be the chunks of
+ * one chunked reply. Chunks of one reply land within the same posting burst
+ * (a few seconds at most, even under rate limits), while separate replies
+ * are a full turn (seconds to minutes) apart — so a 5 s gap never merges two
+ * distinct replies. Used by the startup seed and the classic live fetch to
+ * group a reply's chunks back into one entry (matching how the live stores
+ * keep them: one entry, one id per chunk).
+ */
+export const BOT_REPLY_GROUP_GAP_MS = 5000;
+
+/**
  * Rough token estimate (~4 chars per token). It only needs to be good
  * enough to trigger compaction before the model's context fills up.
  */
@@ -203,7 +214,7 @@ export class ChannelContext {
     }
     merged.sort((a, b) => a.ts - b.ts);
     this.entries.length = 0;
-    this.entries.push(...merged);
+    this.entries.push(...groupConsecutiveReplies(merged));
     this.seeded = true;
   }
 
@@ -275,6 +286,37 @@ export class ChannelContext {
       this.entries.splice(i, 1);
     }
   }
+}
+
+/**
+ * Group consecutive bot entries posted close together (a chunked reply's
+ * chunks, seen as separate Discord messages after a restart) back into one
+ * entry: the content joined with newlines (the same convention as
+ * `updateChunk`), all chunk ids, and the per-chunk text so edit/delete
+ * bookkeeping matches a live chunked reply (any chunk id resolves the
+ * entry; a chunk edit re-derives the content; a chunk delete drops the
+ * whole entry). Non-adjacent or far-apart entries are kept as-is.
+ */
+function groupConsecutiveReplies(entries: ContextEntry[]): ContextEntry[] {
+  const out: ContextEntry[] = [];
+  for (const e of entries) {
+    const prev = out[out.length - 1];
+    if (
+      e.role === "assistant" &&
+      prev !== undefined &&
+      prev.role === "assistant" &&
+      e.ts - prev.ts <= BOT_REPLY_GROUP_GAP_MS
+    ) {
+      const prevContent = prev.content;
+      prev.content = `${prevContent}\n${e.content}`;
+      prev.ids = [...prev.ids, ...e.ids];
+      prev.chunks = [...(prev.chunks ?? [prevContent]), e.content];
+      prev.attachments = [...prev.attachments, ...e.attachments];
+    } else {
+      out.push(e);
+    }
+  }
+  return out;
 }
 
 /** Lazily creates a ChannelContext per channel id. */
