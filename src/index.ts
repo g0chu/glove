@@ -175,7 +175,10 @@ async function main(): Promise<void> {
     const botId = client.user?.id;
     if (!botId) return;
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
-    histories.get(message.channelId).push("user", stripMention(message, botId), [message.id]);
+    // The display name (guild nickname when set, else the global username)
+    // labels this message in the in-memory fallback context.
+    const name = message.member?.displayName ?? message.author.username;
+    histories.get(message.channelId).push("user", stripMention(message, botId), [message.id], undefined, name);
     if (isMentionOf(message, botId)) {
       queues.get(message.channelId).push(message.id);
     }

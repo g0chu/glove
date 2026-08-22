@@ -1,6 +1,6 @@
-import type { GuildTextBasedChannel } from "discord.js";
+import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
-import { ChannelHistory, toRequestMessages } from "../llm/history.js";
+import { ChannelHistory, speakerLabel, toRequestMessages } from "../llm/history.js";
 import { errMsg, log } from "../log.js";
 import {
   fetchMessageImages,
@@ -13,13 +13,28 @@ import { stripMentionText } from "./router.js";
 /** Discord's hard cap on `messages.fetch` `limit`. */
 const DISCORD_FETCH_LIMIT = 100;
 
-/** A channel message as the context builder sees it (the real discord.js Message fits this shape). */
+/** A channel message as the context builder sees it (discord.js messages are adapted into it). */
 export interface MessageLike {
   id: string;
   content: string;
-  author: { id: string; bot: boolean };
+  /** The display name is the guild nickname when set, else the global username. */
+  author: { id: string; bot: boolean; name: string };
   /** A Collection (discord.js) or a plain array — both expose `.values()`. */
   attachments: { values(): Iterable<MessageAttachmentLike> };
+}
+
+/**
+ * A discord.js message as the context builder sees it. The display name is
+ * the guild nickname when set, else the global username; webhook messages
+ * have no member, so their webhook name is used.
+ */
+function toMessageLike(m: Message): MessageLike {
+  return {
+    id: m.id,
+    content: m.content,
+    author: { id: m.author.id, bot: m.author.bot, name: m.member?.displayName ?? m.author.username },
+    attachments: m.attachments,
+  };
 }
 
 export interface ContextOptions {
@@ -34,7 +49,7 @@ export interface ContextOptions {
   imageFetch?: ImageFetch;
 }
 
-/** One conversation entry before consecutive same-role merging. */
+/** One conversation entry: exactly one Discord message (or one bot reply). */
 interface ContextEntry {
   role: "user" | "assistant";
   text: string;
@@ -54,13 +69,18 @@ const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧) \*/;
  * channel right now (it survives bot restarts and includes every author,
  * not just the ones the in-memory window happened to catch).
  *
- * Mapping (chronological order, then consecutive same-role merged):
+ * Mapping (chronological order; every Discord message is its own request
+ * message, never merged, so the model sees the chat as it actually went):
  *  - our recorded replies (in the channel history) appear once with their
  *    canonical text, no matter how many Discord messages back them;
  *  - our other posted lines (tool activity, thinking) are skipped;
  *  - everything else (humans, other bots, webhooks — including the mention
  *    itself) is a user message built from the fetched message (so its
- *    attachments are seen), with bot mentions stripped;
+ *    attachments are seen), with bot mentions stripped and prefixed by the
+ *    author's display name (`Name: …`, `Name (bot): …` for other bots; an
+ *    image-only message is just `Name:`) so the model can tell who said
+ *    what; the bot's own replies are unlabeled — the assistant role is the
+ *    identity;
  *  - image attachments (png/jpeg/webp/gif) become image_url parts when
  *    images are enabled; a skipped attachment leaves a one-line note;
  *  - messages that carry no text and no images are dropped;
@@ -82,7 +102,9 @@ export async function buildChannelContext(
   if (opts.maxMessages <= DISCORD_FETCH_LIMIT) {
     try {
       const col = await channel.messages.fetch({ limit: opts.maxMessages });
-      fetched = [...col.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      fetched = [...col.values()]
+        .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+        .map(toMessageLike);
     } catch (err) {
       log.warn(
         `could not fetch the channel's last ${opts.maxMessages} messages (${errMsg(err)}); using the in-memory window`,
@@ -133,26 +155,23 @@ export async function contextFromMessages(
       images.push(...res.images);
       notes.push(...res.notes);
     }
-    const joined = [text, ...notes].filter((s) => s.length > 0).join("\n");
-    if (joined.length === 0 && images.length === 0) continue; // carries nothing
-    entries.push({ role: own ? "assistant" : "user", text: joined, images });
-  }
-
-  // Consecutive same-role messages read as one turn to the model.
-  const merged: ContextEntry[] = [];
-  for (const e of entries) {
-    const last = merged[merged.length - 1];
-    if (last && last.role === e.role) {
-      if (e.text.length > 0) last.text = last.text.length > 0 ? `${last.text}\n${e.text}` : e.text;
-      last.images.push(...e.images);
-    } else {
-      merged.push({ role: e.role, text: e.text, images: [...e.images] });
+    const body = [text, ...notes].filter((s) => s.length > 0).join("\n");
+    if (body.length === 0 && images.length === 0) continue; // carries nothing
+    if (own) {
+      // A bot reply from before a restart (no history entry): the assistant
+      // role says who, so it is not labeled.
+      entries.push({ role: "assistant", text: body, images });
+      continue;
     }
+    // Who said what: prefix the author's display name (a "(bot)" marker for
+    // other bots); an image-only message is just the label.
+    const label = speakerLabel(m.author.name, m.author.bot);
+    entries.push({ role: "user", text: body.length > 0 ? `${label}: ${body}` : `${label}:`, images });
   }
 
   const out: ChatMessage[] = [];
   if (opts.systemPrompt.trim().length > 0) out.push({ role: "system", content: opts.systemPrompt });
-  for (const e of merged) {
+  for (const e of entries) {
     if (e.images.length === 0) {
       if (e.text.length > 0) out.push({ role: e.role, content: e.text });
     } else {
