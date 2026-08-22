@@ -17,6 +17,8 @@ export interface HistoryMessage {
   content: string;
   ids: string[];
   chunks?: string[];
+  /** The author's display name (user entries only): labels the fallback context. */
+  name?: string;
 }
 
 /** Per-channel in-memory sliding window of the last N messages. */
@@ -26,9 +28,16 @@ export class ChannelHistory {
   constructor(private readonly maxMessages: number) {}
 
   /** Append an entry backed by Discord message id(s); trims the window. */
-  push(role: Role, content: string, ids: string[], chunks?: string[]): HistoryMessage {
+  push(
+    role: Role,
+    content: string,
+    ids: string[],
+    chunks?: string[],
+    name?: string,
+  ): HistoryMessage {
     const entry: HistoryMessage = { role, content, ids: [...ids] };
     if (chunks) entry.chunks = [...chunks];
+    if (name !== undefined) entry.name = name;
     this.messages.push(entry);
     while (this.messages.length > this.maxMessages) {
       this.messages.shift();
@@ -111,10 +120,23 @@ export class ConversationStore {
 }
 
 /**
+ * The speaker label the model sees on a non-bot message: the author's
+ * display name, with a "(bot)" marker for other bots (mirroring Discord's
+ * badge). The bot's own replies carry no label — the assistant role already
+ * says who.
+ */
+export function speakerLabel(name: string, isBot: boolean): string {
+  return isBot ? `${name} (bot)` : name;
+}
+
+/**
  * Build the `messages` array for a request: optional system message
  * (when MODEL_SYSTEM_PROMPT is non-empty) followed by the channel history.
- * Entries with no text (e.g. a bare mention, a sticker-only message) are
- * tracked for edit/delete purposes but carry nothing for the model.
+ * Each entry is its own message (never merged); user entries are prefixed
+ * with their author's display name when one was stored, so the model can
+ * tell who said what even on this fallback path. Entries with no text (e.g.
+ * a bare mention, a sticker-only message) are tracked for edit/delete
+ * purposes but carry nothing for the model.
  */
 export function toRequestMessages(history: ChannelHistory, systemPrompt: string): ChatMessage[] {
   const out: ChatMessage[] = [];
@@ -123,7 +145,11 @@ export function toRequestMessages(history: ChannelHistory, systemPrompt: string)
   }
   for (const m of history.snapshot()) {
     if (m.content.length === 0) continue;
-    out.push({ role: m.role, content: m.content });
+    // Window user entries are always human (bots are never tracked), so the
+    // label needs no "(bot)" marker.
+    const content =
+      m.role === "user" && m.name ? `${speakerLabel(m.name, false)}: ${m.content}` : m.content;
+    out.push({ role: m.role, content });
   }
   return out;
 }

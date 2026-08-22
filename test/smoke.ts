@@ -197,13 +197,13 @@ const ok = (name: string): void => {
 
   const h4 = new ChannelHistory(10);
   h4.push("user", "", ["30"]); // e.g. a bare mention: tracked, but no text
-  h4.push("user", "hi", ["31"]);
+  h4.push("user", "hi", ["31"], undefined, "Alice");
   assert.deepEqual(toRequestMessages(h4, "You are helpful."), [
     { role: "system", content: "You are helpful." },
-    { role: "user", content: "hi" },
+    { role: "user", content: "Alice: hi" },
   ]);
-  assert.deepEqual(toRequestMessages(h4, "   "), [{ role: "user", content: "hi" }]);
-  ok("history: request messages skip textless entries, with/without system prompt");
+  assert.deepEqual(toRequestMessages(h4, "   "), [{ role: "user", content: "Alice: hi" }]);
+  ok("history: request messages skip textless entries, label speakers, system prompt optional");
 }
 
 // ----------------------------------------------------------------- split --
@@ -401,9 +401,9 @@ const ok = (name: string): void => {
 // ---------------------------------------------------------------- context --
 {
   const authors = {
-    alice: { id: "alice", bot: false },
-    carl: { id: "carl", bot: true }, // another bot: unfiltered, enters as user
-    bot: { id: "bot1", bot: true },
+    alice: { id: "alice", bot: false, name: "Alice" },
+    carl: { id: "carl", bot: true, name: "Carl" }, // another bot: unfiltered, enters as user
+    bot: { id: "bot1", bot: true, name: "Glove" },
   };
   let n = 0;
   const m = (author: { id: string; bot: boolean }, content: string, attachments: MessageAttachmentLike[] = []): MessageLike => ({
@@ -452,31 +452,32 @@ const ok = (name: string): void => {
   const res = await contextFromMessages(fetchedList, hist, mention.id, opts);
   assert.deepEqual(res, [
     { role: "system", content: "sys" },
-    { role: "user", content: "hello" },
+    { role: "user", content: "Alice: hello" },
     { role: "assistant", content: "old reply" },
-    { role: "user", content: "beep" },
+    { role: "user", content: "Carl (bot): beep" },
     { role: "assistant", content: "full reply" },
-    { role: "user", content: [{ type: "text", text: "thanks" }, imgPart] },
+    { role: "user", content: "Alice: thanks" },
+    { role: "user", content: [{ type: "text", text: "Alice:" }, imgPart] },
     { role: "assistant", content: "sure!" },
-    { role: "user", content: "look at this\n*[attachment \"big.png\" not sent: 2 KB exceeds the 1 KB limit]*" },
+    { role: "user", content: "Alice: look at this\n*[attachment \"big.png\" not sent: 2 KB exceeds the 1 KB limit]*" },
     { role: "assistant", content: "⚠️ *generation failed: boom*" },
-    { role: "user", content: [{ type: "text", text: "describe this" }, imgPart] },
+    { role: "user", content: [{ type: "text", text: "Alice: describe this" }, imgPart] },
   ]);
-  ok("context: last-N mapping (roles, UI lines skipped, chunked reply once, merges, images, mention stripped)");
+  ok("context: last-N mapping (speaker labels, bot marker, UI lines skipped, chunked reply once, no merging, images, mention stripped)");
 
   // Images disabled: attachments ignored entirely (no images, no notes).
   const res2 = await contextFromMessages(fetchedList, hist, mention.id, { ...opts, enableImages: false });
   assert.deepEqual(res2, [
     { role: "system", content: "sys" },
-    { role: "user", content: "hello" },
+    { role: "user", content: "Alice: hello" },
     { role: "assistant", content: "old reply" },
-    { role: "user", content: "beep" },
+    { role: "user", content: "Carl (bot): beep" },
     { role: "assistant", content: "full reply" },
-    { role: "user", content: "thanks" },
+    { role: "user", content: "Alice: thanks" },
     { role: "assistant", content: "sure!" },
-    { role: "user", content: "look at this" },
+    { role: "user", content: "Alice: look at this" },
     { role: "assistant", content: "⚠️ *generation failed: boom*" },
-    { role: "user", content: "describe this" },
+    { role: "user", content: "Alice: describe this" },
   ]);
   // The mention gone from the window (deleted / pushed out) -> null: skip the turn.
   assert.equal(await contextFromMessages(fetchedList.slice(0, -1), hist, mention.id, opts), null);
@@ -484,9 +485,11 @@ const ok = (name: string): void => {
 
   // Wrapper: fetches with limit = maxMessages, sorts oldest-first, and a
   // fetch failure falls back to the in-memory window (bot keeps working).
+  // discord.js-shaped (the wrapper adapts them): the second message has a
+  // guild nickname, which must win over the username.
   const apiList = [
-    { id: "b", content: "second", createdTimestamp: 200, author: authors.alice, attachments: [] },
-    { id: "a", content: "first", createdTimestamp: 100, author: authors.alice, attachments: [] },
+    { id: "b", content: "second", createdTimestamp: 200, author: { id: "alice", bot: false, username: "Alice" }, member: { displayName: "Al" }, attachments: [] },
+    { id: "a", content: "first", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
   ];
   let seenLimit: number | undefined;
   const chan = {
@@ -500,17 +503,24 @@ const ok = (name: string): void => {
   const wOpts = { botId: "bot1", systemPrompt: "", maxMessages: 20, enableImages: false, imagesMaxBytes: 1024 };
   const wr = await buildChannelContext(chan, new ChannelHistory(20), "b", wOpts);
   assert.equal(seenLimit, 20, "fetch limit is the window size");
-  assert.deepEqual(wr, [{ role: "user", content: "first\nsecond" }], "sorted oldest-first, same role merged");
+  assert.deepEqual(
+    wr,
+    [
+      { role: "user", content: "Alice: first" },
+      { role: "user", content: "Al: second" },
+    ],
+    "sorted oldest-first, one message per Discord message (no merging)",
+  );
   assert.equal(await buildChannelContext(chan, new ChannelHistory(20), "nope", wOpts), null);
 
   const throwing = { messages: { fetch: async () => { throw new Error("api down"); } } } as unknown as GuildTextBasedChannel;
   const fh = new ChannelHistory(20);
-  fh.push("user", "hi", ["1"]);
+  fh.push("user", "hi", ["1"], undefined, "Alice");
   const fb = await buildChannelContext(throwing, fh, "1", { ...wOpts, systemPrompt: "sys" });
   assert.deepEqual(fb, [
     { role: "system", content: "sys" },
-    { role: "user", content: "hi" },
-  ], "fetch failure falls back to the in-memory window");
+    { role: "user", content: "Alice: hi" },
+  ], "fetch failure falls back to the in-memory window (speakers labeled)");
   ok("context: wrapper fetch (limit, ordering) and in-memory fallback");
 }
 
