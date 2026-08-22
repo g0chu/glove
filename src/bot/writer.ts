@@ -280,15 +280,17 @@ export interface PostedReply {
  *    ("🤔 *thinking: …*"); when the reply starts — or, when no reply
  *    content ever streams (non-stream mode, reasoning-only response), at
  *    finish — that message is edited to a terminal line ("🤔 *thought
- *    for Ns*") that stays in the channel above the reply, which is posted
- *    as a fresh message;
- *  - the reply streams in its own live message, created on the first
- *    content delta and edited no more often than `throttleMs` (edits are
- *    serialized; when the text exceeds 2000 chars the preview shows the
- *    most recent tail);
- *  - on completion the final text is chunked (code-fence aware) and posted
- *    as one message per chunk; reasoning never lands in the final message
- *    or the history (only the reply's message ids are reported);
+ *    for Ns*") that stays in the channel above the reply, which streams in
+ *    its own fresh message(s);
+ *  - the reply streams in its own live message(s), created on the first
+ *    content delta: when the text grows past a 2000-char slice boundary a
+ *    fresh live message is created for the next slice — the same
+ *    code-fence-aware chunks the final post will use — and only the
+ *    growing last slice is edited (throttled to `throttleMs`, serialized);
+ *  - on completion the final text is chunked (code-fence aware); each live
+ *    message settles in place to its final chunk and any remaining chunks
+ *    are posted fresh. Reasoning never lands in the final messages or the
+ *    history (only the reply's message ids are reported);
  *  - `finish()`/`reportError()` return the ids and text of whatever was
  *    actually posted, so the caller can record the reply in the channel
  *    history (making it editable/deletable like any other message).
@@ -296,8 +298,13 @@ export interface PostedReply {
 export class ResponseWriter {
   private buffer = "";
   private reasoningBuffer = "";
-  /** The reply's live message (null until the first content delta). */
-  private message: Message | null = null;
+  /**
+   * The reply's live messages, in send order. Each holds its own slice
+   * (<= 2000 chars, the same chunks the final post will use); a fresh
+   * message is created when the text grows past the next slice boundary,
+   * so a long reply streams as several messages instead of one "…" tail.
+   */
+  private liveMessages: Message[] = [];
   /** The thinking live message (null once the reply has taken over). */
   private thinkingMessage: Message | null = null;
   /** When the current round's thinking started (for the "thought for Ns" line). */
@@ -342,11 +349,11 @@ export class ResponseWriter {
   }
 
   /**
-   * Discard the in-progress live messages (thinking + reply preview)
-   * without finishing the turn. Used when a streamed response turns out to
-   * contain tool calls: the text streamed so far is transient, and the next
-   * round streams its own live messages. No-op when nothing has been posted
-   * or the turn finished.
+   * Discard the in-progress live messages (thinking + all reply live
+   * messages) without finishing the turn. Used when a streamed response
+   * turns out to contain tool calls: the text streamed so far is transient,
+   * and the next round streams its own live messages. No-op when nothing
+   * has been posted or the turn finished.
    */
   discard(): void {
     if (this.finished) return;
@@ -361,9 +368,9 @@ export class ResponseWriter {
     // deleted too, while next-round updates queue after the step and their
     // fresh messages survive.
     this.chain = this.chain.then(async () => {
-      const targets = [this.thinkingMessage, this.message].filter((m): m is Message => m !== null);
+      const targets = [this.thinkingMessage, ...this.liveMessages].filter((m): m is Message => m !== null);
       this.thinkingMessage = null;
-      this.message = null;
+      this.liveMessages = [];
       for (const m of targets) {
         await m.delete().catch(() => {});
       }
@@ -389,14 +396,11 @@ export class ResponseWriter {
     try {
       if (!text) {
         const note = "*(the model returned no response)*";
-        posted.push(await this.postInto(this.finalTarget(), note));
+        await this.clearLive(); // defensive: nothing streamed, so none exist
+        posted.push(await this.opts.channel.send(note));
         return { messageIds: [posted[0].id], text: note };
       }
-      const chunks = splitForDiscord(text);
-      posted.push(await this.postInto(this.finalTarget(), chunks[0]));
-      for (const c of chunks.slice(1)) {
-        posted.push(await this.opts.channel.send(c));
-      }
+      for (const m of await this.settle(splitForDiscord(text))) posted.push(m);
       return this.reported(posted, text);
     } catch (err) {
       log.error(`failed to finalize reply: ${errMsg(err)}`);
@@ -421,11 +425,7 @@ export class ResponseWriter {
     const text = partial ? `${partial}\n\n${note}` : note;
     const posted: Message[] = [];
     try {
-      const chunks = splitForDiscord(text);
-      posted.push(await this.postInto(this.finalTarget(), chunks[0]));
-      for (const c of chunks.slice(1)) {
-        posted.push(await this.opts.channel.send(c));
-      }
+      for (const m of await this.settle(splitForDiscord(text))) posted.push(m);
       return this.reported(posted, text);
     } catch (err2) {
       log.error(`failed to post error message: ${errMsg(err2)}`);
@@ -477,22 +477,33 @@ export class ResponseWriter {
   }
 
   /**
-   * The reply preview: its own live message once content has started. On
-   * the first content delta the thinking message (when there was one)
-   * completes in place, then the reply is created as a fresh message.
+   * The reply preview: its own live message(s) once content has started.
+   * On the first content delta the thinking message (when there was one)
+   * completes in place, then the reply's first slice is created as a fresh
+   * message. When the text grows past a slice boundary a fresh live message
+   * is created for the next slice; only the growing last slice is edited.
    */
   private async updateReply(): Promise<void> {
+    const text = sanitizeForDiscord(this.buffer);
+    if (text.length === 0) return;
     try {
-      if (!this.message) {
-        if (this.thinkingMessage) {
-          const done = this.thinkingMessage;
-          this.thinkingMessage = null;
-          await done.edit({ content: this.thinkingDoneLine() }).catch(() => {});
-        }
-        this.message = await this.opts.channel.send(this.contentPreview());
-      } else if (Date.now() - this.lastReplyEditAt >= this.opts.throttleMs) {
+      const chunks = splitForDiscord(text);
+      if (this.liveMessages.length === 0 && this.thinkingMessage) {
+        const done = this.thinkingMessage;
+        this.thinkingMessage = null;
+        await done.edit({ content: this.thinkingDoneLine() }).catch(() => {});
+      }
+      // A new slice appeared: start its live message with the slice as it
+      // stands now; it keeps growing in the edits that follow.
+      while (this.liveMessages.length < chunks.length) {
+        const i = this.liveMessages.length;
+        this.liveMessages.push(await this.opts.channel.send(chunks[i]));
+      }
+      const last = this.liveMessages.length - 1;
+      if (Date.now() - this.lastReplyEditAt >= this.opts.throttleMs) {
         this.lastReplyEditAt = Date.now();
-        await this.message.edit({ content: this.contentPreview() });
+        const target = this.liveMessages[last];
+        if (target.content !== chunks[last]) await target.edit({ content: chunks[last] });
       }
     } catch (err) {
       log.warn(`live message update failed: ${errMsg(err)}`);
@@ -513,16 +524,37 @@ export class ResponseWriter {
     await done.edit({ content: this.thinkingDoneLine() }).catch(() => {});
   }
 
-  /**
-   * Where the final post lands: the reply's live message, or a fresh post
-   * (any thinking line has already been completed by completeThinking()).
-   */
-  private finalTarget(): Message | null {
-    return this.message ?? this.thinkingMessage;
-  }
-
   private async postInto(target: Message | null, content: string): Promise<Message> {
     return target ? await target.edit({ content }) : await this.opts.channel.send(content);
+  }
+
+  /**
+   * Settle the in-progress live messages into the final post: live message
+   * i is edited to final chunk i (the preview already used the same
+   * splitter, so this is normally a no-op or a small trim), and any chunks
+   * beyond the live messages are posted fresh. Returns the messages in
+   * send order; a live message with no chunk left (defensive) is deleted.
+   */
+  private async settle(chunks: string[]): Promise<Message[]> {
+    const posted: Message[] = [];
+    const n = Math.max(this.liveMessages.length, chunks.length);
+    for (let i = 0; i < n; i++) {
+      const live = this.liveMessages[i];
+      if (i < chunks.length) {
+        posted.push(live ? await this.postInto(live, chunks[i]) : await this.opts.channel.send(chunks[i]));
+      } else if (live) {
+        await live.delete().catch(() => {});
+      }
+    }
+    this.liveMessages = [];
+    return posted;
+  }
+
+  /** Delete any in-progress live messages (best-effort, normally none exist). */
+  private async clearLive(): Promise<void> {
+    const targets = this.liveMessages;
+    this.liveMessages = [];
+    for (const m of targets) await m.delete().catch(() => {});
   }
 
   /** The thinking message's terminal line: how long the model thought. */
@@ -531,16 +563,6 @@ export class ResponseWriter {
     if (startedAt === null) return "🤔 *thought…*";
     const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
     return `🤔 *thought for ${secs}s*`;
-  }
-
-  /** Reply preview capped at 2000 chars: the head while it fits, the tail once it doesn't. */
-  private contentPreview(): string {
-    const max = DISCORD_MAX_MESSAGE_CHARS;
-    const text = sanitizeForDiscord(this.buffer);
-    if (text.length <= max) {
-      return text.trim().length > 0 ? text : "…";
-    }
-    return "…" + text.slice(text.length - (max - 3));
   }
 
   /**

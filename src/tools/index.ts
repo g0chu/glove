@@ -2,6 +2,7 @@ import type { Config } from "../config.js";
 import { ToolRegistry } from "./executor.js";
 import { FileTools, registerFileTools } from "./filetools.js";
 import { WebTools, registerWebTools } from "./webtools.js";
+import { ZimTools, registerZimTools } from "./zimtools.js";
 
 /** Everything abortable the tool stack owns (wired into shutdown). */
 export interface ToolsSetup {
@@ -46,6 +47,16 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(file);
     registerFileTools(registry, file);
   }
+  if (cfg.tools.zim.enabled) {
+    const zim = new ZimTools({
+      file: cfg.tools.zim.file,
+      maxResults: cfg.tools.zim.searchMaxResults,
+      scanBudgetMs: cfg.tools.zim.scanBudgetMs,
+      maxTextChars: cfg.tools.maxResultChars,
+    });
+    clients.push(zim);
+    registerZimTools(registry, zim);
+  }
   return { registry, clients };
 }
 
@@ -58,5 +69,6 @@ export const TOOLS_SYSTEM_NOTE: string = [
   "- web_search: search DuckDuckGo (title, URL, snippet per result), then web_fetch to read a promising result.",
   "- web_fetch: returns a page's main content as text.",
   "- file_list, file_read, file_write, file_edit, file_delete, file_search: manage the bot's persistent file workspace (paths are relative to its root; file_edit replaces an exact text span).",
-  "Rules: for current or unknown facts, search and cite the URLs you used in your answer. Summarize tool results; do not paste whole pages back. Use the workspace for notes, drafts, and data that should survive across conversations.",
+  "- wikipedia_search, wikipedia_read: an offline Wikipedia archive on this machine (no internet needed) — search article titles, then read the article text. Prefer it for established facts: people, places, events, science topics.",
+  "Rules: for current or unknown facts, search and cite the URLs you used in your answer. Cite Wikipedia article titles when you use wikipedia_read. Summarize tool results; do not paste whole pages back. Use the workspace for notes, drafts, and data that should survive across conversations.",
 ].join("\n");

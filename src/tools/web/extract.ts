@@ -50,6 +50,31 @@ export function decodeEntities(s: string): string {
   });
 }
 
+/**
+ * Case-insensitive index of the `</name` close tag at/after `from`, measured
+ * in the ORIGINAL string. Tag names are ASCII so only A–Z fold; this keeps
+ * the returned index valid, unlike `html.toLowerCase().indexOf(...)`, because
+ * `toLowerCase()` can change a string's length (e.g. `İ` → `i`+U+0307).
+ */
+function findCloseTag(html: string, name: string, from: number): number {
+  const needle = `</${name}`;
+  const nlen = needle.length;
+  for (let i = from; i + nlen <= html.length; i++) {
+    let ok = true;
+    for (let k = 0; k < nlen; k++) {
+      const h = html.charCodeAt(i + k);
+      const t = needle.charCodeAt(k);
+      const hl = h >= 0x41 && h <= 0x5a ? h + 0x20 : h;
+      if (hl !== t) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return i;
+  }
+  return -1;
+}
+
 /** Find the end `>` of the tag starting at `lt`, honoring quoted values. */
 function findTagEnd(html: string, lt: number): number {
   let quote: string | null = null;
@@ -149,7 +174,7 @@ export function parseHtml(html: string): DomNode {
       // Skip raw-text content up to the matching close tag (which will pop
       // the node). Malformed pages may never close it; then the remainder
       // is treated as script text, like a browser would.
-      const close = html.toLowerCase().indexOf(`</${tag.name}`, tagEnd);
+      const close = findCloseTag(html, tag.name, tagEnd);
       i = close === -1 ? n : close;
       continue;
     }

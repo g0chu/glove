@@ -8,10 +8,23 @@ export interface ToolCall {
   arguments: string;
 }
 
+/**
+ * One part of a multi-part message (the OpenAI multimodal wire shape).
+ * Image parts carry a `data:` URI (base64) — or, for endpoints that allow
+ * it, an https URL the model side can fetch.
+ */
+export type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 /** A message in the conversation sent to the model (wire shape on request). */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  /**
+   * Plain text, or an array of text/image parts for multimodal messages
+   * (user messages carrying attachments; tool content is always a string).
+   */
+  content: string | ContentPart[];
   /** assistant only: tool calls the model requested. */
   toolCalls?: ToolCall[];
   /** tool only: id of the call this message answers. */

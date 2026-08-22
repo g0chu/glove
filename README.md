@@ -63,12 +63,12 @@ npm run dev            # or: npm run build && npm start
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 
-## Tools (web search/fetch + file workspace)
+## Tools (web search/fetch + file workspace + offline Wikipedia)
 
-The bot can run two optional tool families, both **in-process** (no sidecars,
-no Docker). Both are **opt-in** (default `false`) and need a model endpoint
-that supports function calling (`tools`). With both disabled, the bot behaves
-exactly as before.
+The bot can run three optional tool families, all **in-process** (no
+sidecars, no Docker). All are **opt-in** (default `false`) and need a model
+endpoint that supports function calling (`tools`). With all disabled, the bot
+behaves exactly as before.
 
 - **web tools**: `web_search` (DuckDuckGo) and `web_fetch` (plain
   pinned-socket HTTP fetch with SSRF protection, content extraction, and a
@@ -78,6 +78,13 @@ exactly as before.
   `file_delete`, `file_search` over a persistent workspace. The workspace
   lives in **`./workspace`** next to the repo (gitignored) and survives
   restarts.
+- **wikipedia tools**: `wikipedia_search` and `wikipedia_read` over a local
+  **offline Wikipedia archive** (a ZIM file pointed to by `ZIM_FILE`, e.g.
+  the en.wikipedia "all nopic" dump in `./workspace`). The reader works
+  directly on the file — binary search over the ~20M-entry directory plus
+  a time-budgeted title scan, so lookups on a 50 GB archive take well under
+  a second. `wikipedia_read` returns the article as clean plain text
+  (references, TOC and navigation dropped).
 
 A turn may run several model rounds: rounds that end in tool calls are
 transient (their streamed preview is deleted), the tools execute — each
@@ -89,8 +96,9 @@ channel history. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
 ### Setup
 
 Nothing to build or run — the tools live in the bot process. Just set
-`WEBTOOLS_ENABLED=true` and/or `FILETOOLS_ENABLED=true` in `.env` and restart
-the bot.
+`WEBTOOLS_ENABLED=true`, `FILETOOLS_ENABLED=true` and/or
+`ZIMTOOLS_ENABLED=true` (with `ZIM_FILE` pointing at a ZIM archive) in `.env`
+and restart the bot.
 
 ### Notes
 
@@ -103,6 +111,10 @@ the bot.
 - The model endpoint must speak function calling (e.g. llama.cpp with a
   tool-supporting chat template). If the endpoint rejects `tools`, keep the
   `*_ENABLED` flags off.
+- The wikipedia tools read ZIM v6 archives. Wikipedia ZIM article clusters
+  are zstd-compressed, so the reader needs **Node >= 22.15** (built-in zstd);
+  other ZIM features (e.g. LZMA2-compressed clusters) are reported as
+  per-call errors, never crashes.
 - Per-tool caps (fetch size, redirect hops, cache, search result caps,
   workspace limits, …) are in `.env.example` and have sensible defaults.
 
@@ -118,4 +130,4 @@ See [.env.example](.env.example) for the documented list.
 | `npm run build` | compile TypeScript to `dist/` |
 | `npm start` | run the compiled bot |
 | `npm run typecheck` | type-check without emitting |
-| `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file tools, LLM client incl. tool calls vs. a mock endpoint) |
+| `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file/zim tools, LLM client incl. tool calls vs. a mock endpoint) |

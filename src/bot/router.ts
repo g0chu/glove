@@ -30,7 +30,10 @@ export function isMentionOf(message: Message, botId: string): boolean {
  * of the bot stripped out (`<@id>` / `<@!id>`).
  */
 export function stripMention(message: Message, botId: string): string {
-  return message.content
-    .replace(new RegExp(`<@!?${botId}>`, "g"), "")
-    .trim();
+  return stripMentionText(message.content, botId);
+}
+
+/** The stripMention transform on a bare content string (fetched messages, tests). */
+export function stripMentionText(text: string, botId: string): string {
+  return text.replace(new RegExp(`<@!?${botId}>`, "g"), "").trim();
 }

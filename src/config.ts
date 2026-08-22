@@ -17,6 +17,8 @@ export interface ModelConfig {
   apiKey: string;
   name: string;
   enableImages: boolean;
+  /** Max bytes per downloaded image attachment (bigger ones are skipped). */
+  imagesMaxBytes: number;
   stream: boolean;
   systemPrompt: string;
   contextMaxMessages: number;
@@ -57,12 +59,27 @@ export interface FileToolsConfig {
   lineMaxChars: number;
 }
 
+/**
+ * ZIM tool family (in-process): search and read articles from a local
+ * offline Wikipedia archive (a ZIM file on disk, see src/tools/zim/).
+ */
+export interface ZimToolsConfig {
+  enabled: boolean;
+  /** Path to the ZIM archive file (required when enabled). */
+  file: string;
+  /** Hard cap on search results (the tool arg is clamped to this). */
+  searchMaxResults: number;
+  /** Time budget for a full-archive title scan. */
+  scanBudgetMs: number;
+}
+
 export interface ToolsConfig {
   web: WebToolsConfig;
   file: FileToolsConfig;
+  zim: ZimToolsConfig;
   /** Max tool-execution rounds per turn before the turn is cut off. */
   maxRounds: number;
-  /** Hard cap on characters in one tool result (both families). */
+  /** Hard cap on characters in one tool result (all families). */
   maxResultChars: number;
 }
 
@@ -153,6 +170,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       apiKey: optional("MODEL_API_KEY", "none"),
       name: optional("MODEL_NAME", "local"),
       enableImages: boolEnv("MODEL_ENABLE_IMAGES", false),
+      imagesMaxBytes: intEnv("MODEL_IMAGES_MAX_BYTES", 10_485_760, 1024),
       stream: boolEnv("MODEL_STREAM", true),
       systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),
@@ -183,10 +201,20 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
         searchMaxFileBytes: intEnv("FILETOOLS_SEARCH_MAX_FILE_BYTES", 5_000_000, 1_024),
         lineMaxChars: intEnv("FILETOOLS_LINE_MAX_CHARS", 500, 20),
       },
+      zim: {
+        enabled: boolEnv("ZIMTOOLS_ENABLED", false),
+        file: env.ZIM_FILE?.trim() ?? "",
+        searchMaxResults: intEnv("ZIMTOOLS_SEARCH_MAX_RESULTS", 8, 1),
+        scanBudgetMs: intEnv("ZIMTOOLS_SCAN_BUDGET_S", 10, 1) * 1000,
+      },
       maxRounds: intEnv("TOOLS_MAX_ROUNDS", 5, 1),
       maxResultChars: intEnv("TOOLS_MAX_RESULT_CHARS", 200_000, 1_000),
     },
   };
+
+  if (config.tools.zim.enabled && config.tools.zim.file.length === 0) {
+    errors.push("ZIM_FILE is required when ZIMTOOLS_ENABLED is true");
+  }
 
   return { config, errors };
 }
