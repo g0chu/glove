@@ -1,7 +1,7 @@
 import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext } from "./bot/context.js";
-import { isMentionOf, isTrackable, stripMention } from "./bot/router.js";
+import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { QueueStore } from "./bot/queue.js";
 import { ResponseWriter, SAFE_MENTIONS } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
@@ -126,6 +126,9 @@ async function main(): Promise<void> {
               summarize: async (msgs) => (await llm.chat(msgs)).content,
             }
           : undefined,
+        // Classic mode only: the live fetch must not resurrect the messages
+        // the user cleared (!clear boundary).
+        resetAfter: compaction ? undefined : histories.getResetAfter(channelId),
       });
       if (messages === null) {
         // Deleted while queued.
@@ -210,6 +213,33 @@ async function main(): Promise<void> {
     const botId = client.user?.id;
     if (!botId) return;
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
+    // `!clear` resets the channel's model context for a fresh chat: the
+    // command is neither tracked nor answered (a bot mention alongside it is
+    // swallowed too). Mentions queued before the clear are dropped with the
+    // context: their mention is no longer in it (compaction) or sits before
+    // the boundary (classic), so their turns are skipped.
+    if (isClearCommand(message.content, botId)) {
+      if (compaction) {
+        // Drop entries + summary and suppress the startup seed: the next
+        // turn starts from messages that arrive after the clear, not from
+        // the channel's last-N.
+        contexts.get(message.channelId).reset();
+      } else {
+        // The live fetch is the source of truth in classic mode, so the
+        // clear is a boundary: only messages after the command's own id
+        // enter the context. The in-memory window is cleared too (fallback
+        // and recorded replies stay fresh).
+        histories.markCleared(message.channelId, message.id);
+      }
+      log.info(`channel ${message.channelId}: conversation reset by ${message.author.username}`);
+      const channel = message.channel;
+      if (channel && channel.isTextBased()) {
+        channel.send({ content: CLEAR_CONFIRMATION, allowedMentions: SAFE_MENTIONS }).catch((err) => {
+          log.warn(`failed to post the clear confirmation: ${errMsg(err)}`);
+        });
+      }
+      return;
+    }
     // The display name (guild nickname when set, else the global username)
     // labels this message in the context; the attachment metadata is what
     // the image parts are downloaded from at turn time.

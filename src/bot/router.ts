@@ -37,3 +37,18 @@ export function stripMention(message: Message, botId: string): string {
 export function stripMentionText(text: string, botId: string): string {
   return text.replace(new RegExp(`<@!?${botId}>`, "g"), "").trim();
 }
+
+/** The clear-history command: resets the channel's model context for a fresh chat. */
+export const CLEAR_COMMAND = "!clear";
+
+/** The confirmation line posted when a channel's context is cleared (a UI line, never context). */
+export const CLEAR_CONFIRMATION = "🧹 *cleared the channel's conversation history*";
+
+/**
+ * True when the message is the clear-history command: the content, with
+ * every bot mention stripped, is exactly `!clear` (trimmed, case-
+ * insensitive). The command is neither tracked nor answered.
+ */
+export function isClearCommand(content: string, botId: string): boolean {
+  return stripMentionText(content, botId).trim().toLowerCase() === CLEAR_COMMAND;
+}

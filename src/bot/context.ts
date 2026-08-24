@@ -68,6 +68,13 @@ export interface ContextOptions {
   imageFetch?: ImageFetch;
   /** Set = compaction mode (persistent per-channel context); unset = the classic live fetch. */
   compaction?: CompactionOptions;
+  /**
+   * Classic mode (`!clear` boundary): only messages strictly after this
+   * Discord message id enter the context. When the id is not among the
+   * fetched messages, the clear fell out of the last-N window and nothing
+   * is dropped.
+   */
+  resetAfter?: string | null;
 }
 
 /** One conversation entry: exactly one Discord message (or one bot reply). */
@@ -82,7 +89,7 @@ interface ContextEntry {
  * "🔧 *…*") and the thinking line ("🤔 *thought for Ns*") — are posted for humans,
  * not part of the conversation: they never enter the model context.
  */
-const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚) \*/;
+const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚|🧹) \*/;
 
 /**
  * Build the `messages` array for a turn.
@@ -118,13 +125,17 @@ const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚) \*/;
  *  - image attachments (png/jpeg/webp/gif) become image_url parts when
  *    images are enabled; a skipped attachment leaves a one-line note;
  *  - messages that carry no text and no images are dropped;
+ *  - a `resetAfter` boundary (the `!clear` command's message id) drops
+ *    every message up to and including it; when the boundary is not among
+ *    the fetched messages, the clear fell out of the last-N window and
+ *    nothing is dropped;
  *  - the system prompt (when non-empty) comes first.
  *
  * Returns null in classic mode when the mention is no longer among the
- * channel's last `maxMessages` messages (deleted, or pushed out while
- * queued). When the fetch itself fails (or the window is bigger than
- * Discord's fetch cap), the in-memory window is used instead so the bot
- * keeps working when the API is flaky.
+ * channel's last `maxMessages` messages (deleted, pushed out while queued,
+ * or before the `!clear` boundary). When the fetch itself fails (or the
+ * window is bigger than Discord's fetch cap), the in-memory window is used
+ * instead so the bot keeps working when the API is flaky.
  */
 export async function buildChannelContext(
   channel: GuildTextBasedChannel,
@@ -291,7 +302,8 @@ export async function contextToMessages(
 /**
  * Map a chronological list of channel messages to the request `messages`
  * array — the pure core of buildChannelContext, driven with fakes in the
- * tests. Returns null when the mention is not among the messages.
+ * tests. Returns null when the mention is not among the messages (or is
+ * before the `!clear` boundary).
  */
 export async function contextFromMessages(
   fetched: MessageLike[],
@@ -299,7 +311,23 @@ export async function contextFromMessages(
   mentionId: string,
   opts: ContextOptions,
 ): Promise<ChatMessage[] | null> {
-  if (!fetched.some((m) => m.id === mentionId)) return null;
+  // A `!clear` boundary: only messages strictly after the clear command's
+  // own message enter the context. When the boundary id is not among the
+  // fetched messages, the clear fell out of the last-N window and nothing
+  // is dropped.
+  let relevant = fetched;
+  const boundary = opts.resetAfter;
+  if (boundary) {
+    let start = -1;
+    for (let i = fetched.length - 1; i >= 0; i--) {
+      if (fetched[i].id === boundary) {
+        start = i + 1;
+        break;
+      }
+    }
+    if (start !== -1) relevant = fetched.slice(start);
+  }
+  if (!relevant.some((m) => m.id === mentionId)) return null;
 
   const entries: ContextEntry[] = [];
   const emitted = new Set<string>();
@@ -317,7 +345,7 @@ export async function contextFromMessages(
     }
     group = null;
   };
-  for (const m of fetched) {
+  for (const m of relevant) {
     const entry = history.find(m.id);
     if (entry && entry.role === "assistant") {
       // A recorded bot reply: emit it once, with its canonical text, on

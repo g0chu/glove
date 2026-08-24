@@ -181,6 +181,18 @@ export class ChannelContext {
     this.seeded = false;
   }
 
+  /**
+   * Reset for a fresh start (the `!clear` command): drop every entry and
+   * the running summary, and mark the startup seed as taken so the next
+   * turn does not re-seed the channel's last-N messages. Messages that
+   * arrive after the clear fill the context from scratch.
+   */
+  reset(): void {
+    this.summary = null;
+    this.entries.length = 0;
+    this.seeded = true;
+  }
+
   get length(): number {
     return this.entries.length;
   }
