@@ -60,6 +60,13 @@ npm run dev            # or: npm run build && npm start
 - **Queue:** one turn per channel at a time. Mentions that arrive while a
   reply is generating are queued and answered in order. Non-mentions on
   their own never trigger a reply, but they are part of the context.
+- **Clear:** sending `!clear` (exact match, case-insensitive) in a text
+  channel resets that channel's model context for a fresh chat: the command
+  is neither tracked nor answered, the bot posts a short confirmation line
+  ("🧹 *…*"), and everything before it is forgotten — in compaction mode the
+  context (entries + summary) is dropped and not re-seeded, in classic mode
+  the live fetch only considers messages after the command. Mentions queued
+  before the clear are skipped.
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 

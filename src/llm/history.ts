@@ -97,6 +97,8 @@ export class ChannelHistory {
 /** Lazily creates a ChannelHistory per channel id. */
 export class ConversationStore {
   private readonly byChannel = new Map<string, ChannelHistory>();
+  /** Per-channel `!clear` boundary (classic mode): the clear command's message id. */
+  private readonly resetAfter = new Map<string, string>();
 
   constructor(private readonly maxMessages: number) {}
 
@@ -113,9 +115,26 @@ export class ConversationStore {
     return this.byChannel.has(channelId);
   }
 
+  /**
+   * Record a `!clear` boundary for a channel (classic mode): the in-memory
+   * window is cleared (the fallback and the recorded replies stay fresh)
+   * and the clear command's message id is remembered, so the live fetch
+   * context only contains messages after it.
+   */
+  markCleared(channelId: string, clearMessageId: string): void {
+    this.byChannel.get(channelId)?.clear();
+    this.resetAfter.set(channelId, clearMessageId);
+  }
+
+  /** The channel's `!clear` boundary message id, if it was cleared (classic mode). */
+  getResetAfter(channelId: string): string | null {
+    return this.resetAfter.get(channelId) ?? null;
+  }
+
   /** Forget a channel's whole history (e.g. the channel was deleted). */
   clear(channelId: string): void {
     this.byChannel.get(channelId)?.clear();
+    this.resetAfter.delete(channelId);
   }
 }
 

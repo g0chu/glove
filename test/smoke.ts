@@ -2,7 +2,8 @@
  * Smoke tests: config parsing, history window, code-fence-aware chunk
  * splitting, image attachment downloads, turn-context building (last-N
  * channel messages) incl. the compaction mode (persistent per-channel
- * context: seed, growth, summarization, emergency trim), queue semantics,
+ * context: seed, growth, summarization, emergency trim) and the !clear
+ * command (fresh-chat reset in both modes), queue semantics,
  * response writer behavior (incl.
  * multi-message streaming of long replies), the tool executor and tool
  * loop, the in-process web/file/zim tools (against a synthetic ZIM file
@@ -18,7 +19,8 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import type { GuildTextBasedChannel } from "discord.js";
 import { parseConfig } from "../src/config.js";
-import { ChannelHistory, toRequestMessages } from "../src/llm/history.js";
+import { ChannelHistory, ConversationStore, toRequestMessages } from "../src/llm/history.js";
+import { CLEAR_CONFIRMATION, isClearCommand } from "../src/bot/router.js";
 import { ChannelContext, COMPACTION_SYSTEM_PROMPT, estimateTokens } from "../src/llm/context.js";
 import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
 import { ChannelQueue } from "../src/bot/queue.js";
@@ -218,6 +220,39 @@ const ok = (name: string): void => {
   ]);
   assert.deepEqual(toRequestMessages(h4, "   "), [{ role: "user", content: "Alice: hi" }]);
   ok("history: request messages skip textless entries, label speakers, system prompt optional");
+
+  // !clear (classic mode): the store clears the window and records the
+  // boundary message id; a newer clear moves it; forgetting the channel
+  // (delete) forgets it too.
+  const store = new ConversationStore(5);
+  store.get("c1").push("user", "old talk", ["o1"], undefined, "Alice");
+  assert.equal(store.getResetAfter("c1"), null, "no boundary yet");
+  store.markCleared("c1", "cl1");
+  assert.equal(store.get("c1").length, 0, "the in-memory window is cleared");
+  assert.equal(store.getResetAfter("c1"), "cl1");
+  store.get("c1").push("user", "new talk", ["n1"], undefined, "Alice");
+  store.markCleared("c1", "cl2");
+  assert.equal(store.getResetAfter("c1"), "cl2", "a newer clear moves the boundary");
+  assert.equal(store.get("c1").length, 0, "cleared again");
+  store.markCleared("c2", "cl3");
+  assert.equal(store.getResetAfter("c2"), "cl3", "works for a channel without a window yet");
+  store.clear("c1");
+  assert.equal(store.getResetAfter("c1"), null, "forgetting the channel forgets the boundary");
+  ok("history: !clear clears the window and records/moves the boundary (channel clear forgets it)");
+}
+
+// ---------------------------------------------------------------- clear --
+{
+  const botId = "bot1";
+  assert.equal(isClearCommand("!clear", botId), true);
+  assert.equal(isClearCommand("  !clear  ", botId), true, "trimmed");
+  assert.equal(isClearCommand("!CLEAR", botId), true, "case-insensitive");
+  assert.equal(isClearCommand("<@bot1> !clear", botId), true, "a bot mention alongside still counts");
+  assert.equal(isClearCommand("!cleared", botId), false);
+  assert.equal(isClearCommand("please !clear the cache", botId), false, "only the bare command");
+  assert.equal(isClearCommand("!reset", botId), false);
+  assert.equal(isClearCommand("", botId), false);
+  ok("clear: !clear detection (trimmed, case-insensitive, bot mentions stripped)");
 }
 
 // ----------------------------------------------------------------- split --
@@ -608,6 +643,56 @@ const ok = (name: string): void => {
     { role: "user", content: "Alice: hi" },
   ], "fetch failure falls back to the in-memory window (speakers labeled)");
   ok("context: wrapper fetch (limit, ordering) and in-memory fallback");
+
+  // !clear boundary: only messages strictly after the clear command's own
+  // message enter the context; a mention before it never runs its turn; when
+  // the boundary fell out of the last-N window, everything is kept.
+  const clearMsg = m(authors.alice, "!clear");
+  const fresh = m(authors.alice, "fresh question");
+  const clearOpts = { ...opts, systemPrompt: "", resetAfter: clearMsg.id };
+  assert.deepEqual(
+    await contextFromMessages([hello, clearMsg, fresh], new ChannelHistory(20), fresh.id, clearOpts),
+    [{ role: "user", content: "Alice: fresh question" }],
+    "only messages after the boundary (the clear itself included in neither)",
+  );
+  assert.equal(
+    await contextFromMessages([hello, clearMsg, fresh], new ChannelHistory(20), hello.id, clearOpts),
+    null,
+    "a pre-clear mention never runs its turn",
+  );
+  assert.deepEqual(
+    await contextFromMessages([fresh], new ChannelHistory(20), fresh.id, { ...opts, systemPrompt: "", resetAfter: "gone" }),
+    [{ role: "user", content: "Alice: fresh question" }],
+    "boundary out of the window: nothing dropped",
+  );
+  ok("context: the !clear boundary drops earlier messages (pre-clear mention -> null, out-of-window boundary -> kept)");
+
+  // The clear confirmation line is a bot UI line: never context.
+  const confirmed = m(authors.bot, CLEAR_CONFIRMATION);
+  const afterClear = m(authors.alice, "now we start fresh");
+  assert.deepEqual(
+    await contextFromMessages([confirmed, afterClear], new ChannelHistory(20), afterClear.id, { ...opts, systemPrompt: "" }),
+    [{ role: "user", content: "Alice: now we start fresh" }],
+  );
+  ok("context: the clear confirmation line is a UI line, never context");
+
+  // Wrapper: the live fetch respects the boundary end to end.
+  const cApiList = [
+    { id: "co1", content: "old talk", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "ccl", content: "!clear", createdTimestamp: 200, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "cn1", content: "fresh talk", createdTimestamp: 300, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+  ];
+  const cChan = {
+    messages: {
+      fetch: async () => ({ values: () => cApiList.values() }),
+    },
+  } as unknown as GuildTextBasedChannel;
+  const cwOpts = { ...wOpts, resetAfter: "ccl" };
+  assert.deepEqual(await buildChannelContext(cChan, new ChannelContext(), new ChannelHistory(20), "cn1", cwOpts), [
+    { role: "user", content: "Alice: fresh talk" },
+  ]);
+  assert.equal(await buildChannelContext(cChan, new ChannelContext(), new ChannelHistory(20), "co1", cwOpts), null, "pre-clear mention -> null");
+  ok("context: wrapper live fetch respects the !clear boundary (pre-clear mention -> null)");
 }
 
 // ----------------------------------------------------------- compaction --
@@ -803,6 +888,43 @@ const ok = (name: string): void => {
     { role: "user", content: "B: y" },
   ]);
   ok("compaction: image window notes, recent image parts, summary rendered first");
+
+  // !clear: reset() drops every entry and the running summary, and
+  // suppresses the startup seed — the next turn starts from messages that
+  // arrived after the clear, not from the channel's last-N; a mention that
+  // was queued before the clear no longer runs its turn.
+  const kstore = new ChannelContext();
+  kstore.seedFrom([
+    { id: "k1", ts: 100, role: "user", content: "old talk", name: "Alice", attachments: [] },
+  ]);
+  kstore.pushUser("Bob", "more talk", "k2", 200, []);
+  assert.deepEqual(await kstore.compact(1, async () => "sum of old talk"), { ok: true });
+  assert.equal(kstore.getSummary(), "sum of old talk");
+  kstore.reset();
+  assert.equal(kstore.length, 0, "entries dropped");
+  assert.equal(kstore.getSummary(), null, "summary dropped");
+  assert.equal(kstore.seeded, true, "no re-seed after a clear");
+  // The next turn does not seed (the fetch below would throw if attempted)
+  // and carries only what arrived after the clear.
+  kstore.pushUser("Alice", "fresh start", "k3", 300, []);
+  const kOpts = {
+    botId: "bot1",
+    systemPrompt: "",
+    maxMessages: 20,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    compaction: { maxTokens: 10_000, keepMessages: 5, summarize: async () => "never" },
+  };
+  assert.deepEqual(await buildChannelContext(noFetch, kstore, new ChannelHistory(20), "k3", kOpts), [
+    { role: "user", content: "Alice: fresh start" },
+  ]);
+  // A mention queued before the clear: its message left the context, the
+  // turn is skipped (no fetch attempted either — the mention check comes first).
+  const kcleared = new ChannelContext();
+  kcleared.pushUser("Alice", "queued before the clear", "km", 150, []);
+  kcleared.reset();
+  assert.equal(await buildChannelContext(noFetch, kcleared, new ChannelHistory(20), "km", kOpts), null, "pre-clear mention -> null");
+  ok("compaction: reset() drops entries + summary, suppresses the seed (pre-clear mention -> null)");
 }
 
 // ----------------------------------------------------------------- queue --
