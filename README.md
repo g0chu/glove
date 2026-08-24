@@ -75,7 +75,9 @@ npm run dev            # or: npm run build && npm start
 The bot can run three optional tool families, all **in-process** (no
 sidecars, no Docker). All are **opt-in** (default `false`) and need a model
 endpoint that supports function calling (`tools`). With all disabled, the bot
-behaves exactly as before.
+behaves exactly as before. The model is only told about the families you
+enabled — a short system-prompt note lists exactly those, so the bot never
+claims tools it does not have.
 
 - **web tools**: `web_search` (DuckDuckGo) and `web_fetch` (plain
   pinned-socket HTTP fetch with SSRF protection, content extraction, and a

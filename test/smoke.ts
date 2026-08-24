@@ -31,6 +31,7 @@ import { buildChannelContext, contextFromMessages, contextToMessages, type Messa
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
+import { buildTools } from "../src/tools/index.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
 import { FetchCache } from "../src/tools/web/cache.js";
 import { extractTitle, extractContent } from "../src/tools/web/extract.js";
@@ -1590,6 +1591,62 @@ const ok = (name: string): void => {
   ok("loop: empty registry means a plain chat");
 }
 
+// -------------------------------------------------------------- tools --
+{
+  // The system note advertises exactly the enabled families: the model
+  // must never claim a tool that is not registered (the note used to be
+  // static, listing all three families even when only one was enabled).
+  const base = {
+    DISCORD_TOKEN: "t",
+    DISCORD_GUILD_ID: "g",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+  };
+  const { config: zimCfg, errors: zimErrs } = parseConfig({
+    ...base,
+    ZIMTOOLS_ENABLED: "true",
+    ZIM_FILE: "/tmp/wiki.zim",
+  });
+  assert.deepEqual(zimErrs, []);
+  const zimOnly = buildTools(zimCfg);
+  assert.equal(zimOnly.registry.size, 2);
+  assert.ok(zimOnly.systemNote?.includes("wikipedia_search"));
+  assert.ok(zimOnly.systemNote?.includes("wikipedia_read"));
+  assert.ok(!zimOnly.systemNote?.includes("web_search"), "web tools not advertised");
+  assert.ok(!zimOnly.systemNote?.includes("web_fetch"), "web tools not advertised");
+  assert.ok(!zimOnly.systemNote?.includes("file_"), "file tools not advertised");
+  assert.ok(zimOnly.systemNote?.includes("Summarize tool results"), "the common rule stays");
+  const { config: allCfg, errors: allErrs } = parseConfig({
+    ...base,
+    WEBTOOLS_ENABLED: "true",
+    FILETOOLS_ENABLED: "true",
+    ZIMTOOLS_ENABLED: "true",
+    ZIM_FILE: "/tmp/wiki.zim",
+  });
+  assert.deepEqual(allErrs, []);
+  const all = buildTools(allCfg);
+  assert.equal(all.registry.size, 10);
+  for (const name of [
+    "web_search",
+    "web_fetch",
+    "file_list",
+    "file_read",
+    "file_write",
+    "file_edit",
+    "file_delete",
+    "file_search",
+    "wikipedia_search",
+    "wikipedia_read",
+  ]) {
+    assert.ok(all.systemNote?.includes(name), `the note advertises ${name}`);
+  }
+  const { config: noneCfg, errors: noneErrs } = parseConfig(base);
+  assert.deepEqual(noneErrs, []);
+  const none = buildTools(noneCfg);
+  assert.equal(none.registry.size, 0);
+  assert.equal(none.systemNote, null, "nothing registered, no note");
+  ok("tools: the system note lists exactly the enabled families (null with none)");
+}
+
 // ------------------------------------------------------------- activity --
 {
   // one persistent line per call: icon, name, up to two args, … for the rest
@@ -2183,8 +2240,17 @@ const ok = (name: string): void => {
     assert.ok(results[1].content.includes("theoretical physicist"));
     const broken = new ZimTools({ file: path.join(zimDir, "missing.zim"), maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000 });
     await assert.rejects(broken.search("x", 5), /cannot open/);
+    // The no-match hint only suggests web_search when the web family is
+    // registered (it used to suggest it unconditionally).
+    const miss = await tools.search("definitely absent", 5);
+    assert.ok(miss.startsWith("No article in the local Wikipedia archive matches"), miss);
+    assert.ok(!miss.includes("web_search"), "no hint at a tool that is not registered");
+    const withWeb = new ZimTools({ file: zimFile, maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000, webSearchAvailable: true });
+    assert.ok((await withWeb.search("definitely absent", 5)).includes("web_search"));
+    withWeb.abort();
     tools.abort();
     ok("zim tools: registry wiring, search/read results, broken file surfaces as error");
+    ok("zim tools: the no-match hint only suggests web_search when it is registered");
 
     // -- config
     const { config: zc, errors: ze } = parseConfig({

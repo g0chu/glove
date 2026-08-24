@@ -10,7 +10,7 @@ import { ConversationStore, type ChannelHistory } from "./llm/history.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
 import { formatToolCall } from "./tools/activity.js";
-import { TOOLS_SYSTEM_NOTE, buildTools } from "./tools/index.js";
+import { buildTools } from "./tools/index.js";
 import { runToolTurn } from "./tools/loop.js";
 
 async function main(): Promise<void> {
@@ -106,9 +106,9 @@ async function main(): Promise<void> {
       // onToolRound), the tools run, and the next round continues with the
       // results in context. Only the final reply is posted and recorded.
       // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
-      // note is added when tools are registered.
-      const hasTools = tools.registry.size > 0;
-      const systemPrompt = [cfg.model.systemPrompt, hasTools ? TOOLS_SYSTEM_NOTE : null]
+      // note (listing only the enabled families) is added when any are
+      // registered.
+      const systemPrompt = [cfg.model.systemPrompt, tools.systemNote]
         .filter((p): p is string => p !== null && p.trim().length > 0)
         .join("\n\n");
       const messages = await buildChannelContext(textChannel, context, history, mentionId, {

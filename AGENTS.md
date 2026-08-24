@@ -12,7 +12,7 @@ Discord bot bridging guild text channels to any OpenAI-compatible Chat Completio
 - **Clear** — `!clear` in a text channel resets that channel's model context for a fresh chat: compaction mode drops entries + summary and suppresses the startup seed (no re-seed); classic mode clears the sliding window and remembers the command's message id as a boundary the live fetch respects (only later messages enter the context). The command is neither tracked nor answered (a bot mention alongside it is swallowed too); the bot posts a confirmation line (🧹, a UI line, never context). Mentions queued before the clear are skipped (their message left the context / sits before the boundary).
 - **Turn** — `runToolTurn` (`tools/loop.ts`): model ↔ tool rounds capped by `TOOLS_MAX_ROUNDS`; tool results live only in the turn. Then `ResponseWriter` posts the final reply. Only the final reply reaches channel history; tool-activity (🔎/📁/🔧) and thinking (🤔) lines are posted but never tracked.
 - **Images** — `MODEL_ENABLE_IMAGES=true`: image attachments (png/jpeg/webp/gif) of the newest `MODEL_CONTEXT_MAX_MESSAGES` entries are downloaded per turn from the Discord CDN (≤4 per message, `MODEL_IMAGES_MAX_BYTES` cap) and sent as base64 `image_url` parts; unsent attachments leave a one-line note.
-- **Tools** — three opt-in in-process families (default `false`): `WEBTOOLS_ENABLED` (DuckDuckGo search + SSRF-protected fetch), `FILETOOLS_ENABLED` (ops confined to `FILETOOLS_WORKSPACE`, default `./workspace`, which must exist), `ZIMTOOLS_ENABLED` (offline Wikipedia, `ZIM_FILE` → ZIM v6 archive).
+- **Tools** — three opt-in in-process families (default `false`): `WEBTOOLS_ENABLED` (DuckDuckGo search + SSRF-protected fetch), `FILETOOLS_ENABLED` (ops confined to `FILETOOLS_WORKSPACE`, default `./workspace`, which must exist), `ZIMTOOLS_ENABLED` (offline Wikipedia, `ZIM_FILE` → ZIM v6 archive). The system prompt note (`tools/index.ts`, built by `buildTools`) lists exactly the enabled families — the model is never told about disabled ones; the ZIM no-match hint only suggests `web_search` when the web family is enabled.
 
 ```
 src/
@@ -51,7 +51,7 @@ npm test                  # smoke tests (tsx test/smoke.ts)
 ## 3. Testing Guidelines
 
 - Whole suite is `test/smoke.ts` via `npm test` — no framework, no selection, no config. Hermetic: mock OpenAI-compatible HTTP server on an ephemeral port, fake Discord channels, injected DNS/search backends, temp workspace dirs; no `.env`/Discord/network needed.
-- Plain `node:assert/strict`; `ok(name)` check groups (currently **100**); the final line prints the count.
+- Plain `node:assert/strict`; `ok(name)` check groups (currently **102**); the final line prints the count.
 - Async is driven with `ticks()` (`setImmediate`), not real sleeps.
 - In tests use the pure `parseConfig(env)`, never `loadConfig()` (calls `process.exit(1)`).
 - Web-tool tests use `WebToolsOptions.allowPrivate`/`resolver`/`searchFetch` — tests-only escape hatches, never enable in production.

@@ -18,6 +18,11 @@ export interface ZimToolsOptions {
   scanBudgetMs: number;
   /** Max characters of article text returned by wikipedia_read. */
   maxTextChars: number;
+  /**
+   * Whether the web family is registered too: the no-match hint may then
+   * point at web_search. Never suggest a tool that is not available.
+   */
+  webSearchAvailable?: boolean;
 }
 
 export class ZimTools {
@@ -44,7 +49,8 @@ export class ZimTools {
     const limit = Math.max(1, Math.min(maxResults, this.opts.maxResults));
     const { results, partial } = await reader.search(query, limit);
     if (results.length === 0) {
-      return `No article in the local Wikipedia archive matches "${query}". Try a shorter or differently spelled query, or use web_search.`;
+      const hint = this.opts.webSearchAvailable ? ", or use web_search" : "";
+      return `No article in the local Wikipedia archive matches "${query}". Try a shorter or differently spelled query${hint}.`;
     }
     const lines = results.map((r, i) => {
       const nsNote = r.ns === "C" ? "" : ` (namespace "${r.ns}")`;
