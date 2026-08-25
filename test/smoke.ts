@@ -1602,7 +1602,7 @@ const ok = (name: string): void => {
   w7.chunk("The answer is 42.");
   await ticks(2);
   assert.equal(g.sent.length, 2, "reply streams in a fresh message");
-  assert.match(g.messages[0].content, /^🤔 \*Let me think step by step\. First, the units; xxxxx\.\.\. \(\d+s\)\*$/, "thinking completes into first-line (truncated) + seconds");
+  assert.match(g.messages[0].content, /^🤔 \*Let me think step by step\. First, the units; xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\.\.\. \(\d+s\)\*$/, "thinking completes into first-line (truncated at the tool-line length) + seconds");
   assert.equal(g.getLive()!.content, "The answer is 42.", "reply takes over in its own message");
   const p7 = await w7.finish("The answer is 42.");
   assert.equal(p7!.text, "The answer is 42.", "reasoning is not posted or recorded");

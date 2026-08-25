@@ -1,6 +1,6 @@
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import { errMsg, log, truncate } from "../log.js";
-import { sanitizeForDiscord } from "./format.js";
+import { ACTIVITY_CONTENT_MAX, sanitizeForDiscord } from "./format.js";
 
 /** Discord hard message limit. */
 export const DISCORD_MAX_MESSAGE_CHARS = 2000;
@@ -15,8 +15,6 @@ const REASONING_TAIL_LINES = 5;
  */
 const REASONING_BUFFER_MAX = 8000;
 
-/** How many chars of the first reasoning line the terminal line shows. */
-const REASONING_FIRST_LINE_CHARS = 50;
 
 /**
  * Mentions allowed in the bot's own posts: user pings stay active (the
@@ -342,7 +340,8 @@ export class ResponseWriter {
   private reasoningEndedNewline = false;
   /**
    * The first line of the reasoning, kept for the terminal line (capped at
-   * REASONING_FIRST_LINE_CHARS). Tracked separately from reasoningBuffer
+   * ACTIVITY_CONTENT_MAX — the same length the tool activity lines use).
+   * Tracked separately from reasoningBuffer
    * because that buffer keeps only a tail (the head is dropped when the
    * thinking runs long).
    */
@@ -405,15 +404,15 @@ export class ResponseWriter {
       this.reasoningStartedAt = Date.now();
     }
     // Track the first line (for the terminal line) until its newline arrives.
-    // Only the first REASONING_FIRST_LINE_CHARS are kept — the terminal line
-    // truncates there — but the full length is counted to know whether the
-    // line was cut.
+    // Only the first ACTIVITY_CONTENT_MAX are kept — the terminal line
+    // truncates there (the same length the tool activity lines use) — but the
+    // full length is counted to know whether the line was cut.
     if (!this.reasoningFirstLineDone) {
       const nl = delta.indexOf("\n");
       const take = nl === -1 ? delta : delta.slice(0, nl);
       this.reasoningFirstLineLength += take.length;
-      if (this.reasoningFirstLine.length < REASONING_FIRST_LINE_CHARS) {
-        this.reasoningFirstLine += take.slice(0, REASONING_FIRST_LINE_CHARS - this.reasoningFirstLine.length);
+      if (this.reasoningFirstLine.length < ACTIVITY_CONTENT_MAX) {
+        this.reasoningFirstLine += take.slice(0, ACTIVITY_CONTENT_MAX - this.reasoningFirstLine.length);
       }
       if (nl !== -1) this.reasoningFirstLineDone = true;
     }
@@ -690,7 +689,7 @@ export class ResponseWriter {
 
   /**
    * The thinking message's terminal line: the first line of the reasoning
-   * (truncated after REASONING_FIRST_LINE_CHARS, with a "..." when it was
+   * (truncated after ACTIVITY_CONTENT_MAX, with a "..." when it was
    * cut) plus how long the model thought — e.g.
    * "🤔 *Let me check the units first... (12s)*". Falls back to a plain
    * "thought for Ns" when there is no first line to show.
@@ -703,7 +702,7 @@ export class ResponseWriter {
     // sanitizer so stray math becomes Unicode rather than raw $…$ source).
     const line = sanitizeForDiscord(this.reasoningFirstLine).trim();
     if (line.length === 0) return `🤔 *thought for ${secs}s*`;
-    const truncated = this.reasoningFirstLineLength > REASONING_FIRST_LINE_CHARS;
+    const truncated = this.reasoningFirstLineLength > ACTIVITY_CONTENT_MAX;
     return `🤔 *${line}${truncated ? "..." : ""} (${secs}s)*`;
   }
 
