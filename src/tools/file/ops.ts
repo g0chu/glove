@@ -8,40 +8,14 @@
  * used to see through the sidecar's 400 responses.
  */
 import fs from "node:fs/promises";
-import type { Dirent } from "node:fs";
 import path from "node:path";
 import { ToolError } from "../web/ssrf.js";
-import { resolveInWorkspace, workspaceRoot } from "./paths.js";
+import { resolveInWorkspace } from "./paths.js";
 
 /** Per-operation caps (from config; keep them close to the sidecar defaults). */
 export interface FileOpsOptions {
   readMaxBytes: number;
   writeMaxBytes: number;
-  listMaxEntries: number;
-  searchMaxResults: number;
-  searchMaxFiles: number;
-  searchMaxFileBytes: number;
-  lineMaxChars: number;
-}
-
-export interface ListEntry {
-  name: string;
-  type: "dir" | "file";
-  size?: number;
-  mtime?: string;
-}
-
-export interface SearchMatch {
-  file: string;
-  line: number;
-  text: string;
-}
-
-/** "YYYY-MM-DD HH:MM:SS UTC" for a unix-ms timestamp (matches the old sidecar). */
-function isoMtime(tsMs: number): string {
-  const d = new Date(tsMs);
-  const p = (n: number): string => String(n).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())} UTC`;
 }
 
 function errMsg(err: unknown): string {
@@ -68,58 +42,6 @@ function replaceFirst(haystack: string, oldText: string, newText: string): strin
 /** Decode a buffer as strict UTF-8; raises on invalid sequences. */
 function utf8Fatal(buf: Buffer): string {
   return new TextDecoder("utf-8", { fatal: true }).decode(buf);
-}
-
-/** Case-insensitive-lexicographic compare without locale dependence. */
-function byLower(a: string, b: string): number {
-  const la = a.toLowerCase();
-  const lb = b.toLowerCase();
-  return la < lb ? -1 : la > lb ? 1 : 0;
-}
-
-/** List a directory; entries sorted dirs-first, then by name (case-folded). */
-export async function listFiles(
-  workspace: string,
-  rel: string | undefined,
-  maxEntries: number,
-): Promise<{ path: string; entries: ListEntry[]; truncated: boolean }> {
-  const root = workspaceRoot(workspace);
-  const target = resolveInWorkspace(workspace, rel);
-  let st;
-  try {
-    st = await fs.stat(target);
-  } catch {
-    st = null;
-  }
-  if (!st || !st.isDirectory()) throw new ToolError(`not a directory: ${rel ?? "."}`);
-
-  let names: string[];
-  try {
-    names = await fs.readdir(target);
-  } catch (err) {
-    throw new ToolError(`cannot list ${rel ?? "."}: ${errMsg(err)}`);
-  }
-  const dirNames: string[] = [];
-  const entries: ListEntry[] = [];
-  for (const name of names) {
-    let cst;
-    try {
-      cst = await fs.stat(path.join(target, name));
-    } catch {
-      continue; // vanished or unreadable entry
-    }
-    if (cst.isDirectory()) dirNames.push(name);
-    else entries.push({ name, type: "file", size: cst.size, mtime: isoMtime(cst.mtimeMs) });
-  }
-  dirNames.sort(byLower);
-  entries.sort((a, b) => byLower(a.name, b.name));
-  const combined: ListEntry[] = [
-    ...dirNames.map((name) => ({ name, type: "dir" as const })),
-    ...entries,
-  ];
-  const truncated = combined.length > maxEntries;
-  const display = path.relative(root, target).split(path.sep).join("/");
-  return { path: display === "" ? "." : display, entries: combined.slice(0, maxEntries), truncated };
 }
 
 /** Read a text file window (bytes) with a hard cap and binary refusal. */
@@ -251,123 +173,4 @@ export async function editFile(
   }
   await fs.writeFile(target, encoded);
   return { path: rel, replacements: replaceAll ? occurrences : 1 };
-}
-
-/** Delete a file or directory tree (never the workspace root). */
-export async function deletePath(workspace: string, rel: string): Promise<{ path: string; deleted: "file" | "dir" }> {
-  const root = workspaceRoot(workspace);
-  const target = resolveInWorkspace(workspace, rel);
-  if (target === root) throw new ToolError("refusing to delete the workspace root");
-  let st;
-  try {
-    st = await fs.lstat(target);
-  } catch {
-    st = null;
-  }
-  if (!st) throw new ToolError(`not found: ${rel}`);
-  if (st.isDirectory()) {
-    await fs.rm(target, { recursive: true });
-    return { path: rel, deleted: "dir" };
-  }
-  await fs.unlink(target);
-  return { path: rel, deleted: "file" };
-}
-
-/**
- * Search file contents under a directory. Walk order matches the old
- * sidecar (os.walk): per directory, files (sorted) then subdirectories
- * (sorted, symlinks to dirs are not descended into); symlinks to files
- * count against the scan budget but are skipped.
- */
-export async function searchFiles(
-  workspace: string,
-  rel: string | undefined,
-  pattern: string,
-  literal: boolean,
-  maxResults: number,
-  opts: FileOpsOptions,
-): Promise<{ matches: SearchMatch[]; truncated: boolean }> {
-  const root = workspaceRoot(workspace);
-  const base = resolveInWorkspace(workspace, rel);
-  let st;
-  try {
-    st = await fs.stat(base);
-  } catch {
-    st = null;
-  }
-  if (!st || !st.isDirectory()) throw new ToolError(`not a directory: ${rel ?? "."}`);
-
-  let regex: RegExp | null = null;
-  if (!literal) {
-    try {
-      const r = new RegExp(pattern);
-      // Drop g/y: JS keeps match state per regex, Python's re.search does not.
-      regex = new RegExp(r.source, r.flags.replace(/[gy]/g, ""));
-    } catch (err) {
-      throw new ToolError(`invalid regular expression ${JSON.stringify(pattern)}: ${errMsg(err)}`);
-    }
-  }
-  const limit = Math.min(maxResults, opts.searchMaxResults);
-  const matches: SearchMatch[] = [];
-  let truncated = false;
-  let filesScanned = 0;
-
-  const matchLine = (line: string): boolean => (literal ? line.includes(pattern) : regex !== null && regex.test(line));
-
-  const walk = async (dir: string): Promise<boolean> => {
-    let entries: Dirent[];
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    const byName = (a: Dirent, b: Dirent): number => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-    const subdirs = entries.filter((e) => e.isDirectory() && !e.isSymbolicLink()).sort(byName).map((e) => e.name);
-    const files = entries.filter((e) => !(e.isDirectory() && !e.isSymbolicLink())).sort(byName).map((e) => e.name);
-    for (const name of files) {
-      if (filesScanned >= opts.searchMaxFiles) {
-        truncated = true;
-        return true;
-      }
-      filesScanned += 1;
-      const fp = path.join(dir, name);
-      let lst;
-      try {
-        lst = await fs.lstat(fp);
-      } catch {
-        continue;
-      }
-      if (lst.isSymbolicLink()) continue;
-      if (lst.size > opts.searchMaxFileBytes) continue;
-      let text: string;
-      try {
-        const buf = await fs.readFile(fp);
-        if (buf.subarray(0, 8192).includes(0)) continue; // binary
-        text = utf8Fatal(buf);
-      } catch {
-        continue; // unreadable / invalid UTF-8 / vanished file
-      }
-      const lines = text.split(/\r\n|\r|\n/);
-      if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop(); // trailing newline
-      for (let i = 0; i < lines.length; i++) {
-        if (!matchLine(lines[i])) continue;
-        matches.push({
-          file: path.relative(root, fp).split(path.sep).join("/"),
-          line: i + 1,
-          text: lines[i].trim().slice(0, opts.lineMaxChars),
-        });
-        if (matches.length >= limit) {
-          truncated = true;
-          return true;
-        }
-      }
-    }
-    for (const name of subdirs) {
-      if (await walk(path.join(dir, name))) return true;
-    }
-    return false;
-  };
-
-  await walk(base);
-  return { matches, truncated };
 }

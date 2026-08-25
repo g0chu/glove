@@ -52,19 +52,14 @@ export interface WebToolsConfig {
 
 /**
  * File tool family (in-process): a persistent workspace directory on the
- * host that the bot can list/read/write/edit/search. All paths are
- * confined to the workspace (see src/tools/file/paths.ts).
+ * host that the bot can read/write/edit. All paths are confined to the
+ * workspace (see src/tools/file/paths.ts).
  */
 export interface FileToolsConfig {
   enabled: boolean;
   workspace: string;
   readMaxBytes: number;
   writeMaxBytes: number;
-  listMaxEntries: number;
-  searchMaxResults: number;
-  searchMaxFiles: number;
-  searchMaxFileBytes: number;
-  lineMaxChars: number;
 }
 
 /**
@@ -222,11 +217,6 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
         workspace: optional("FILETOOLS_WORKSPACE", "./workspace"),
         readMaxBytes: intEnv("FILETOOLS_READ_MAX_BYTES", 1_000_000, 1_024),
         writeMaxBytes: intEnv("FILETOOLS_WRITE_MAX_BYTES", 5_000_000, 1_024),
-        listMaxEntries: intEnv("FILETOOLS_LIST_MAX_ENTRIES", 500, 1),
-        searchMaxResults: intEnv("FILETOOLS_SEARCH_MAX_RESULTS", 500, 1),
-        searchMaxFiles: intEnv("FILETOOLS_SEARCH_MAX_FILES", 10_000, 1),
-        searchMaxFileBytes: intEnv("FILETOOLS_SEARCH_MAX_FILE_BYTES", 5_000_000, 1_024),
-        lineMaxChars: intEnv("FILETOOLS_LINE_MAX_CHARS", 500, 20),
       },
       shell: {
         enabled: boolEnv("SHELLTOOLS_ENABLED", false),

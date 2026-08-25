@@ -53,17 +53,12 @@ export function buildTools(cfg: Config): ToolsSetup {
       workspace: cfg.tools.file.workspace,
       readMaxBytes: cfg.tools.file.readMaxBytes,
       writeMaxBytes: cfg.tools.file.writeMaxBytes,
-      listMaxEntries: cfg.tools.file.listMaxEntries,
-      searchMaxResults: cfg.tools.file.searchMaxResults,
-      searchMaxFiles: cfg.tools.file.searchMaxFiles,
-      searchMaxFileBytes: cfg.tools.file.searchMaxFileBytes,
-      lineMaxChars: cfg.tools.file.lineMaxChars,
       maxResultChars: cfg.tools.maxResultChars,
     });
     clients.push(file);
     registerFileTools(registry, file);
     bullets.push(
-      "- file_list, file_read, file_write, file_edit, file_delete, file_search: manage the bot's persistent file workspace (paths are relative to its root; file_edit replaces an exact text span).",
+      "- file_read, file_write, file_edit: manage the bot's persistent file workspace (paths are relative to its root; file_edit replaces an exact text span).",
     );
     rules.push("Use the workspace for notes, drafts, and data that should survive across conversations.");
   }
