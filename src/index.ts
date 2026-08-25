@@ -20,7 +20,7 @@ async function main(): Promise<void> {
   const compaction = cfg.model.compactionEnabled;
   log.info(
     "config loaded:",
-    `guild=${cfg.discord.guildId}`,
+    cfg.discord.guildId !== "" ? `guild=${cfg.discord.guildId}` : "guilds=all",
     `model=${cfg.model.name}`,
     `endpoint=${cfg.model.apiUrl}`,
     `stream=${cfg.model.stream}`,
@@ -197,7 +197,11 @@ async function main(): Promise<void> {
 
   client.once("clientReady", () => {
     log.info(`connected as ${client.user?.tag} (id ${client.user?.id})`);
-    log.info(`responding to @mentions in guild ${cfg.discord.guildId}`);
+    log.info(
+      cfg.discord.guildId !== ""
+        ? `responding to @mentions in guild ${cfg.discord.guildId}`
+        : "responding to @mentions in any text channel of any guild the bot is in",
+    );
     if (cfg.model.enableImages) {
       log.info(
         `image input enabled (png/jpeg/webp/gif, max ${cfg.model.imagesMaxBytes} bytes per image)`,
