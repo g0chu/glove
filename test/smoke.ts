@@ -6,8 +6,8 @@
  * command (fresh-chat reset in both modes), queue semantics,
  * response writer behavior (incl.
  * multi-message streaming of long replies), the tool executor and tool
- * loop, the in-process web/file/zim tools (against a synthetic ZIM file
- * built in a temp dir), and the LLM client (stream +
+ * loop, the in-process web/file/shell/zim tools (against a synthetic ZIM
+ * file built in a temp dir), and the LLM client (stream +
  * non-stream + tool calls + errors + multimodal wire shape) against a
  * local mock OpenAI-compatible server. Run with: npm test
  */
@@ -38,6 +38,7 @@ import { extractTitle, extractContent } from "../src/tools/web/extract.js";
 import { searchDuckDuckGo } from "../src/tools/web/search.js";
 import { resolveInWorkspace } from "../src/tools/file/paths.js";
 import * as fileOps from "../src/tools/file/ops.js";
+import { ShellTools } from "../src/tools/shelltools.js";
 import { ZimReader } from "../src/tools/zim/reader.js";
 import { ZimTools, registerZimTools } from "../src/tools/zimtools.js";
 import { zstdCompressSync } from "node:zlib";
@@ -114,6 +115,9 @@ const ok = (name: string): void => {
     FILETOOLS_ENABLED: "true",
     FILETOOLS_WORKSPACE: "/tmp/ws",
     FILETOOLS_READ_MAX_BYTES: "4096",
+    SHELLTOOLS_ENABLED: "true",
+    SHELLTOOLS_TIMEOUT_S: "45",
+    SHELLTOOLS_MAX_OUTPUT_BYTES: "2048",
     TOOLS_MAX_RESULT_CHARS: "12345",
     TOOLS_MAX_ROUNDS: "7",
     DISCORD_SHOW_REASONING: "false",
@@ -134,6 +138,10 @@ const ok = (name: string): void => {
   assert.equal(tc.tools.file.workspace, "/tmp/ws");
   assert.equal(tc.tools.file.readMaxBytes, 4096);
   assert.equal(tc.tools.file.listMaxEntries, 500); // default
+  assert.equal(tc.tools.file.writeMaxBytes, 5_000_000); // default
+  assert.equal(tc.tools.shell.enabled, true);
+  assert.equal(tc.tools.shell.timeoutMs, 45000);
+  assert.equal(tc.tools.shell.maxOutputBytes, 2048);
   assert.equal(tc.tools.maxResultChars, 12345);
   assert.equal(tc.tools.maxRounds, 7);
   assert.equal(tc.model.compactionEnabled, false);
@@ -147,6 +155,9 @@ const ok = (name: string): void => {
   assert.equal(td.tools.web.enabled, false, "web tools off by default");
   assert.equal(td.tools.file.enabled, false, "file tools off by default");
   assert.equal(td.tools.file.workspace, "./workspace");
+  assert.equal(td.tools.shell.enabled, false, "shell tool off by default");
+  assert.equal(td.tools.shell.timeoutMs, 30000); // default
+  assert.equal(td.tools.shell.maxOutputBytes, 100_000); // default
   assert.equal(td.tools.web.searchMaxResults, 10); // default
   assert.equal(td.tools.maxResultChars, 200_000); // default
   assert.equal(td.tools.maxRounds, 5);
@@ -1626,7 +1637,7 @@ const ok = (name: string): void => {
 {
   // The system note advertises exactly the enabled families: the model
   // must never claim a tool that is not registered (the note used to be
-  // static, listing all three families even when only one was enabled).
+  // static, listing all four families even when only one was enabled).
   const base = {
     DISCORD_TOKEN: "t",
     DISCORD_GUILD_ID: "g",
@@ -1645,17 +1656,19 @@ const ok = (name: string): void => {
   assert.ok(!zimOnly.systemNote?.includes("web_search"), "web tools not advertised");
   assert.ok(!zimOnly.systemNote?.includes("web_fetch"), "web tools not advertised");
   assert.ok(!zimOnly.systemNote?.includes("file_"), "file tools not advertised");
+  assert.ok(!zimOnly.systemNote?.includes("shell_exec"), "shell tool not advertised");
   assert.ok(zimOnly.systemNote?.includes("Summarize tool results"), "the common rule stays");
   const { config: allCfg, errors: allErrs } = parseConfig({
     ...base,
     WEBTOOLS_ENABLED: "true",
     FILETOOLS_ENABLED: "true",
+    SHELLTOOLS_ENABLED: "true",
     ZIMTOOLS_ENABLED: "true",
     ZIM_FILE: "/tmp/wiki.zim",
   });
   assert.deepEqual(allErrs, []);
   const all = buildTools(allCfg);
-  assert.equal(all.registry.size, 10);
+  assert.equal(all.registry.size, 11);
   for (const name of [
     "web_search",
     "web_fetch",
@@ -1665,6 +1678,7 @@ const ok = (name: string): void => {
     "file_edit",
     "file_delete",
     "file_search",
+    "shell_exec",
     "wikipedia_search",
     "wikipedia_read",
   ]) {
@@ -1686,6 +1700,7 @@ const ok = (name: string): void => {
     '🔎 *web_search(query="quantum computing", n=5, …)*',
   );
   assert.equal(formatToolCall({ id: "a2", name: "file_read", arguments: '{"path":"notes.md"}' }), '📁 *file_read(path="notes.md")*');
+  assert.equal(formatToolCall({ id: "a5", name: "shell_exec", arguments: '{"command":"git status"}' }), '🐚 *shell_exec(command="git status")*');
   assert.equal(formatToolCall({ id: "a3", name: "mystery_tool", arguments: "not json" }), "🔧 *mystery_tool*", "unparseable args tolerated");
 
   const longUrl = "https://example.com/" + "x".repeat(200);
@@ -1958,6 +1973,42 @@ const ok = (name: string): void => {
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
+  }
+}
+
+// ------------------------------------------------------------ shell tools --
+// The in-process shell tool: commands run via /bin/sh in a temp workspace,
+// with a deadline and a combined output cap (exit code, stdout, stderr,
+// timeout kill, buffer-overflow kill, missing workdir).
+{
+  const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "glove-shelltest-")));
+  const tools = new ShellTools({ cwd: ws, timeoutMs: 2000, maxOutputBytes: 1000, maxResultChars: 50_000 });
+  try {
+    const out = await tools.exec("echo hello && echo world >&2", 10);
+    assert.ok(out.startsWith("$ echo hello && echo world >&2"), out);
+    assert.ok(out.includes("exit: 0"), out);
+    assert.ok(out.includes("stdout:\nhello"), out);
+    assert.ok(out.includes("stderr:\nworld"), out);
+    ok("shell: exit code, stdout and stderr reported");
+
+    const bad = await tools.exec("exit 3", 10);
+    assert.ok(bad.includes("exit: 3"), bad);
+    assert.ok(bad.includes("(no output)"), bad);
+    ok("shell: non-zero exit, no-output note");
+
+    const slow = await tools.exec("sleep 5", 1);
+    assert.ok(slow.includes("timed out after 1s (killed)"), slow);
+    ok("shell: deadline kills a slow command");
+
+    const flood = await tools.exec("yes | head -c 100000", 10);
+    assert.ok(flood.includes("output exceeded the 1000 byte cap (killed)"), flood);
+    ok("shell: output cap kills a chatty command, partial output returned");
+
+    const noWs = new ShellTools({ cwd: path.join(ws, "nope"), timeoutMs: 1000, maxOutputBytes: 1000, maxResultChars: 50_000 });
+    await assert.rejects(noWs.exec("true", 5), /does not exist/);
+    ok("shell: missing working directory refused");
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
   }
 }
 

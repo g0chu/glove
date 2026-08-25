@@ -73,9 +73,9 @@ npm run dev            # or: npm run build && npm start
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 
-## Tools (web search/fetch + file workspace + offline Wikipedia)
+## Tools (web search/fetch + file workspace + shell + offline Wikipedia)
 
-The bot can run three optional tool families, all **in-process** (no
+The bot can run four optional tool families, all **in-process** (no
 sidecars, no Docker). All are **opt-in** (default `false`) and need a model
 endpoint that supports function calling (`tools`). With all disabled, the bot
 behaves exactly as before. The model is only told about the families you
@@ -90,6 +90,12 @@ claims tools it does not have.
   `file_delete`, `file_search` over a persistent workspace. The workspace
   lives in **`./workspace`** next to the repo (gitignored) and survives
   restarts.
+- **shell tool**: `shell_exec` runs a shell command via `/bin/sh` in the
+  file workspace and returns the exit code plus capped stdout and stderr.
+  Use it for what the file tools cannot do — running programs, git,
+  package managers, scripts. Commands are **not** sandboxed; a per-command
+  deadline and an output cap keep a single call from hanging or flooding
+  the context.
 - **wikipedia tools**: `wikipedia_search` and `wikipedia_read` over a local
   **offline Wikipedia archive** (a ZIM file pointed to by `ZIM_FILE`, e.g.
   the en.wikipedia "all nopic" dump in `./workspace`). The reader works
@@ -108,9 +114,9 @@ channel history. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
 ### Setup
 
 Nothing to build or run — the tools live in the bot process. Just set
-`WEBTOOLS_ENABLED=true`, `FILETOOLS_ENABLED=true` and/or
-`ZIMTOOLS_ENABLED=true` (with `ZIM_FILE` pointing at a ZIM archive) in `.env`
-and restart the bot.
+`WEBTOOLS_ENABLED=true`, `FILETOOLS_ENABLED=true`, `SHELLTOOLS_ENABLED=true`
+and/or `ZIMTOOLS_ENABLED=true` (with `ZIM_FILE` pointing at a ZIM archive)
+in `.env` and restart the bot.
 
 ### Notes
 
@@ -120,6 +126,11 @@ and restart the bot.
   hop (max 5).
 - `file_edit` replaces an exact text span; `new_text` may be empty (deleting
   the span). Paths are confined to the workspace; symlink escapes are rejected.
+- `shell_exec` is not sandboxed: commands run in the file workspace, so
+  prefer read-only or workspace-local commands. `SHELLTOOLS_TIMEOUT_S`
+  (default 30) is the deadline per command (and the cap for the tool's
+  `timeout_s` argument); `SHELLTOOLS_MAX_OUTPUT_BYTES` (default 100000) caps
+  the combined stdout+stderr kept from one command.
 - The model endpoint must speak function calling (e.g. llama.cpp with a
   tool-supporting chat template). If the endpoint rejects `tools`, keep the
   `*_ENABLED` flags off.
@@ -142,4 +153,4 @@ See [.env.example](.env.example) for the documented list.
 | `npm run build` | compile TypeScript to `dist/` |
 | `npm start` | run the compiled bot |
 | `npm run typecheck` | type-check without emitting |
-| `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file/zim tools, LLM client incl. tool calls vs. a mock endpoint) |
+| `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file/shell/zim tools, LLM client incl. tool calls vs. a mock endpoint) |
