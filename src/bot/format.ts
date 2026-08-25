@@ -247,6 +247,19 @@ function convertMath(inner: string): string {
 const MATHISH_RE = /\\[a-zA-Z]|[_^]/;
 
 /**
+ * How many characters of model-provided content a one-line Discord activity
+ * message shows before truncating. Shared by the tool-call activity lines
+ * (tools/activity.ts) and the thinking terminal line (bot/writer.ts) so all
+ * activity lines truncate at the same length.
+ */
+export const ACTIVITY_CONTENT_MAX = 80;
+
+/** Truncate one chunk of activity content at the shared cap (77 chars + "…"). */
+export function truncateActivityContent(s: string): string {
+  return s.length > ACTIVITY_CONTENT_MAX ? s.slice(0, ACTIVITY_CONTENT_MAX - 3) + "…" : s;
+}
+
+/**
  * Rewrite LaTeX math in model output to plain Unicode text for Discord:
  * `$$...$$` display math is always converted; `$...$` inline spans are
  * converted only when their content looks like math (backslash commands,

@@ -1,4 +1,4 @@
-import { sanitizeForDiscord } from "../bot/format.js";
+import { sanitizeForDiscord, truncateActivityContent } from "../bot/format.js";
 import type { ToolCall } from "../llm/client.js";
 import { parseToolArgs } from "./executor.js";
 
@@ -25,7 +25,7 @@ function argValue(v: unknown): string {
     s = JSON.stringify(v) ?? String(v);
   }
   s = s.replace(/\*/g, "");
-  if (s.length > 80) s = s.slice(0, 77) + "…";
+  s = truncateActivityContent(s);
   return typeof v === "string" ? `"${s}"` : s;
 }
 
