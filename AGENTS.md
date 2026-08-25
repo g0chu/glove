@@ -4,7 +4,7 @@ Discord bot bridging guild text channels to any OpenAI-compatible Chat Completio
 
 ## 1. Project Overview & Architecture
 
-@mention the bot in a text channel of the configured guild and it forwards the channel's recent conversation to the model, streaming the answer back as a live-updating message. Every *trackable* message (human, text channel, target guild) enters the channel's conversation store on arrival; only *mentions* queue a turn.
+@mention the bot in a text channel of the configured guild (`DISCORD_GUILD_ID`; empty = any guild the bot is a member of) and it forwards the channel's recent conversation to the model, streaming the answer back as a live-updating message. Every *trackable* message (human, text channel, target guild) enters the channel's conversation store on arrival; only *mentions* queue a turn.
 
 - **Context** — `CONTEXT_COMPACTION_ENABLED` (default on):
   - **compaction** (`llm/context.ts`): per-channel in-memory context, seeded once with the channel's last N messages (live fetch, survives restarts), then only grows. When the token estimate (~4 chars/token) passes `CONTEXT_COMPACTION_MAX_TOKENS`, everything older than the newest `CONTEXT_COMPACTION_KEEP_MESSAGES` messages is folded into a model-written summary (one tool-less chat call to the same endpoint, sent as a *user* message, ≤4000 chars). The turn's mention is never folded or trimmed.
@@ -46,12 +46,12 @@ npm test                  # smoke tests (tsx test/smoke.ts)
 ```
 
 - **Done means green**: `npm test` **and** `npm run typecheck` — `tsx` does not typecheck, so a green test run proves nothing about types.
-- Required env: `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, `MODEL_API_URL`; everything else in `.env.example`.
+- Required env: `DISCORD_TOKEN`, `MODEL_API_URL`; `DISCORD_GUILD_ID` is optional (empty = respond in every text channel of every guild the bot is in); everything else in `.env.example`.
 
 ## 3. Testing Guidelines
 
 - Whole suite is `test/smoke.ts` via `npm test` — no framework, no selection, no config. Hermetic: mock OpenAI-compatible HTTP server on an ephemeral port, fake Discord channels, injected DNS/search backends, temp workspace dirs; no `.env`/Discord/network needed.
-- Plain `node:assert/strict`; `ok(name)` check groups (currently **102**); the final line prints the count.
+- Plain `node:assert/strict`; `ok(name)` check groups (currently **104**); the final line prints the count.
 - Async is driven with `ticks()` (`setImmediate`), not real sleeps.
 - In tests use the pure `parseConfig(env)`, never `loadConfig()` (calls `process.exit(1)`).
 - Web-tool tests use `WebToolsOptions.allowPrivate`/`resolver`/`searchFetch` — tests-only escape hatches, never enable in production.

@@ -17,10 +17,10 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
-import type { GuildTextBasedChannel } from "discord.js";
+import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
 import { ChannelHistory, ConversationStore, toRequestMessages } from "../src/llm/history.js";
-import { CLEAR_CONFIRMATION, isClearCommand } from "../src/bot/router.js";
+import { CLEAR_CONFIRMATION, isClearCommand, isTrackable } from "../src/bot/router.js";
 import { ChannelContext, COMPACTION_SYSTEM_PROMPT, estimateTokens } from "../src/llm/context.js";
 import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
 import { ChannelQueue } from "../src/bot/queue.js";
@@ -169,6 +169,14 @@ const ok = (name: string): void => {
   assert.ok(toolErrs.some((e) => e.includes("TOOLS_MAX_ROUNDS")), `got: ${toolErrs.join("; ")}`);
   assert.ok(toolErrs.some((e) => e.includes("TOOLS_MAX_RESULT_CHARS")), `got: ${toolErrs.join("; ")}`);
   ok("config: invalid tool env values rejected");
+
+  const { config: ga, errors: gaErrors } = parseConfig({
+    DISCORD_TOKEN: "t",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+  });
+  assert.deepEqual(gaErrors, []);
+  assert.equal(ga.discord.guildId, "", "no DISCORD_GUILD_ID -> respond in every guild");
+  ok("config: DISCORD_GUILD_ID is optional (empty = any guild the bot is in)");
 }
 
 // --------------------------------------------------------------- history --
@@ -254,6 +262,29 @@ const ok = (name: string): void => {
   assert.equal(isClearCommand("!reset", botId), false);
   assert.equal(isClearCommand("", botId), false);
   ok("clear: !clear detection (trimmed, case-insensitive, bot mentions stripped)");
+}
+
+// ------------------------------------------------------------- router --
+{
+  const botId = "bot1";
+  const fakeMsg = (guildId: string | null, channelType: number, bot = false): Message =>
+    ({
+      author: { bot },
+      guild: guildId === null ? null : { id: guildId },
+      channel: { type: channelType },
+    }) as unknown as Message;
+  // empty guild id: any guild's text channel is trackable, DMs are not
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText), botId, ""), true);
+  assert.equal(isTrackable(fakeMsg("999", ChannelType.GuildText), botId, ""), true, "another guild too");
+  assert.equal(isTrackable(fakeMsg(null, ChannelType.GuildText), botId, ""), false, "DMs are never tracked");
+  // a set guild id: only that guild is trackable
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText), botId, "123"), true);
+  assert.equal(isTrackable(fakeMsg("999", ChannelType.GuildText), botId, "123"), false, "other guilds are ignored");
+  assert.equal(isTrackable(fakeMsg(null, ChannelType.GuildText), botId, "123"), false, "DMs are never tracked");
+  // bots and non-text channels are never trackable
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText, true), botId, ""), false, "bot messages are never tracked");
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildVoice), botId, ""), false, "voice channels are ignored");
+  ok("router: isTrackable (empty guild id = any guild; DMs/bots/voice never tracked)");
 }
 
 // ----------------------------------------------------------------- split --

@@ -3,6 +3,7 @@ import "dotenv/config";
 export interface DiscordConfig {
   token: string;
   applicationId: string | null;
+  /** The single guild to act in; empty = every guild the bot is a member of. */
   guildId: string;
   typingIntervalMs: number;
   streamUpdateThrottleMs: number;
@@ -158,7 +159,9 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
   };
 
   const token = required("DISCORD_TOKEN");
-  const guildId = required("DISCORD_GUILD_ID");
+  // Optional: when empty the bot responds in every text channel of every
+  // guild it is a member of (DMs are never tracked).
+  const guildId = optional("DISCORD_GUILD_ID", "");
   const apiUrl = required("MODEL_API_URL");
   if (apiUrl) httpUrlOk("MODEL_API_URL", apiUrl);
 

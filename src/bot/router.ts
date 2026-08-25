@@ -2,7 +2,8 @@ import { ChannelType, type Message } from "discord.js";
 
 /**
  * A message is *trackable* when it is worth considering at all: it is in a
- * text channel of the target guild and was written by a human.
+ * text channel of the target guild(s) and was written by a human. An empty
+ * `guildId` means every guild the bot is a member of.
  *
  * Trackable messages come in two flavors:
  *  - mentions of the bot  -> start a turn (see queue.ts)
@@ -12,7 +13,8 @@ import { ChannelType, type Message } from "discord.js";
 export function isTrackable(message: Message, botId: string, guildId: string): boolean {
   if (message.author.bot) return false; // bots (incl. ourselves) are never tracked
   const guild = message.guild;
-  if (!guild || guild.id !== guildId) return false; // ignore other guilds / DMs
+  if (!guild) return false; // ignore DMs
+  if (guildId !== "" && guild.id !== guildId) return false; // ignore other guilds
   if (message.channel.type !== ChannelType.GuildText) return false; // text channels only
   return true;
 }

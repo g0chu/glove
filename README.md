@@ -1,9 +1,10 @@
 # Glove — Discord ↔ Chat Completions Bridge
 
-A Discord bot that bridges a server's text channels to any **OpenAI-compatible
+A Discord bot that bridges text channels to any **OpenAI-compatible
 Chat Completions endpoint**. @mention the bot in any text channel of the
-configured guild and it forwards the channel's recent conversation to the
-model, streaming the answer back as a live-updating message.
+configured guild — or of any guild it is in, when `DISCORD_GUILD_ID` is
+left empty — and it forwards the channel's recent conversation to the model,
+streaming the answer back as a live-updating message.
 
 ## Requirements
 
@@ -26,7 +27,9 @@ npm run dev            # or: npm run build && npm start
 ## Behavior
 
 - **Trigger:** the bot answers only when @mentioned (replies to its messages
-  count as mentions) in any text channel of `DISCORD_GUILD_ID`.
+  count as mentions) in any text channel of `DISCORD_GUILD_ID` — or of any
+  guild the bot is a member of when `DISCORD_GUILD_ID` is left empty (DMs
+  are never tracked).
 - **Memory:** per-channel sliding window of the last
   `MODEL_CONTEXT_MAX_MESSAGES` (default 20) messages; an optional
   `MODEL_SYSTEM_PROMPT` is prepended to every request. Every message in the
