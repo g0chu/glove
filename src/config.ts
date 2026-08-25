@@ -68,6 +68,19 @@ export interface FileToolsConfig {
 }
 
 /**
+ * Shell tool family (in-process): run one shell command via /bin/sh in
+ * the file workspace, with a per-command deadline and a combined
+ * stdout+stderr output cap (see src/tools/shelltools.ts).
+ */
+export interface ShellToolsConfig {
+  enabled: boolean;
+  /** Max deadline per command (ms). */
+  timeoutMs: number;
+  /** Max combined stdout+stderr bytes kept from one command. */
+  maxOutputBytes: number;
+}
+
+/**
  * ZIM tool family (in-process): search and read articles from a local
  * offline Wikipedia archive (a ZIM file on disk, see src/tools/zim/).
  */
@@ -84,6 +97,7 @@ export interface ZimToolsConfig {
 export interface ToolsConfig {
   web: WebToolsConfig;
   file: FileToolsConfig;
+  shell: ShellToolsConfig;
   zim: ZimToolsConfig;
   /** Max tool-execution rounds per turn before the turn is cut off. */
   maxRounds: number;
@@ -191,9 +205,9 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
     },
     tools: {
       // Off by default: not every Chat Completions endpoint supports
-      // function calling. Both families run in-process, so enabling one
-      // only needs the env vars below (and, for file tools, the workspace
-      // directory on disk).
+      // function calling. All families run in-process, so enabling one
+      // only needs the env vars below (and, for the file and shell tools,
+      // the workspace directory on disk).
       web: {
         enabled: boolEnv("WEBTOOLS_ENABLED", false),
         timeoutMs: intEnv("WEBTOOLS_TIMEOUT_S", 90, 1) * 1000,
@@ -213,6 +227,11 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
         searchMaxFiles: intEnv("FILETOOLS_SEARCH_MAX_FILES", 10_000, 1),
         searchMaxFileBytes: intEnv("FILETOOLS_SEARCH_MAX_FILE_BYTES", 5_000_000, 1_024),
         lineMaxChars: intEnv("FILETOOLS_LINE_MAX_CHARS", 500, 20),
+      },
+      shell: {
+        enabled: boolEnv("SHELLTOOLS_ENABLED", false),
+        timeoutMs: intEnv("SHELLTOOLS_TIMEOUT_S", 30, 1) * 1000,
+        maxOutputBytes: intEnv("SHELLTOOLS_MAX_OUTPUT_BYTES", 100_000, 1_024),
       },
       zim: {
         enabled: boolEnv("ZIMTOOLS_ENABLED", false),

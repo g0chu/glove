@@ -1,6 +1,7 @@
 import type { Config } from "../config.js";
 import { ToolRegistry } from "./executor.js";
 import { FileTools, registerFileTools } from "./filetools.js";
+import { ShellTools, registerShellTools } from "./shelltools.js";
 import { WebTools, registerWebTools } from "./webtools.js";
 import { ZimTools, registerZimTools } from "./zimtools.js";
 
@@ -65,6 +66,20 @@ export function buildTools(cfg: Config): ToolsSetup {
       "- file_list, file_read, file_write, file_edit, file_delete, file_search: manage the bot's persistent file workspace (paths are relative to its root; file_edit replaces an exact text span).",
     );
     rules.push("Use the workspace for notes, drafts, and data that should survive across conversations.");
+  }
+  if (cfg.tools.shell.enabled) {
+    const shell = new ShellTools({
+      cwd: cfg.tools.file.workspace,
+      timeoutMs: cfg.tools.shell.timeoutMs,
+      maxOutputBytes: cfg.tools.shell.maxOutputBytes,
+      maxResultChars: cfg.tools.maxResultChars,
+    });
+    clients.push(shell);
+    registerShellTools(registry, shell);
+    bullets.push(
+      "- shell_exec: run a shell command in the bot's file workspace via /bin/sh (returns the exit code plus stdout and stderr, capped). Use for what the file tools cannot do: running programs, git, package managers, scripts.",
+    );
+    rules.push("shell_exec is not sandboxed: prefer read-only or workspace-local commands and never run destructive commands without the user asking.");
   }
   if (cfg.tools.zim.enabled) {
     const zim = new ZimTools({
