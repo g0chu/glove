@@ -38,6 +38,14 @@ export interface FetchImagesOptions {
    * fetch is trusted to guard its own URLs. Never set in production.
    */
   fetchImpl?: ImageFetch;
+  /**
+   * When true, non-image attachments are skipped silently instead of
+   * leaving an "unsupported type" note: the file pipeline (file contents
+   * enabled) owns them, and noting them here would report the same
+   * attachment twice. Default (false) keeps the classic behavior: every
+   * attachment that is not a supported image type leaves a note.
+   */
+  skipNonImages?: boolean;
 }
 
 /** Only Discord's own CDN is a trusted attachment source. */
@@ -56,7 +64,8 @@ export function isDiscordCdnUrl(url: string): boolean {
   }
 }
 
-function humanBytes(n: number): string {
+/** A byte count as a human-readable size (e.g. "1 KB", "2.5 MB"). */
+export function humanBytes(n: number): string {
   if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
   return `${Math.ceil(n / 1024)} KB`;
 }
@@ -64,7 +73,10 @@ function humanBytes(n: number): string {
 /**
  * Download the image attachments of one message for the model. Never
  * throws: every problem (unsupported type, non-CDN URL, oversized file,
- * HTTP failure, timeout) becomes a one-line note instead.
+ * HTTP failure, timeout) becomes a one-line note instead. With
+ * `skipNonImages` set, non-image attachments are the file pipeline's job
+ * and are skipped silently (no note) — the pipelines are mutually
+ * exclusive per attachment type.
  */
 export async function fetchMessageImages(
   attachments: Iterable<MessageAttachmentLike>,
@@ -79,13 +91,16 @@ export async function fetchMessageImages(
   };
   let attempted = 0;
   for (const att of attachments) {
-    if (attempted >= MAX_IMAGES_PER_MESSAGE) {
-      note(att, `more than ${MAX_IMAGES_PER_MESSAGE} images per message`);
-      continue;
-    }
     const mime = SUPPORTED_IMAGE_TYPES[att.contentType ?? ""];
     if (!mime) {
-      note(att, `unsupported type ${att.contentType ?? "unknown"}`);
+      // Non-image attachment: the file pipeline's job when it runs (the
+      // caller sets skipNonImages) — noting it here would report the same
+      // attachment twice.
+      if (!opts.skipNonImages) note(att, `unsupported type ${att.contentType ?? "unknown"}`);
+      continue;
+    }
+    if (attempted >= MAX_IMAGES_PER_MESSAGE) {
+      note(att, `more than ${MAX_IMAGES_PER_MESSAGE} images per message`);
       continue;
     }
     if (!opts.fetchImpl && !isDiscordCdnUrl(att.url)) {

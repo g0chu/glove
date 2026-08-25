@@ -25,6 +25,7 @@ async function main(): Promise<void> {
     `endpoint=${cfg.model.apiUrl}`,
     `stream=${cfg.model.stream}`,
     `images=${cfg.model.enableImages}`,
+    `files=${cfg.model.enableFileContents}`,
     `window=${cfg.model.contextMaxMessages}`,
     compaction
       ? `compaction=on (budget ~${cfg.model.compactionMaxTokens} est. tokens, keep ${cfg.model.compactionKeepMessages})`
@@ -117,6 +118,8 @@ async function main(): Promise<void> {
         maxMessages: cfg.model.contextMaxMessages,
         enableImages: cfg.model.enableImages,
         imagesMaxBytes: cfg.model.imagesMaxBytes,
+        enableFileContents: cfg.model.enableFileContents,
+        fileContentsMaxBytes: cfg.model.fileContentsMaxBytes,
         compaction: compaction
           ? {
               maxTokens: cfg.model.compactionMaxTokens,
@@ -205,6 +208,11 @@ async function main(): Promise<void> {
     if (cfg.model.enableImages) {
       log.info(
         `image input enabled (png/jpeg/webp/gif, max ${cfg.model.imagesMaxBytes} bytes per image)`,
+      );
+    }
+    if (cfg.model.enableFileContents) {
+      log.info(
+        `file contents enabled (non-image attachments inlined, max ${cfg.model.fileContentsMaxBytes} bytes per file)`,
       );
     }
   });

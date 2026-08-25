@@ -20,6 +20,10 @@ export interface ModelConfig {
   enableImages: boolean;
   /** Max bytes per downloaded image attachment (bigger ones are skipped). */
   imagesMaxBytes: number;
+  /** When true, the text content of non-image attachments is inlined into the context. */
+  enableFileContents: boolean;
+  /** Max bytes per downloaded file attachment (bigger ones are skipped). */
+  fileContentsMaxBytes: number;
   stream: boolean;
   systemPrompt: string;
   /** Last-N seed size / image window (and the sliding window in classic mode). */
@@ -190,6 +194,8 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       name: optional("MODEL_NAME", "local"),
       enableImages: boolEnv("MODEL_ENABLE_IMAGES", false),
       imagesMaxBytes: intEnv("MODEL_IMAGES_MAX_BYTES", 10_485_760, 1024),
+      enableFileContents: boolEnv("MODEL_ENABLE_FILE_CONTENTS", false),
+      fileContentsMaxBytes: intEnv("MODEL_FILE_CONTENT_MAX_BYTES", 1_000_000, 1024),
       stream: boolEnv("MODEL_STREAM", true),
       systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),

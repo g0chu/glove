@@ -3,6 +3,7 @@ import type { ChatMessage, ContentPart } from "../llm/client.js";
 import { BOT_REPLY_GROUP_GAP_MS, type ChannelContext, type SeedEntry } from "../llm/context.js";
 import { ChannelHistory, speakerLabel, toRequestMessages } from "../llm/history.js";
 import { errMsg, log } from "../log.js";
+import { fetchMessageFiles, type FileFetch } from "./files.js";
 import {
   fetchMessageImages,
   isImageAttachment,
@@ -66,6 +67,12 @@ export interface ContextOptions {
   imagesMaxBytes: number;
   /** Test-only: inject the image fetch (production uses the native one). */
   imageFetch?: ImageFetch;
+  /** When true, the text content of non-image attachments is inlined into the context. */
+  enableFileContents: boolean;
+  /** Max bytes per downloaded file attachment (bigger ones are skipped). */
+  fileContentsMaxBytes: number;
+  /** Test-only: inject the file fetch (production uses the native one). */
+  fileFetch?: FileFetch;
   /** Set = compaction mode (persistent per-channel context); unset = the classic live fetch. */
   compaction?: CompactionOptions;
   /**
@@ -77,7 +84,12 @@ export interface ContextOptions {
   resetAfter?: string | null;
 }
 
-/** One conversation entry: exactly one Discord message (or one bot reply). */
+/**
+ * One conversation entry: exactly one Discord message (or one bot reply).
+ * Inlined file-content blocks (when file contents are enabled) are folded
+ * into `text` at construction time — the entry's text is the whole body the
+ * model sees.
+ */
 interface ContextEntry {
   role: "user" | "assistant";
   text: string;
@@ -123,8 +135,13 @@ const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚|🧹) \*/;
  *    what; the bot's own replies are unlabeled — the assistant role is the
  *    identity;
  *  - image attachments (png/jpeg/webp/gif) become image_url parts when
- *    images are enabled; a skipped attachment leaves a one-line note;
- *  - messages that carry no text and no images are dropped;
+ *    images are enabled; a skipped image leaves a one-line note (when file
+ *    contents are enabled, non-image attachments belong to the file
+ *    pipeline and are not noted here);
+ *  - non-image attachments are downloaded and inlined as labeled, fenced
+ *    blocks when file contents are enabled (a skipped attachment leaves a
+ *    one-line note);
+ *  - messages that carry no text, no images, and no file blocks are dropped;
  *  - a `resetAfter` boundary (the `!clear` command's message id) drops
  *    every message up to and including it; when the boundary is not among
  *    the fetched messages, the clear fell out of the last-N window and
@@ -182,7 +199,10 @@ async function buildCompactedContext(
     // fetch failed: the context keeps working from what arrived, and the
     // seed is retried on the next turn
   }
-  if (context.estimateTokens(opts.systemPrompt, opts.maxMessages) > c.maxTokens) {
+  // File contents add a per-attachment cost to the estimate (their size,
+  // capped at the download limit); undefined = the feature is off.
+  const fileCost = opts.enableFileContents ? opts.fileContentsMaxBytes : undefined;
+  if (context.estimateTokens(opts.systemPrompt, opts.maxMessages, fileCost) > c.maxTokens) {
     const res = await context.compact(c.keepMessages, c.summarize, mentionId);
     if (res.ok) {
       log.info(
@@ -192,7 +212,7 @@ async function buildCompactedContext(
       log.warn(
         `context compaction did not apply (${res.reason}); trimming the oldest messages to fit the budget`,
       );
-      context.emergencyTrim(mentionId, c.maxTokens, opts.systemPrompt, opts.maxMessages);
+      context.emergencyTrim(mentionId, c.maxTokens, opts.systemPrompt, opts.maxMessages, fileCost);
     }
   }
   return contextToMessages(context, opts);
@@ -238,12 +258,17 @@ function toSeedEntry(m: MessageLike, botId: string): SeedEntry | null {
  * unlabeled — the role is the identity. Image attachments of the newest
  * `maxMessages` entries become image_url parts (a skipped attachment leaves
  * a one-line note); older image attachments leave a note instead of being
- * re-downloaded every turn. Entries that carry no text and no images are
- * dropped.
+ * re-downloaded every turn. Non-image attachments of those entries are
+ * downloaded and inlined as labeled, fenced blocks when file contents are
+ * enabled (older ones leave a note instead). Entries that carry no text,
+ * no images, and no file blocks are dropped.
  */
 export async function contextToMessages(
   context: ChannelContext,
-  opts: Pick<ContextOptions, "systemPrompt" | "maxMessages" | "enableImages" | "imagesMaxBytes" | "imageFetch">,
+  opts: Pick<
+    ContextOptions,
+    "systemPrompt" | "maxMessages" | "enableImages" | "imagesMaxBytes" | "imageFetch" | "enableFileContents" | "fileContentsMaxBytes" | "fileFetch"
+  >,
 ): Promise<ChatMessage[]> {
   const out: ChatMessage[] = [];
   if (opts.systemPrompt.trim().length > 0) out.push({ role: "system", content: opts.systemPrompt });
@@ -259,11 +284,15 @@ export async function contextToMessages(
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     const images: AttachmentImage[] = [];
+    const files: string[] = [];
     const notes: string[] = [];
     if (opts.enableImages) {
       if (i >= imageWindowStart) {
         const res = await fetchMessageImages(e.attachments, opts.imagesMaxBytes, {
           fetchImpl: opts.imageFetch,
+          // With file contents on, non-image attachments are the file
+          // pipeline's job (no "unsupported type" notes for them).
+          skipNonImages: opts.enableFileContents,
         });
         images.push(...res.images);
         notes.push(...res.notes);
@@ -272,6 +301,22 @@ export async function contextToMessages(
         for (const att of e.attachments) {
           if (isImageAttachment(att)) {
             notes.push(`*[attachment "${att.name}" not sent: older than the image window]*`);
+          }
+        }
+      }
+    }
+    if (opts.enableFileContents) {
+      if (i >= imageWindowStart) {
+        const res = await fetchMessageFiles(e.attachments, opts.fileContentsMaxBytes, {
+          fetchImpl: opts.fileFetch,
+        });
+        files.push(...res.files.map((f) => f.text));
+        notes.push(...res.notes);
+      } else {
+        // Outside the file window: a note instead of re-downloading every turn.
+        for (const att of e.attachments) {
+          if (!isImageAttachment(att)) {
+            notes.push(`*[attachment "${att.name}" not sent: older than the file window]*`);
           }
         }
       }
@@ -285,8 +330,8 @@ export async function contextToMessages(
         : label
           ? `${label}:`
           : "";
-    const body = [text, ...notes].filter((s) => s.length > 0).join("\n");
-    if (body.length === 0 && images.length === 0) continue; // carries nothing
+    const body = [text, ...files, ...notes].filter((s) => s.length > 0).join("\n");
+    if (body.length === 0 && images.length === 0 && files.length === 0) continue; // carries nothing
     if (images.length === 0) {
       if (body.length > 0) out.push({ role: e.role, content: body });
     } else {
@@ -336,10 +381,10 @@ export async function contextFromMessages(
   // consecutive own messages: group the close-together ones back into one
   // assistant entry (the live stores keep a chunked reply as one entry,
   // one id per chunk). The assistant role says who, so it is not labeled.
-  let group: { texts: string[]; images: AttachmentImage[]; notes: string[] } | null = null;
+  let group: { texts: string[]; images: AttachmentImage[]; files: string[]; notes: string[] } | null = null;
   const flushGroup = (): void => {
     if (!group) return;
-    const body = [group.texts.join("\n"), ...group.notes].filter((s) => s.length > 0).join("\n");
+    const body = [group.texts.join("\n"), ...group.files, ...group.notes].filter((s) => s.length > 0).join("\n");
     if (body.length > 0 || group.images.length > 0) {
       entries.push({ role: "assistant", text: body, images: group.images });
     }
@@ -364,26 +409,38 @@ export async function contextFromMessages(
 
     const text = stripMentionText(m.content, opts.botId);
     const images: AttachmentImage[] = [];
+    const files: string[] = [];
     const notes: string[] = [];
     if (opts.enableImages) {
       const res = await fetchMessageImages(m.attachments.values(), opts.imagesMaxBytes, {
         fetchImpl: opts.imageFetch,
+        // With file contents on, non-image attachments are the file
+        // pipeline's job (no "unsupported type" notes for them).
+        skipNonImages: opts.enableFileContents,
       });
       images.push(...res.images);
       notes.push(...res.notes);
     }
+    if (opts.enableFileContents) {
+      const res = await fetchMessageFiles(m.attachments.values(), opts.fileContentsMaxBytes, {
+        fetchImpl: opts.fileFetch,
+      });
+      files.push(...res.files.map((f) => f.text));
+      notes.push(...res.notes);
+    }
     if (own) {
-      if (text.length === 0 && images.length === 0) continue; // carries nothing
+      if (text.length === 0 && images.length === 0 && files.length === 0) continue; // carries nothing
       if (group === null || m.createdTimestamp - lastTs > BOT_REPLY_GROUP_GAP_MS) flushGroup();
-      group ??= { texts: [], images: [], notes: [] };
+      group ??= { texts: [], images: [], files: [], notes: [] };
       group.texts.push(text);
       group.images.push(...images);
+      group.files.push(...files);
       group.notes.push(...notes);
       lastTs = m.createdTimestamp;
       continue;
     }
     flushGroup();
-    const body = [text, ...notes].filter((s) => s.length > 0).join("\n");
+    const body = [text, ...files, ...notes].filter((s) => s.length > 0).join("\n");
     if (body.length === 0 && images.length === 0) continue; // carries nothing
     // Who said what: prefix the author's display name (a "(bot)" marker for
     // other bots); an image-only message is just the label.
