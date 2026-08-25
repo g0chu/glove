@@ -1,15 +1,7 @@
 import type { ToolSpec } from "../llm/client.js";
 import type { ToolRegistry } from "./executor.js";
-import { argInt, argOptionalString, argString } from "./executor.js";
-import {
-  deletePath,
-  editFile,
-  listFiles,
-  readFile,
-  searchFiles,
-  writeFile,
-  type FileOpsOptions,
-} from "./file/ops.js";
+import { argInt, argString } from "./executor.js";
+import { editFile, readFile, writeFile, type FileOpsOptions } from "./file/ops.js";
 
 /** String argument that must be present (may be empty, e.g. deleting text). */
 function argPresentString(args: Record<string, unknown>, key: string): string {
@@ -17,10 +9,6 @@ function argPresentString(args: Record<string, unknown>, key: string): string {
   if (v === undefined || v === null) throw new Error(`missing required argument "${key}"`);
   if (typeof v !== "string") throw new Error(`argument "${key}" must be a string`);
   return v;
-}
-
-function asString(v: unknown): string {
-  return typeof v === "string" ? v : "";
 }
 
 function asBool(v: unknown): boolean {
@@ -35,10 +23,10 @@ export interface FileToolsOptions extends FileOpsOptions {
 }
 
 /**
- * In-process file tools: file management in a persistent workspace
- * directory on the bot's host. Every path is resolved and confined to the
- * workspace (see file/paths.ts); the operations and their caps live in
- * file/ops.ts. No sidecar, no HTTP hop.
+ * In-process file tools: read, write and edit files in a persistent
+ * workspace directory on the bot's host. Every path is resolved and
+ * confined to the workspace (see file/paths.ts); the operations and their
+ * caps live in file/ops.ts. No sidecar, no HTTP hop.
  */
 export class FileTools {
   constructor(private readonly opts: FileToolsOptions) {}
@@ -48,22 +36,6 @@ export class FileTools {
     return text.length > this.opts.maxResultChars
       ? `${text.slice(0, this.opts.maxResultChars)}\n…[truncated]`
       : text;
-  }
-
-  /** List a directory (default: workspace root). */
-  async list(path: string | undefined): Promise<string> {
-    const data = await listFiles(this.opts.workspace, path, this.opts.listMaxEntries);
-    const entries = data.entries;
-    if (entries.length === 0) return this.cap(`Directory "${data.path || "."}" is empty.`);
-    const lines = entries.map((e) => {
-      const name = asString(e.name);
-      if (e.type === "dir") return `- [dir] ${name}/`;
-      const size = e.size == null ? "" : ` ${e.size} B`;
-      const mtime = e.mtime ? `  modified ${e.mtime}` : "";
-      return `- ${name}${size}${mtime}`;
-    });
-    const more = data.truncated ? `\n(listing truncated at ${entries.length} entries)` : "";
-    return this.cap(`Directory listing of "${data.path || "."}" (${entries.length} entries):\n${lines.join("\n")}${more}`);
   }
 
   /** Read a text file (with offset/limit for large files). */
@@ -93,39 +65,11 @@ export class FileTools {
     return `Replaced ${data.replacements} occurrence(s) in "${data.path || path}".`;
   }
 
-  /** Delete a file or directory tree. */
-  async remove(path: string): Promise<string> {
-    const data = await deletePath(this.opts.workspace, path);
-    return `Deleted ${data.deleted === "dir" ? "directory" : "file"} "${data.path || path}".`;
-  }
-
-  /** Search file contents for a pattern (regex or literal). */
-  async search(pattern: string, path: string | undefined, literal: boolean, maxResults: number): Promise<string> {
-    const data = await searchFiles(this.opts.workspace, path, pattern, literal, maxResults, this.opts);
-    const matches = data.matches;
-    if (matches.length === 0) return this.cap(`No matches for ${literal ? "text" : "pattern"} "${pattern}".`);
-    const lines = matches.map((m) => `${m.file}:${m.line}: ${m.text.trim()}`);
-    const more = data.truncated ? `\n(more matches exist — narrow the pattern or path)` : "";
-    return this.cap(`${matches.length} match(es) for "${pattern}":\n${lines.join("\n")}${more}`);
-  }
-
   /** No-op: local filesystem operations run to completion, nothing to cancel. */
   abort(): void {}
 }
 
 /** OpenAI-compatible function specs for the file tools. */
-export const FILE_LIST_SPEC: ToolSpec = {
-  name: "file_list",
-  description: "List the bot's persistent file workspace (a directory that survives restarts). Returns entries with type, size, and modification time.",
-  parameters: {
-    type: "object",
-    properties: {
-      path: { type: "string", description: "Directory relative to the workspace root (default: root)." },
-    },
-    additionalProperties: false,
-  },
-};
-
 export const FILE_READ_SPEC: ToolSpec = {
   name: "file_read",
   description: "Read a text file from the workspace. Large files can be read in windows with offset/limit (byte offsets).",
@@ -172,38 +116,8 @@ export const FILE_EDIT_SPEC: ToolSpec = {
   },
 };
 
-export const FILE_DELETE_SPEC: ToolSpec = {
-  name: "file_delete",
-  description: "Delete a file or directory tree from the workspace. This cannot be undone.",
-  parameters: {
-    type: "object",
-    properties: {
-      path: { type: "string", description: "Path relative to the workspace root." },
-    },
-    required: ["path"],
-    additionalProperties: false,
-  },
-};
-
-export const FILE_SEARCH_SPEC: ToolSpec = {
-  name: "file_search",
-  description: "Search the contents of files in the workspace for a pattern. Returns matching lines with file and line number.",
-  parameters: {
-    type: "object",
-    properties: {
-      pattern: { type: "string", description: "Regular expression to search for." },
-      path: { type: "string", description: "Subdirectory to search in, relative to the workspace root (default: root)." },
-      literal: { type: "boolean", description: "Treat the pattern as a literal string, not a regex (default false)." },
-      max_results: { type: "integer", description: "Maximum matches to return (1-500, default 100)." },
-    },
-    required: ["pattern"],
-    additionalProperties: false,
-  },
-};
-
 /** Register the file tools on a registry, bound to one FileTools. */
 export function registerFileTools(registry: ToolRegistry, tools: FileTools): void {
-  registry.register(FILE_LIST_SPEC, (args) => tools.list(argOptionalString(args, "path")));
   registry.register(FILE_READ_SPEC, (args) =>
     tools.read(
       argString(args, "path"),
@@ -216,14 +130,5 @@ export function registerFileTools(registry: ToolRegistry, tools: FileTools): voi
   );
   registry.register(FILE_EDIT_SPEC, (args) =>
     tools.edit(argString(args, "path"), argString(args, "old_text"), argPresentString(args, "new_text"), asBool(args.replace_all)),
-  );
-  registry.register(FILE_DELETE_SPEC, (args) => tools.remove(argString(args, "path")));
-  registry.register(FILE_SEARCH_SPEC, (args) =>
-    tools.search(
-      argString(args, "pattern"),
-      argOptionalString(args, "path"),
-      asBool(args.literal),
-      argInt(args, "max_results", 100, 1, 500),
-    ),
   );
 }

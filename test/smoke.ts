@@ -137,7 +137,6 @@ const ok = (name: string): void => {
   assert.equal(tc.tools.file.enabled, true);
   assert.equal(tc.tools.file.workspace, "/tmp/ws");
   assert.equal(tc.tools.file.readMaxBytes, 4096);
-  assert.equal(tc.tools.file.listMaxEntries, 500); // default
   assert.equal(tc.tools.file.writeMaxBytes, 5_000_000); // default
   assert.equal(tc.tools.shell.enabled, true);
   assert.equal(tc.tools.shell.timeoutMs, 45000);
@@ -1668,16 +1667,13 @@ const ok = (name: string): void => {
   });
   assert.deepEqual(allErrs, []);
   const all = buildTools(allCfg);
-  assert.equal(all.registry.size, 11);
+  assert.equal(all.registry.size, 8);
   for (const name of [
     "web_search",
     "web_fetch",
-    "file_list",
     "file_read",
     "file_write",
     "file_edit",
-    "file_delete",
-    "file_search",
     "shell_exec",
     "wikipedia_search",
     "wikipedia_read",
@@ -1850,11 +1846,6 @@ const ok = (name: string): void => {
     const ops: fileOps.FileOpsOptions = {
       readMaxBytes: 1000,
       writeMaxBytes: 10,
-      listMaxEntries: 100,
-      searchMaxResults: 500,
-      searchMaxFiles: 10_000,
-      searchMaxFileBytes: 100_000,
-      lineMaxChars: 500,
     };
 
     // -- write
@@ -1864,24 +1855,6 @@ const ok = (name: string): void => {
     await assert.rejects(fileOps.writeFile(ws, "notes/a.txt", "x".repeat(11), true, 10), /write cap/);
     await assert.rejects(fileOps.writeFile(ws, "notes", "x", true, 10), /overwrite a directory/);
     ok("file write: create_dirs, cap, directory guard");
-
-    // -- list
-    fs.writeFileSync(path.join(ws, "top.txt"), "top");
-    const listing = await fileOps.listFiles(ws, undefined, ops.listMaxEntries);
-    assert.equal(listing.path, ".");
-    assert.deepEqual(
-      listing.entries.map((e) => `${e.name}:${e.type}`),
-      ["link:dir", "notes:dir", "sub:dir", "top.txt:file"],
-    );
-    const noteListing = await fileOps.listFiles(ws, "notes", ops.listMaxEntries);
-    assert.equal(noteListing.path, "notes");
-    assert.equal(noteListing.entries.length, 1);
-    assert.equal(noteListing.entries[0].name, "a.txt");
-    assert.ok(typeof noteListing.entries[0].size === "number");
-    assert.ok(noteListing.entries[0].mtime?.includes("UTC") ?? false);
-    await assert.rejects(fileOps.listFiles(ws, "notes/a.txt", ops.listMaxEntries), /not a directory/);
-    await assert.rejects(fileOps.listFiles(ws, "missing", ops.listMaxEntries), /not a directory/);
-    ok("file list: dirs-first, size/mtime, path display, errors");
 
     // -- read
     fs.writeFileSync(path.join(ws, "big.txt"), "abcdef");
@@ -1936,40 +1909,6 @@ const ok = (name: string): void => {
     await assert.rejects(fileOps.editFile(ws, "ecap.txt", "ab", "a".repeat(11), false, 1000, 10), /write cap/);
     assert.equal(fs.readFileSync(path.join(ws, "ecap.txt"), "utf8"), "ab", "rejected edit leaves the file untouched");
     ok("file edit: exact span, replace_all, empty new_text, caps, errors");
-
-    // -- delete
-    fs.writeFileSync(path.join(ws, "del.txt"), "x");
-    assert.equal((await fileOps.deletePath(ws, "del.txt")).deleted, "file");
-    fs.mkdirSync(path.join(ws, "tree"));
-    fs.writeFileSync(path.join(ws, "tree", "f.txt"), "x");
-    assert.equal((await fileOps.deletePath(ws, "tree")).deleted, "dir");
-    assert.ok(!fs.existsSync(path.join(ws, "tree")));
-    await assert.rejects(fileOps.deletePath(ws, ""), /workspace root/);
-    await assert.rejects(fileOps.deletePath(ws, "nope"), /not found/);
-    ok("file delete: file, directory tree, root guard, errors");
-
-    // -- search
-    fs.writeFileSync(path.join(ws, "s1.txt"), "alpha\nbeta alpha\n");
-    fs.mkdirSync(path.join(ws, "sdir"));
-    fs.writeFileSync(path.join(ws, "sdir", "s2.txt"), "alpha gamma\n");
-    const found = await fileOps.searchFiles(ws, undefined, "alpha", false, 100, ops);
-    assert.deepEqual(
-      found.matches.map((m) => `${m.file}:${m.line}`),
-      ["s1.txt:1", "s1.txt:2", "sdir/s2.txt:1"],
-    );
-    const literal = await fileOps.searchFiles(ws, undefined, "a.l+", true, 100, ops);
-    assert.equal(literal.matches.length, 0); // literal: no regex metachars
-    const anchored = await fileOps.searchFiles(ws, undefined, "^alpha", false, 100, ops);
-    assert.deepEqual(
-      anchored.matches.map((m) => `${m.file}:${m.line}`),
-      ["s1.txt:1", "sdir/s2.txt:1"],
-    );
-    const cappedResults = await fileOps.searchFiles(ws, undefined, "alpha", false, 2, ops);
-    assert.equal(cappedResults.matches.length, 2);
-    assert.ok(cappedResults.truncated);
-    await assert.rejects(fileOps.searchFiles(ws, undefined, "[", false, 10, ops), /invalid regular expression/);
-    await assert.rejects(fileOps.searchFiles(ws, "s1.txt", "alpha", false, 10, ops), /not a directory/);
-    ok("file search: walk order, literal vs regex, capping, invalid pattern");
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });

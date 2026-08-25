@@ -86,10 +86,9 @@ claims tools it does not have.
   pinned-socket HTTP fetch with SSRF protection, content extraction, and a
   TTL-bounded result cache). No browser rendering, so JavaScript-heavy pages
   may come back incomplete.
-- **file tools**: `file_list`, `file_read`, `file_write`, `file_edit`,
-  `file_delete`, `file_search` over a persistent workspace. The workspace
-  lives in **`./workspace`** next to the repo (gitignored) and survives
-  restarts.
+- **file tools**: `file_read`, `file_write` and `file_edit` over a
+  persistent workspace. The workspace lives in **`./workspace`** next to the
+  repo (gitignored) and survives restarts.
 - **shell tool**: `shell_exec` runs a shell command via `/bin/sh` in the
   file workspace and returns the exit code plus capped stdout and stderr.
   Use it for what the file tools cannot do — running programs, git,
