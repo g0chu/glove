@@ -44,15 +44,19 @@ npm run dev            # or: npm run build && npm start
   model's streamed reasoning ("🤔 *thinking: …*" — the whole thinking while
   it fits, then a "N lines hidden" line + the last 5 lines, capped at 2000
   chars) when the endpoint sends reasoning deltas (`DISCORD_SHOW_REASONING`,
-   default on). When the reply starts, that message completes in place into a
-   "🤔 *thought for Ns*" line that stays above the reply, which streams in
-   its own message (with `MODEL_STREAM=false` the line completes when the
-   reply is ready and the reply posts as a separate message). The reasoning
-   text is never posted or recorded. Tool
-  activity is different: each tool call is posted as its own **persistent** short
-  message ("🔎 *web_search(query=\"…\")*" — name + arguments only, results
-  never shown; `DISCORD_SHOW_TOOL_ACTIVITY`, default on). These are bot
-  messages and never enter the channel context.
+   default on). When the reply starts — or when a tool-call round ends, so
+   each round's thinking is kept — that message completes in place into a
+   terminal line: the first line of the thinking (truncated after 50 chars,
+   `...` when cut) plus how long it took, e.g. "🤔 *Let me check the units
+   first. (12s)*". That line stays in the channel (above the reply, which
+   streams in its own message; with `MODEL_STREAM=false` the line completes
+   when the reply is ready and the reply posts as a separate message), so a
+   multi-tool turn shows a thought line per round, not just one at the end.
+   The reasoning text itself is never posted or recorded. Tool activity is
+   different: each tool call is posted as its own **persistent** short message
+   ("🔎 *web_search(query=\"…\")*" — name + arguments only, results never
+   shown; `DISCORD_SHOW_TOOL_ACTIVITY`, default on). These are bot messages
+   and never enter the channel context.
 - **Chunking:** replies longer than Discord's 2000-char limit are split
   into multiple messages, preferring newlines, keeping markdown tables
   together (a table that must span messages repeats its header row in each

@@ -677,7 +677,7 @@ const ok = (name: string): void => {
   const hello = m(authors.alice, "hello");
   const oldReply = m(authors.bot, "old reply"); // not in history (bot restarted since)
   const beep = m(authors.carl, "beep");
-  const think = m(authors.bot, "🤔 *thought for 3s*"); // our UI line
+  const think = m(authors.bot, "🤔 *Let me check the units first. (3s)*"); // our UI line
   const activity = m(authors.bot, "🔎 *web_search(query=\"x\")*"); // our UI line
   const wiki = m(authors.bot, "📚 *wikipedia_search(query=\"loop\")*"); // our UI line
   const chunkA = m(authors.bot, "part one");
@@ -1518,8 +1518,9 @@ const ok = (name: string): void => {
   assert.ok((w4d as unknown as { reasoningBuffer: string }).reasoningBuffer.length <= 8000, "the buffer holds only a tail");
   ok("writer: long reasoning keeps the preview bounded (tail + line count)");
 
-  // discard(): a tool-call round's streamed preview is deleted, and the
-  // next round streams a fresh live message
+  // discard(): a tool-call round's streamed *text* preview is deleted (no
+  // reasoning here, so nothing to persist), and the next round streams a
+  // fresh live message
   const msgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const dchan = {
     sendTyping: async (): Promise<void> => {},
@@ -1576,9 +1577,10 @@ const ok = (name: string): void => {
   ok("writer: LaTeX sanitized before posting and recording");
 
   // reasoning preview: shown live, capped at 2000 chars (tail kept), and
-  // when the reply starts the thinking message completes in place ("🤔
-  // *thought for Ns*") while the reply streams in a fresh message;
-  // reasoning is never posted or recorded
+  // when the reply starts the thinking message completes in place into its
+  // terminal line (first line of the thinking, truncated, + how long it
+  // took) while the reply streams in a fresh message; reasoning is never
+  // posted or recorded
   const g = makeChannel();
   const w7 = new ResponseWriter({
     channel: g.channel as unknown as GuildTextBasedChannel,
@@ -1600,12 +1602,12 @@ const ok = (name: string): void => {
   w7.chunk("The answer is 42.");
   await ticks(2);
   assert.equal(g.sent.length, 2, "reply streams in a fresh message");
-  assert.match(g.messages[0].content, /^🤔 \*thought for \d+s\*$/, "thinking message completes in place");
+  assert.match(g.messages[0].content, /^🤔 \*Let me think step by step\. First, the units; xxxxx\.\.\. \(\d+s\)\*$/, "thinking completes into first-line (truncated) + seconds");
   assert.equal(g.getLive()!.content, "The answer is 42.", "reply takes over in its own message");
   const p7 = await w7.finish("The answer is 42.");
   assert.equal(p7!.text, "The answer is 42.", "reasoning is not posted or recorded");
   assert.deepEqual(p7!.messageIds, [g.messages[1].id], "only the reply message is recorded");
-  ok("writer: reasoning preview live-capped, completes into a 'thought for' line, never recorded");
+  ok("writer: reasoning preview live-capped, completes into a first-line + seconds line, never recorded");
 
   // long multi-line thinking: header + "N lines hidden" + the last 5 lines
   const h = makeChannel();
@@ -1626,8 +1628,10 @@ const ok = (name: string): void => {
   assert.ok(thinkLong.length <= 2000, `long preview capped at 2000 (got ${thinkLong.length})`);
   ok("writer: long thinking shows 'N lines hidden' + the last 5 lines");
 
-  // discard() also clears the reasoning buffer: the next round's thinking
-  // starts fresh instead of continuing the old one
+  // discard() persists the round's thinking (the live thinking message is
+  // completed into its terminal line, not deleted) and clears the reasoning
+  // buffer: the next round's thinking starts fresh instead of continuing
+  // the old one
   const actMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const actChan = {
     sendTyping: async (): Promise<void> => {},
@@ -1659,7 +1663,8 @@ const ok = (name: string): void => {
   assert.match(actMsgs[0].content, /thinking/);
   w8.discard();
   await ticks(3);
-  assert.equal(actMsgs[0].deleted, true, "preview deleted on discard");
+  assert.equal(actMsgs[0].deleted, false, "thinking message persisted (not deleted) on discard");
+  assert.match(actMsgs[0].content, /^🤔 \*old round thinking… \(\d+s\)\*$/, "completed into its terminal line");
   w8.reason("fresh round thinking");
   await ticks(2);
   assert.equal(actMsgs.length, 2, "next round gets a fresh message");
@@ -1667,7 +1672,110 @@ const ok = (name: string): void => {
   assert.doesNotMatch(actMsgs[1].content, /old round/, "cleared reasoning does not leak into the new round");
   const p8 = await w8.finish("done");
   assert.equal(p8!.text, "done");
-  ok("writer: discard() clears the reasoning buffer, next round is fresh");
+  ok("writer: discard() persists the round's thinking, next round is fresh");
+  // Every tool-call round's reasoning is persisted as its own terminal line
+  // (the live thinking message is completed in place, never deleted), so the
+  // channel shows a thought line between each round's tool activity — not
+  // just one at the very end.
+  const tMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const tChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `t${String(tMsgs.length)}`, content: data.content, deleted: false };
+      tMsgs.push(m);
+      return {
+        id: m.id,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const wT = new ResponseWriter({
+    channel: tChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  wT.start();
+  // Round 1: thinking only, then a tool call (transient text discarded,
+  // thinking persisted by discard()).
+  wT.reason("Round one: gather the data.");
+  await ticks(2);
+  wT.discard();
+  await ticks(3);
+  assert.equal(tMsgs.length, 1, "round 1: the thinking line");
+  assert.match(tMsgs[0].content, /^🤔 \*Round one: gather the data\. \(\d+s\)\*$/, "round 1 thinking persisted by discard()");
+  assert.equal(tMsgs[0].deleted, false, "round 1 thinking line not deleted");
+  // Round 2: thinking only, then a tool call — a fresh terminal line.
+  wT.reason("Round two: analyze it.");
+  await ticks(2);
+  wT.discard();
+  await ticks(3);
+  assert.equal(tMsgs.length, 2, "round 2: a fresh thinking line");
+  assert.match(tMsgs[1].content, /^🤔 \*Round two: analyze it\. \(\d+s\)\*$/, "round 2 thinking persisted by discard()");
+  // Round 3: thinking, then the final answer (the thinking line completes
+  // when the reply takes over).
+  wT.reason("Round three: answer.");
+  await ticks(2);
+  assert.equal(tMsgs.length, 3, "round 3: a fresh thinking line");
+  wT.chunk("The final answer.");
+  await ticks(2);
+  assert.match(tMsgs[2].content, /^🤔 \*Round three: answer\. \(\d+s\)\*$/, "round 3 thinking completes when the reply starts");
+  assert.equal(tMsgs.length, 4, "the reply streams in a fresh message");
+  assert.equal(tMsgs[3].content, "The final answer.", "the reply is a fresh message");
+  const pT = await wT.finish("The final answer.");
+  assert.equal(pT!.text, "The final answer.");
+  assert.equal(tMsgs[3].content, "The final answer.", "the reply settles in place");
+  assert.deepEqual(tMsgs.map((m) => m.deleted), [false, false, false, false], "no thinking line is deleted");
+  ok("writer: every tool-call round's reasoning persists as its own terminal line");
+  // A round that streams both reasoning and transient text: the thinking line
+  // completes when the text takes over, and discard() deletes only the text —
+  // it must NOT post a second terminal line for the same round.
+  const uMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const uChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `u${String(uMsgs.length)}`, content: data.content, deleted: false };
+      uMsgs.push(m);
+      return {
+        id: m.id,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const wU = new ResponseWriter({
+    channel: uChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  wU.start();
+  wU.reason("Thinking then text.");
+  await ticks(2);
+  wU.chunk("transient text");
+  await ticks(2);
+  assert.equal(uMsgs.length, 2, "thinking line + transient text");
+  assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*$/, "thinking completes when the text starts");
+  assert.equal(uMsgs[0].deleted, false);
+  assert.equal(uMsgs[1].content, "transient text");
+  wU.discard();
+  await ticks(3);
+  assert.equal(uMsgs.length, 2, "discard() posts no second terminal line");
+  assert.equal(uMsgs[1].deleted, true, "transient text deleted");
+  assert.equal(uMsgs[0].deleted, false, "the thinking line is kept");
+  assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*$/, "the thinking line is unchanged");
+  ok("writer: a reasoning + text round posts exactly one terminal line");
 
   // non-stream mode: the whole reasoning arrives at once (one reason() call,
   // no chunks); on finish the thinking line completes in place and the
@@ -1684,7 +1792,7 @@ const ok = (name: string): void => {
   assert.equal(n.sent.length, 1, "thinking preview creates the live message");
   const p9 = await w9.finish("The answer is 7.");
   assert.equal(n.sent.length, 2, "reply posts as a fresh message");
-  assert.match(n.messages[0].content, /^🤔 \*thought for \d+s\*$/, "thinking line completed on finish");
+  assert.match(n.messages[0].content, /^🤔 \*Let me check the units first\. \(\d+s\)\*$/, "thinking line completed on finish (first line, untruncated)");
   assert.equal(n.getLive()!.content, "The answer is 7.");
   assert.equal(p9!.text, "The answer is 7.");
   assert.deepEqual(p9!.messageIds, [n.messages[1].id], "only the reply message is recorded");
@@ -1703,7 +1811,7 @@ const ok = (name: string): void => {
   await ticks(2);
   const p10 = await w10.finish("");
   assert.equal(o.sent.length, 2, "thinking line + note");
-  assert.match(o.messages[0].content, /^🤔 \*thought for \d+s\*$/, "thinking line completed");
+  assert.match(o.messages[0].content, /^🤔 \*hmm, nothing to say… \(\d+s\)\*$/, "thinking line completed (first line, untruncated)");
   assert.match(o.messages[1].content, /no response/i, "note posts as its own message");
   assert.equal(p10!.messageIds.length, 1, "only the note is recorded");
   ok("writer: reasoning-only turn keeps the thinking line, note posted fresh");
