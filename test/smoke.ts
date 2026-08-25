@@ -27,6 +27,7 @@ import { ChannelQueue } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
+import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
 import { buildChannelContext, contextFromMessages, contextToMessages, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
@@ -65,6 +66,8 @@ const ok = (name: string): void => {
     MODEL_CONTEXT_MAX_MESSAGES: "7",
     MODEL_API_KEY: "k1",
     MODEL_IMAGES_MAX_BYTES: "2048",
+    MODEL_ENABLE_FILE_CONTENTS: "true",
+    MODEL_FILE_CONTENT_MAX_BYTES: "500000",
     CONTEXT_COMPACTION_MAX_TOKENS: "1234",
     CONTEXT_COMPACTION_KEEP_MESSAGES: "5",
   });
@@ -77,6 +80,8 @@ const ok = (name: string): void => {
   assert.equal(config.model.apiKey, "k1");
   assert.equal(config.model.enableImages, false); // default
   assert.equal(config.model.imagesMaxBytes, 2048);
+  assert.equal(config.model.enableFileContents, true);
+  assert.equal(config.model.fileContentsMaxBytes, 500000);
   assert.equal(config.model.compactionMaxTokens, 1234);
   assert.equal(config.model.compactionKeepMessages, 5);
   assert.equal(config.discord.typingIntervalMs, 5000); // default
@@ -93,11 +98,13 @@ const ok = (name: string): void => {
     MODEL_STREAM: "banana",
     DISCORD_SHOW_REASONING: "maybe",
     MODEL_IMAGES_MAX_BYTES: "0",
+    MODEL_FILE_CONTENT_MAX_BYTES: "0",
     CONTEXT_COMPACTION_MAX_TOKENS: "abc",
   });
-  assert.ok(badErrors.length >= 7, `expected >= 7 errors, got ${badErrors.length}`);
+  assert.ok(badErrors.length >= 8, `expected >= 8 errors, got ${badErrors.length}`);
   assert.ok(badErrors.some((e) => e.includes("DISCORD_SHOW_REASONING")), `got: ${badErrors.join("; ")}`);
   assert.ok(badErrors.some((e) => e.includes("MODEL_IMAGES_MAX_BYTES")), `got: ${badErrors.join("; ")}`);
+  assert.ok(badErrors.some((e) => e.includes("MODEL_FILE_CONTENT_MAX_BYTES")), `got: ${badErrors.join("; ")}`);
   assert.ok(badErrors.some((e) => e.includes("CONTEXT_COMPACTION_MAX_TOKENS")), `got: ${badErrors.join("; ")}`);
   ok("config: reports missing/invalid values");
 
@@ -162,6 +169,8 @@ const ok = (name: string): void => {
   assert.equal(td.tools.maxRounds, 5);
   assert.equal(td.model.enableImages, false, "image input off by default");
   assert.equal(td.model.imagesMaxBytes, 10_485_760); // default
+  assert.equal(td.model.enableFileContents, false, "file contents off by default");
+  assert.equal(td.model.fileContentsMaxBytes, 1_000_000); // default
   assert.equal(td.model.compactionEnabled, true, "compaction on by default");
   assert.equal(td.model.compactionMaxTokens, 4000); // default
   assert.equal(td.model.compactionKeepMessages, 20); // default
@@ -514,6 +523,134 @@ const ok = (name: string): void => {
   assert.equal(ok7.notes.length, 1);
   assert.match(ok7.notes[0], /more than 4 images per message/);
   ok("images: data URIs, type/size/HTTP failures become notes, per-message cap");
+
+  // skipNonImages (file contents enabled): non-image attachments are the
+  // file pipeline's job — skipped silently (no "unsupported type" note) and
+  // not counted against the per-message image cap. The default keeps the
+  // classic note.
+  const skip = await fetchMessageImages(
+    [
+      att({ name: "notes.md", contentType: "text/markdown" }),
+      att(),
+      att(),
+      att(),
+      att(),
+      att({ name: "x.md", contentType: "text/markdown" }),
+    ],
+    1024,
+    { fetchImpl, skipNonImages: true },
+  );
+  assert.equal(skip.images.length, 4);
+  assert.deepEqual(skip.notes, []);
+  const skipOff = await fetchMessageImages(
+    [att({ name: "notes.md", contentType: "text/markdown" })],
+    1024,
+    { fetchImpl },
+  );
+  assert.match(skipOff.notes[0], /unsupported type text\/markdown/);
+  ok("images: skipNonImages leaves non-image attachments to the file pipeline");
+}
+
+// ----------------------------------------------------------------- files --
+{
+  const att = (over: Partial<MessageAttachmentLike> = {}): MessageAttachmentLike => ({
+    url: "https://cdn.discordapp.com/attachments/1/2/3/notes.md",
+    name: "notes.md",
+    size: 11,
+    contentType: "text/markdown",
+    ...over,
+  });
+  const fetchImpl: FileFetch = () => Promise.resolve(new Response(Buffer.from("# Notes\nbody")));
+
+  // Binary filter: valid UTF-8 without NUL bytes is text; NUL, invalid
+  // UTF-8, and empty buffers are not.
+  assert.equal(isProbablyText(Buffer.from("hello")), true);
+  assert.equal(isProbablyText(Buffer.from([0x00, 0x01])), false, "NUL byte");
+  assert.equal(isProbablyText(Buffer.from([0xff, 0xfe, 0x80])), false, "invalid UTF-8");
+  assert.equal(isProbablyText(Buffer.alloc(0)), false, "empty");
+  // The fence grows past any backtick run in the content (it cannot escape).
+  assert.equal(fenceFor("no backticks"), "```");
+  assert.equal(fenceFor("a ``` b"), "````");
+  assert.equal(fenceFor("````x````"), "`````");
+  ok("files: binary filter and fence sizing");
+
+  // Production URL validation: only https Discord-CDN URLs are trusted
+  // (same as images), checked before any network call.
+  const nonCdn = await fetchMessageFiles(
+    [att({ url: "https://evil.example.com/notes.md" })],
+    1024,
+  );
+  assert.equal(nonCdn.files.length, 0);
+  assert.match(nonCdn.notes[0], /not a discord attachment/);
+  // Image attachments belong to the image pipeline: ignored entirely here
+  // (no files, no notes).
+  const imgOnly = await fetchMessageFiles(
+    [{ url: "https://cdn.discordapp.com/attachments/1/2/3/i.png", name: "i.png", size: 10, contentType: "image/png" }],
+    1024,
+    { fetchImpl },
+  );
+  assert.equal(imgOnly.files.length, 0);
+  assert.deepEqual(imgOnly.notes, []);
+  ok("files: only https Discord-CDN URLs are trusted, image attachments ignored");
+
+  // Success: a labeled, fenced block; the header carries the name and size.
+  const ok1 = await fetchMessageFiles([att()], 1024, { fetchImpl });
+  assert.equal(ok1.files.length, 1);
+  assert.deepEqual(ok1.notes, []);
+  assert.equal(ok1.files[0].text, '[attachment "notes.md" (1 KB)]:\n```\n# Notes\nbody\n```');
+  // Content with backtick runs gets a longer fence (the content stays inside).
+  const ok2 = await fetchMessageFiles([att({ name: "code.md", size: 15 })], 1024, {
+    fetchImpl: () => Promise.resolve(new Response(Buffer.from("a ``` b\n```c```"))),
+  });
+  assert.equal(ok2.files[0].text, "[attachment \"code.md\" (1 KB)]:\n````\na ``` b\n```c```\n````");
+  // A leading BOM is stripped from the inlined content.
+  const ok3 = await fetchMessageFiles([att({ size: 8 })], 1024, {
+    fetchImpl: () => Promise.resolve(new Response(Buffer.from("\uFEFFhello"))),
+  });
+  assert.equal(ok3.files[0].text, '[attachment "notes.md" (1 KB)]:\n```\nhello\n```');
+  ok("files: labeled fenced blocks, dynamic fence, BOM stripped");
+
+  // Binary content (NUL byte / invalid UTF-8) and empty files become notes.
+  const bin = await fetchMessageFiles([att()], 1024, {
+    fetchImpl: () => Promise.resolve(new Response(Buffer.from([0x00, 0x01, 0x02]))),
+  });
+  assert.equal(bin.files.length, 0);
+  assert.match(bin.notes[0], /binary content/);
+  const badUtf8 = await fetchMessageFiles([att()], 1024, {
+    fetchImpl: () => Promise.resolve(new Response(Buffer.from([0xff, 0xfe, 0x80]))),
+  });
+  assert.match(badUtf8.notes[0], /binary content/);
+  const empty = await fetchMessageFiles([att({ size: 0 })], 1024, {
+    fetchImpl: () => Promise.resolve(new Response(new Uint8Array(0))),
+  });
+  assert.match(empty.notes[0], /empty file/);
+  ok("files: binary and empty attachments become notes");
+
+  // Declared and actual size over the cap, plus download failures, become
+  // notes, never exceptions (same convention as images).
+  const big = await fetchMessageFiles([att({ size: 2048 })], 1024, { fetchImpl });
+  assert.equal(big.files.length, 0);
+  assert.match(big.notes[0], /2 KB exceeds the 1 KB limit/);
+  const lie = await fetchMessageFiles([att({ size: 1 })], 2, { fetchImpl });
+  assert.match(lie.notes[0], /exceeds/);
+  const http404 = await fetchMessageFiles([att()], 1024, {
+    fetchImpl: () => Promise.resolve(new Response("nope", { status: 404 })),
+  });
+  assert.match(http404.notes[0], /download failed \(HTTP 404\)/);
+  const threw = await fetchMessageFiles([att()], 1024, {
+    fetchImpl: () => Promise.reject(new Error("dns down")),
+  });
+  assert.match(threw.notes[0], /download failed/);
+  // More than the per-message cap: the rest are noted.
+  const many = await fetchMessageFiles(
+    [att({ name: "a.md" }), att({ name: "b.md" }), att({ name: "c.md" }), att({ name: "d.md" })],
+    1024,
+    { fetchImpl },
+  );
+  assert.equal(many.files.length, 3);
+  assert.equal(many.notes.length, 1);
+  assert.match(many.notes[0], /more than 3 files per message/);
+  ok("files: size caps and download failures become notes, per-message cap");
 }
 
 // ---------------------------------------------------------------- context --
@@ -567,6 +704,8 @@ const ok = (name: string): void => {
     enableImages: true,
     imagesMaxBytes: 1024,
     imageFetch,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
   };
   const imgPart = { type: "image_url", image_url: { url: `data:image/png;base64,${imgBytes.toString("base64")}` } };
   const res = await contextFromMessages(fetchedList, hist, mention.id, opts);
@@ -602,6 +741,65 @@ const ok = (name: string): void => {
   // The mention gone from the window (deleted / pushed out) -> null: skip the turn.
   assert.equal(await contextFromMessages(fetchedList.slice(0, -1), hist, mention.id, opts), null);
   ok("context: images disabled ignores attachments; mention gone -> null");
+
+  // File contents: non-image attachments are inlined as labeled, fenced
+  // blocks; images are left to the image pipeline; a skipped attachment
+  // leaves a note; disabled -> ignored entirely (as with images).
+  const fileAtt: MessageAttachmentLike = {
+    url: "https://cdn.discordapp.com/attachments/1/2/3/notes.md",
+    name: "notes.md",
+    size: 11,
+    contentType: "text/markdown",
+  };
+  const fileBytes = Buffer.from("# Notes\nbody");
+  const fileFetch: FileFetch = () => Promise.resolve(new Response(fileBytes));
+  const fileBlock = '[attachment "notes.md" (1 KB)]:\n```\n# Notes\nbody\n```';
+  const fcOpts = { ...opts, enableFileContents: true, fileFetch };
+  const fm1 = m(authors.alice, "here is the file", [fileAtt]);
+  const fm2 = m(authors.alice, "<@bot1> read this", [fileAtt]);
+  const fres = await contextFromMessages([fm1, fm2], hist, fm2.id, fcOpts);
+  assert.deepEqual(fres, [
+    { role: "system", content: "sys" },
+    { role: "user", content: `Alice: here is the file\n${fileBlock}` },
+    { role: "user", content: `Alice: read this\n${fileBlock}` },
+  ]);
+  // A message with both an image and a file: the image part plus the text
+  // part carrying the file block.
+  const mixed = m(authors.alice, "both", [imgAtt, fileAtt]);
+  const mres = await contextFromMessages([mixed], hist, mixed.id, fcOpts);
+  assert.deepEqual(mres, [
+    { role: "system", content: "sys" },
+    { role: "user", content: [{ type: "text", text: `Alice: both\n${fileBlock}` }, imgPart] },
+  ]);
+  // An oversized attachment leaves a note (no download).
+  const bigFileAtt: MessageAttachmentLike = {
+    url: "https://cdn.discordapp.com/attachments/1/2/3/big.md",
+    name: "big.md",
+    size: 4096,
+    contentType: "text/markdown",
+  };
+  const bigMsg = m(authors.alice, "too big", [bigFileAtt]);
+  const bres = await contextFromMessages([bigMsg], hist, bigMsg.id, fcOpts);
+  assert.deepEqual(bres, [
+    { role: "system", content: "sys" },
+    { role: "user", content: 'Alice: too big\n*[attachment "big.md" not sent: 4 KB exceeds the 1 KB limit]*' },
+  ]);
+  // File contents off (images on): the classic behavior is unchanged — the
+  // image pipeline notes the non-image attachment as an unsupported type
+  // (nothing else handles it). Both pipelines off: ignored entirely.
+  const fres2 = await contextFromMessages([fm1, fm2], hist, fm2.id, { ...fcOpts, enableFileContents: false });
+  assert.deepEqual(fres2, [
+    { role: "system", content: "sys" },
+    { role: "user", content: 'Alice: here is the file\n*[attachment "notes.md" not sent: unsupported type text/markdown]*' },
+    { role: "user", content: 'Alice: read this\n*[attachment "notes.md" not sent: unsupported type text/markdown]*' },
+  ]);
+  const fres3 = await contextFromMessages([fm1, fm2], hist, fm2.id, { ...fcOpts, enableFileContents: false, enableImages: false });
+  assert.deepEqual(fres3, [
+    { role: "system", content: "sys" },
+    { role: "user", content: "Alice: here is the file" },
+    { role: "user", content: "Alice: read this" },
+  ]);
+  ok("context: file contents inlined as labeled fenced blocks; oversized -> note; off -> classic note / ignored");
 
   // A chunked reply from before a restart (no history entry): the
   // consecutive own messages posted close together (the reply's chunks) are
@@ -663,7 +861,15 @@ const ok = (name: string): void => {
       },
     },
   } as unknown as GuildTextBasedChannel;
-  const wOpts = { botId: "bot1", systemPrompt: "", maxMessages: 20, enableImages: false, imagesMaxBytes: 1024 };
+  const wOpts = {
+    botId: "bot1",
+    systemPrompt: "",
+    maxMessages: 20,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
+  };
   const wr = await buildChannelContext(chan, new ChannelContext(), new ChannelHistory(20), "b", wOpts);
   assert.equal(seenLimit, 20, "fetch limit is the window size");
   assert.deepEqual(
@@ -763,6 +969,22 @@ const ok = (name: string): void => {
     { url: "https://cdn.discordapp.com/attachments/1/2/3/i.png", name: "i.png", size: 10, contentType: "image/png" },
   ]);
   assert.equal(est.estimateTokens("", 10), 1200, "200 text tokens + 1000 image tokens");
+  // File contents: when enabled (fileMaxBytes given), non-image attachments
+  // in the window add a cost of their size (capped at fileMaxBytes); images
+  // keep their fixed cost. Off (undefined) adds nothing.
+  const fest = new ChannelContext();
+  fest.pushUser("A", "x", "e1", 1, [
+    { url: "https://cdn.discordapp.com/attachments/1/2/3/big.txt", name: "big.txt", size: 8_000_000, contentType: "text/plain" },
+  ]);
+  fest.pushUser("B", "y", "e2", 2, [
+    { url: "https://cdn.discordapp.com/attachments/1/2/3/small.md", name: "small.md", size: 2000, contentType: "text/markdown" },
+    { url: "https://cdn.discordapp.com/attachments/1/2/3/i.png", name: "i.png", size: 10, contentType: "image/png" },
+  ]);
+  // off: text (1 + 1) + the image's fixed cost (1000), no file cost.
+  assert.equal(fest.estimateTokens("", 2), 1002, "off: text + image, no file cost");
+  // on: + file costs, each attachment capped at fileMaxBytes (8 MB and 2000
+  // both cap to 1000 -> ceil(1000/4) each).
+  assert.equal(fest.estimateTokens("", 2, 1000), 1502, "on: text + image + two capped file costs");
   ok("compaction store: seed merges chronologically (tracked ids win), token estimate");
 
   // A chunked reply in the channel before the bot started (its chunks are
@@ -820,6 +1042,8 @@ const ok = (name: string): void => {
     maxMessages: 20,
     enableImages: false,
     imagesMaxBytes: 1024,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
     compaction: { maxTokens: 20, keepMessages: 3, summarize },
   };
   const cres = await buildChannelContext(noFetch, cstore, new ChannelHistory(20), "m1", cOpts);
@@ -913,6 +1137,8 @@ const ok = (name: string): void => {
     enableImages: true,
     imagesMaxBytes: 1024,
     imageFetch: () => Promise.resolve(new Response(imgBytes)),
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
   });
   const iPart = { type: "image_url", image_url: { url: `data:image/png;base64,${imgBytes.toString("base64")}` } };
   assert.deepEqual(ires, [
@@ -924,12 +1150,80 @@ const ok = (name: string): void => {
   sstore.pushUser("A", "x", "s1", 1, []);
   sstore.pushUser("B", "y", "s2", 2, []);
   assert.deepEqual(await sstore.compact(1, async () => "the summary"), { ok: true });
-  const sres = await contextToMessages(sstore, { systemPrompt: "", maxMessages: 10, enableImages: false, imagesMaxBytes: 1024 });
+  const sres = await contextToMessages(sstore, {
+    systemPrompt: "",
+    maxMessages: 10,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
+  });
   assert.deepEqual(sres, [
     { role: "user", content: "Summary of the earlier messages in this channel (older messages were compacted):\nthe summary" },
     { role: "user", content: "B: y" },
   ]);
   ok("compaction: image window notes, recent image parts, summary rendered first");
+
+  // File window: older non-image attachments leave a note, recent ones are
+  // inlined as labeled, fenced blocks (image attachments are the image
+  // pipeline's job, so they stay unnoted here).
+  const ffstore = new ChannelContext();
+  const fileAtt2: MessageAttachmentLike = {
+    url: "https://cdn.discordapp.com/attachments/1/2/3/notes.md",
+    name: "notes.md",
+    size: 11,
+    contentType: "text/markdown",
+  };
+  ffstore.seedFrom([
+    { id: "ff1", ts: 1, role: "user", content: "old file", name: "Alice", attachments: [fileAtt2] },
+    { id: "ff2", ts: 2, role: "user", content: "recent file", name: "Bob", attachments: [fileAtt2] },
+  ]);
+  const fileBytes2 = Buffer.from("# Notes\nbody");
+  const ffres = await contextToMessages(ffstore, {
+    systemPrompt: "",
+    maxMessages: 1,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    enableFileContents: true,
+    fileContentsMaxBytes: 1024,
+    fileFetch: () => Promise.resolve(new Response(fileBytes2)),
+  });
+  const fileBlock2 = '[attachment "notes.md" (1 KB)]:\n```\n# Notes\nbody\n```';
+  assert.deepEqual(ffres, [
+    { role: "user", content: 'Alice: old file\n*[attachment "notes.md" not sent: older than the file window]*' },
+    { role: "user", content: `Bob: recent file\n${fileBlock2}` },
+  ]);
+  ok("compaction: file window notes, recent files inlined");
+
+  // Both pipelines on: the newest entry's image becomes an image_url part
+  // and its file is inlined — no "unsupported type" note for the file (the
+  // pipelines are mutually exclusive per attachment type); the older entry
+  // leaves one window note per pipeline.
+  const bfstore = new ChannelContext();
+  bfstore.seedFrom([
+    { id: "bf1", ts: 1, role: "user", content: "old mix", name: "Alice", attachments: [imgAtt, fileAtt2] },
+    { id: "bf2", ts: 2, role: "user", content: "recent mix", name: "Bob", attachments: [imgAtt, fileAtt2] },
+  ]);
+  const bfres = await contextToMessages(bfstore, {
+    systemPrompt: "",
+    maxMessages: 1,
+    enableImages: true,
+    imagesMaxBytes: 1024,
+    imageFetch: () => Promise.resolve(new Response(imgBytes)),
+    enableFileContents: true,
+    fileContentsMaxBytes: 1024,
+    fileFetch: () => Promise.resolve(new Response(fileBytes2)),
+  });
+  const bfPart = { type: "image_url", image_url: { url: `data:image/png;base64,${imgBytes.toString("base64")}` } };
+  assert.deepEqual(bfres, [
+    {
+      role: "user",
+      content:
+        'Alice: old mix\n*[attachment "img.png" not sent: older than the image window]*\n*[attachment "notes.md" not sent: older than the file window]*',
+    },
+    { role: "user", content: [{ type: "text", text: `Bob: recent mix\n${fileBlock2}` }, bfPart] },
+  ]);
+  ok("compaction: both pipelines on — image part + file block, no duplicate notes");
 
   // !clear: reset() drops every entry and the running summary, and
   // suppresses the startup seed — the next turn starts from messages that
@@ -955,6 +1249,8 @@ const ok = (name: string): void => {
     maxMessages: 20,
     enableImages: false,
     imagesMaxBytes: 1024,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
     compaction: { maxTokens: 10_000, keepMessages: 5, summarize: async () => "never" },
   };
   assert.deepEqual(await buildChannelContext(noFetch, kstore, new ChannelHistory(20), "k3", kOpts), [

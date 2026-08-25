@@ -85,7 +85,9 @@ export const COMPACTION_SYSTEM_PROMPT =
 
 /**
  * Render the compactable part (the existing summary + the older entries) as
- * a plain transcript for the summarizer.
+ * a plain transcript for the summarizer. Attachment names are listed so the
+ * summary can note that files were shared, even when their content was not
+ * (or could not be) inlined.
  */
 export function compactionTranscript(summary: string | null, older: ContextEntry[]): string {
   const lines: string[] = [];
@@ -94,11 +96,11 @@ export function compactionTranscript(summary: string | null, older: ContextEntry
     lines.push("");
   }
   for (const e of older) {
-    const imgs = e.attachments.filter(isImageAttachment).map((a) => a.name);
-    const imgNote = imgs.length > 0 ? ` [attachment: ${imgs.join(", ")}]` : "";
-    if (e.content.length === 0 && imgs.length === 0) continue; // carries nothing
+    const atts = e.attachments.map((a) => a.name);
+    const attNote = atts.length > 0 ? ` [attachment: ${atts.join(", ")}]` : "";
+    if (e.content.length === 0 && atts.length === 0) continue; // carries nothing
     const who = e.role === "assistant" ? "Bot" : e.name ? speakerLabel(e.name, e.bot ?? false) : "Someone";
-    const content = e.content.length > 0 ? `${e.content}${imgNote}` : imgNote.trimStart();
+    const content = e.content.length > 0 ? `${e.content}${attNote}` : attNote.trimStart();
     lines.push(`${who}: ${content}`.trimEnd());
   }
   return lines.join("\n");
@@ -233,17 +235,25 @@ export class ChannelContext {
   /**
    * Estimated tokens of the next request built from this context: the
    * system prompt + the summary + every entry, plus a fixed cost for the
-   * images that would actually be sent (the newest `imageWindow` entries).
+   * images that would actually be sent (the newest `window` entries) and,
+   * when `fileMaxBytes` is given (file contents enabled), a cost for the
+   * non-image attachments that would be inlined (their size, capped at
+   * `fileMaxBytes`, same ~4-chars-per-token heuristic).
    */
-  estimateTokens(systemPrompt: string, imageWindow: number): number {
+  estimateTokens(systemPrompt: string, window: number, fileMaxBytes?: number): number {
     let t = estimateTokens(systemPrompt);
     if (this.summary) t += estimateTokens(this.summary);
-    const windowStart = this.entries.length - imageWindow;
+    const windowStart = this.entries.length - window;
     for (let i = 0; i < this.entries.length; i++) {
       const e = this.entries[i];
       t += estimateTokens(e.content);
       if (i >= windowStart) {
         t += e.attachments.filter(isImageAttachment).length * IMAGE_TOKEN_ESTIMATE;
+        if (fileMaxBytes !== undefined) {
+          for (const a of e.attachments) {
+            if (!isImageAttachment(a)) t += Math.ceil(Math.min(a.size, fileMaxBytes) / 4);
+          }
+        }
       }
     }
     return t;
@@ -291,8 +301,14 @@ export class ChannelContext {
    * entries (never the protected one — the turn's mention) until the
    * estimate fits the budget.
    */
-  emergencyTrim(protectedId: string, maxTokens: number, systemPrompt: string, imageWindow: number): void {
-    while (this.estimateTokens(systemPrompt, imageWindow) > maxTokens) {
+  emergencyTrim(
+    protectedId: string,
+    maxTokens: number,
+    systemPrompt: string,
+    window: number,
+    fileMaxBytes?: number,
+  ): void {
+    while (this.estimateTokens(systemPrompt, window, fileMaxBytes) > maxTokens) {
       const i = this.entries.findIndex((e) => !e.ids.includes(protectedId));
       if (i === -1) break; // only the protected entry is left
       this.entries.splice(i, 1);
