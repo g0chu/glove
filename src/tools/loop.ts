@@ -24,7 +24,10 @@ export interface ToolTurnDeps {
   /**
    * Called right after a response that contains tool calls is fully
    * received (and before the next round starts). The caller uses this to
-   * discard any streamed preview text — it is transient, not the answer.
+   * discard the round's streamed preview *text* — it is transient, not the
+   * answer — while the round's thinking is kept (its live thinking message
+   * is completed into a terminal line so the reasoning shows up between
+   * the tool-activity messages).
    */
   onToolRound?: () => void;
   /**

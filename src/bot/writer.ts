@@ -15,6 +15,9 @@ const REASONING_TAIL_LINES = 5;
  */
 const REASONING_BUFFER_MAX = 8000;
 
+/** How many chars of the first reasoning line the terminal line shows. */
+const REASONING_FIRST_LINE_CHARS = 50;
+
 /**
  * Mentions allowed in the bot's own posts: user pings stay active (the
  * model can address a specific person), while @everyone/@here and role
@@ -311,11 +314,13 @@ export interface PostedReply {
  *  - typing indicator refreshed every `typingIntervalMs`;
  *  - while the model is thinking (reasoning deltas, no reply content yet),
  *    a thinking live message shows the streamed reasoning
- *    ("🤔 *thinking: …*"); when the reply starts — or, when no reply
- *    content ever streams (non-stream mode, reasoning-only response), at
- *    finish — that message is edited to a terminal line ("🤔 *thought
- *    for Ns*") that stays in the channel above the reply, which streams in
- *    its own fresh message(s);
+ *    ("🤔 *thinking: …*"); when the reply starts — or, when a tool-call
+ *    round ends (discard()), or when no reply content ever streams
+ *    (non-stream mode, reasoning-only response) at finish — that message
+ *    is edited to a terminal line (the first line of the thinking,
+ *    truncated, plus how long it took — e.g. "🤔 *Let me check the units…
+ *    (12s)*") that stays in the channel, so every round's reasoning is
+ *    visible, not just the final one;
  *  - the reply streams in its own live message(s), created on the first
  *    content delta: when the text grows past a 2000-char slice boundary a
  *    fresh live message is created for the next slice — the same
@@ -335,6 +340,23 @@ export class ResponseWriter {
   private reasoningCapped = false;
   private reasoningNewlines = 0;
   private reasoningEndedNewline = false;
+  /**
+   * The first line of the reasoning, kept for the terminal line (capped at
+   * REASONING_FIRST_LINE_CHARS). Tracked separately from reasoningBuffer
+   * because that buffer keeps only a tail (the head is dropped when the
+   * thinking runs long).
+   */
+  private reasoningFirstLine = "";
+  /** Full length of the first reasoning line (up to its newline). */
+  private reasoningFirstLineLength = 0;
+  /** True once a newline ended the first reasoning line. */
+  private reasoningFirstLineDone = false;
+  /**
+   * True once this round's thinking message has been completed into its
+   * terminal line (by the reply taking over, by finish(), or by discard()).
+   * Guards against posting a second terminal line for the same round.
+   */
+  private thinkingSettled = false;
   /**
    * The reply's live messages, in send order. Each holds its own slice
    * (<= 2000 chars, the same chunks the final post will use); a fresh
@@ -373,13 +395,27 @@ export class ResponseWriter {
   /**
    * Feed a streamed reasoning delta (the model's "thinking", when the
    * endpoint sends it). Shown live in a thinking message that completes
-   * into a "🤔 *thought for Ns*" line when the reply starts; reasoning is
-   * never posted or recorded.
+   * into a terminal line (the first line of the thinking, truncated, plus
+   * how long it took) when the reply starts or the round ends; reasoning is
+   * never posted or recorded in full.
    */
   reason(delta: string): void {
     if (this.finished) return;
     if (this.reasoningStartedAt === null && this.buffer.length === 0) {
       this.reasoningStartedAt = Date.now();
+    }
+    // Track the first line (for the terminal line) until its newline arrives.
+    // Only the first REASONING_FIRST_LINE_CHARS are kept — the terminal line
+    // truncates there — but the full length is counted to know whether the
+    // line was cut.
+    if (!this.reasoningFirstLineDone) {
+      const nl = delta.indexOf("\n");
+      const take = nl === -1 ? delta : delta.slice(0, nl);
+      this.reasoningFirstLineLength += take.length;
+      if (this.reasoningFirstLine.length < REASONING_FIRST_LINE_CHARS) {
+        this.reasoningFirstLine += take.slice(0, REASONING_FIRST_LINE_CHARS - this.reasoningFirstLine.length);
+      }
+      if (nl !== -1) this.reasoningFirstLineDone = true;
     }
     let newlines = 0;
     for (let i = 0; i < delta.length; i++) {
@@ -397,34 +433,61 @@ export class ResponseWriter {
   }
 
   /**
-   * Discard the in-progress live messages (thinking + all reply live
-   * messages) without finishing the turn. Used when a streamed response
-   * turns out to contain tool calls: the text streamed so far is transient,
-   * and the next round streams its own live messages. No-op when nothing
-   * has been posted or the turn finished.
+   * End a tool-call round without finishing the turn. The round's streamed
+   * reply text is transient and is deleted (the next round streams its own
+   * live messages), but its thinking is real: the thinking message is
+   * completed into its terminal line (persisted in the channel) instead of
+   * being deleted, so every round's reasoning shows up above the next round.
+   * No-op when the turn finished.
    */
   discard(): void {
     if (this.finished) return;
+    // Captured before the state below is cleared: the terminal line and
+    // whether there was thinking to persist belong to the round ending now.
+    // (thinkingSettled is deliberately NOT reset here — an in-flight
+    // updateReply may still complete the thinking message after this sync
+    // part runs; it is reset at the end of the step, below, once the
+    // thinking has been handled, so a terminal line an in-flight updateReply
+    // already posted is not posted again.)
+    const doneLine = this.thinkingDoneLine();
+    const hadReasoning = this.reasoningBuffer.length > 0;
     this.buffer = "";
     this.reasoningBuffer = "";
     this.reasoningCapped = false;
     this.reasoningNewlines = 0;
     this.reasoningEndedNewline = false;
+    this.reasoningFirstLine = "";
+    this.reasoningFirstLineLength = 0;
+    this.reasoningFirstLineDone = false;
     this.reasoningStartedAt = null;
     this.lastThinkingEditAt = 0;
     this.lastReplyEditAt = 0;
-    // The messages are captured when the delete step runs, not now: a
-    // pending updateLive from this round (e.g. an initial send still in
-    // flight) is queued before the step, so the messages it creates are
-    // deleted too, while next-round updates queue after the step and their
-    // fresh messages survive.
+    // The messages are captured when the step runs, not now: a pending
+    // updateLive from this round (e.g. an initial send still in flight) is
+    // queued before the step, so the messages it creates are handled too,
+    // while next-round updates queue after the step and their fresh
+    // messages survive.
     this.chain = this.chain.then(async () => {
-      const targets = [this.thinkingMessage, ...this.liveMessages].filter((m): m is Message => m !== null);
+      const thinking = this.thinkingMessage;
       this.thinkingMessage = null;
+      if (thinking) {
+        // Reasoning streamed but the reply never took over: complete the
+        // live thinking message into its terminal line in place.
+        await thinking.edit({ content: doneLine, allowedMentions: SAFE_MENTIONS }).catch(() => {});
+      } else if (hadReasoning && !this.thinkingSettled) {
+        // Reasoning streamed but the live message never landed (e.g. the
+        // initial send failed) and no terminal line was posted yet: post the
+        // terminal line so the round's thinking is not lost.
+        await this.opts.channel.send({ content: doneLine, allowedMentions: SAFE_MENTIONS }).catch(() => {});
+      }
+      const targets = [...this.liveMessages];
       this.liveMessages = [];
       for (const m of targets) {
         await m.delete().catch(() => {});
       }
+      // A new round starts: reset the settled flag so the next round's
+      // thinking is tracked fresh.
+      this.thinkingSettled = false;
     });
   }
 
@@ -548,6 +611,7 @@ export class ResponseWriter {
       if (this.liveMessages.length === 0 && this.thinkingMessage) {
         const done = this.thinkingMessage;
         this.thinkingMessage = null;
+        this.thinkingSettled = true;
         await done.edit({ content: this.thinkingDoneLine(), allowedMentions: SAFE_MENTIONS }).catch(() => {});
       }
       // A new slice appeared: start its live message with the slice as it
@@ -578,6 +642,7 @@ export class ResponseWriter {
     if (!this.thinkingMessage) return;
     const done = this.thinkingMessage;
     this.thinkingMessage = null;
+    this.thinkingSettled = true;
     await done.edit({ content: this.thinkingDoneLine(), allowedMentions: SAFE_MENTIONS }).catch(() => {});
   }
 
@@ -623,12 +688,23 @@ export class ResponseWriter {
     for (const m of targets) await m.delete().catch(() => {});
   }
 
-  /** The thinking message's terminal line: how long the model thought. */
+  /**
+   * The thinking message's terminal line: the first line of the reasoning
+   * (truncated after REASONING_FIRST_LINE_CHARS, with a "..." when it was
+   * cut) plus how long the model thought — e.g.
+   * "🤔 *Let me check the units first... (12s)*". Falls back to a plain
+   * "thought for Ns" when there is no first line to show.
+   */
   private thinkingDoneLine(): string {
     const startedAt = this.reasoningStartedAt;
     if (startedAt === null) return "🤔 *thought…*";
     const secs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
-    return `🤔 *thought for ${secs}s*`;
+    // The first line is model text (like the live preview, run it through the
+    // sanitizer so stray math becomes Unicode rather than raw $…$ source).
+    const line = sanitizeForDiscord(this.reasoningFirstLine).trim();
+    if (line.length === 0) return `🤔 *thought for ${secs}s*`;
+    const truncated = this.reasoningFirstLineLength > REASONING_FIRST_LINE_CHARS;
+    return `🤔 *${line}${truncated ? "..." : ""} (${secs}s)*`;
   }
 
   /**
