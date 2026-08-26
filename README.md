@@ -1,5 +1,7 @@
 # Glove — Discord ↔ Chat Completions Bridge
 
+[![CI](https://github.com/g0chu/glove/actions/workflows/ci.yml/badge.svg)](https://github.com/g0chu/glove/actions/workflows/ci.yml)
+
 A Discord bot that bridges text channels to any **OpenAI-compatible
 Chat Completions endpoint**. @mention the bot in any text channel of the
 configured guild — or of any guild it is in, when `DISCORD_GUILD_ID` is

@@ -1,0 +1,56 @@
+name: Bug report
+description: Something is not working the way it should.
+title: ""
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Thanks for taking the time to file a bug report!
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Which version is affected?
+      placeholder: e.g. commit hash or tag
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: The `.env` values involved — redact `DISCORD_TOKEN` and any API keys/URLs.
+      render: yaml
+    validations:
+      required: false
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact sequence of actions (mention, command, tool involved, endpoint).
+      placeholder: |
+        1. …
+        2. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What actually happened, including the message the bot posted in the channel.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant timestamped log lines from the bot process, if any.
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,43 @@
+name: Enhancement
+description: Request a new feature or improvement.
+title: ""
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Please check open issues first — features begin with an issue, not a PR.
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Prerequisites
+      description: Please confirm the following before submitting.
+      options:
+        - label: I searched open issues and PRs for a related request.
+          required: true
+        - label: I am running recent code.
+          required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Feature description
+      description: What are you trying to do, and what do you expect the bot to do?
+      placeholder: Detailed description of the feature
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this necessary and how is it useful?
+      placeholder: Explanation of why this feature is needed and its benefits
+    validations:
+      required: true
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Possible implementation
+      description: If you have an idea of how it could be implemented, describe it. Links welcome.
+      placeholder: Detailed description of potential implementation
+    validations:
+      required: false

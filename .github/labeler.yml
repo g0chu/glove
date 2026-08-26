@@ -1,0 +1,28 @@
+# https://github.com/actions/labeler
+bot:
+  - changed-files:
+    - any-glob-to-any-file:
+      - src/bot/**
+llm:
+  - changed-files:
+    - any-glob-to-any-file:
+      - src/llm/**
+tools:
+  - changed-files:
+    - any-glob-to-any-file:
+      - src/tools/**
+docs:
+  - changed-files:
+    - any-glob-to-any-file:
+      - "**/*.md"
+testing:
+  - changed-files:
+    - any-glob-to-any-file:
+      - test/**
+devops:
+  - changed-files:
+    - any-glob-to-any-file:
+      - .github/**
+      - package.json
+      - package-lock.json
+      - tsconfig.json
