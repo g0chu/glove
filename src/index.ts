@@ -103,9 +103,10 @@ async function main(): Promise<void> {
         return;
       }
       // With tools enabled, the model may answer in several rounds: a round
-      // that ends in tool calls streams transient text (discarded via
-      // onToolRound), the tools run, and the next round continues with the
-      // results in context. Only the final reply is posted and recorded.
+      // that ends in tool calls streams its narration (settled in place via
+      // onToolRound, so it stays above the tool-activity lines), the tools
+      // run, and the next round continues with the results in context. Only
+      // the final reply is recorded in the channel history.
       // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
       // note (listing only the enabled families) is added when any are
       // registered.
