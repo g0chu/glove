@@ -433,16 +433,20 @@ export class ResponseWriter {
 
   /**
    * End a tool-call round without finishing the turn. The round's streamed
-   * reply text is transient and is deleted (the next round streams its own
-   * live messages), but its thinking is real: the thinking message is
-   * completed into its terminal line (persisted in the channel) instead of
-   * being deleted, so every round's reasoning shows up above the next round.
-   * No-op when the turn finished.
+   * reply text is settled in place (its live messages are completed to the
+   * round's full text, so the narration stays in the channel between the
+   * tool-activity lines), and its thinking is completed into its terminal
+   * line (persisted in the channel), so every round's reasoning and text
+   * show up above the next round. The next round streams its own fresh live
+   * messages below. No-op when the turn finished.
    */
   discard(): void {
     if (this.finished) return;
-    // Captured before the state below is cleared: the terminal line and
-    // whether there was thinking to persist belong to the round ending now.
+    // Captured before the state below is cleared: the terminal line, the
+    // round's full text (the live preview may lag behind the buffer — edits
+    // are throttled — so the settle completes the live messages to the full
+    // text), and whether there was thinking to persist all belong to the
+    // round ending now.
     // (thinkingSettled is deliberately NOT reset here — an in-flight
     // updateReply may still complete the thinking message after this sync
     // part runs; it is reset at the end of the step, below, once the
@@ -450,6 +454,7 @@ export class ResponseWriter {
     // already posted is not posted again.)
     const doneLine = this.thinkingDoneLine();
     const hadReasoning = this.reasoningBuffer.length > 0;
+    const replyText = sanitizeForDiscord(this.buffer).trim();
     this.buffer = "";
     this.reasoningBuffer = "";
     this.reasoningCapped = false;
@@ -461,11 +466,11 @@ export class ResponseWriter {
     this.reasoningStartedAt = null;
     this.lastThinkingEditAt = 0;
     this.lastReplyEditAt = 0;
-    // The messages are captured when the step runs, not now: a pending
+    // The messages are handled when the step runs, not now: a pending
     // updateLive from this round (e.g. an initial send still in flight) is
-    // queued before the step, so the messages it creates are handled too,
-    // while next-round updates queue after the step and their fresh
-    // messages survive.
+    // queued before the step, so the messages it creates are settled too,
+    // while next-round updates queue after the step and start the next
+    // round's fresh live messages.
     this.chain = this.chain.then(async () => {
       const thinking = this.thinkingMessage;
       this.thinkingMessage = null;
@@ -479,11 +484,13 @@ export class ResponseWriter {
         // terminal line so the round's thinking is not lost.
         await this.opts.channel.send({ content: doneLine, allowedMentions: SAFE_MENTIONS }).catch(() => {});
       }
-      const targets = [...this.liveMessages];
-      this.liveMessages = [];
-      for (const m of targets) {
-        await m.delete().catch(() => {});
-      }
+      // The round's text is not transient: settle the live messages in
+      // place (the preview used the same splitter, so each live message
+      // normally just completes to its final chunk; a slice that grew past
+      // its boundary is posted fresh). A live message with no chunk left
+      // (defensive — the round streamed no text, so normally none exist)
+      // is deleted.
+      await this.settle(splitForDiscord(replyText));
       // A new round starts: reset the settled flag so the next round's
       // thinking is tracked fresh.
       this.thinkingSettled = false;

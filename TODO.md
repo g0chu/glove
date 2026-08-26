@@ -6,6 +6,34 @@ includes a regression test in `test/smoke.ts`; green = `npm test` +
 
 ## Done (this pass)
 
+### 14. Model text between tool calls deleted on multi-round turns
+- **Where**: `ResponseWriter.discard` (called via `onToolRound` for every
+  round that ends in tool calls) deleted the round's streamed text preview —
+  so on a turn with many tool calls the model's between-round narration never
+  reached the channel; the user saw only the thinking lines and the
+  tool-activity lines. `runToolTurn` also fired `onToolRound` for the cutoff
+  round, treating the turn's final text as transient as well.
+- **Fix**: `discard()` now settles the round's text in place (its live
+  messages complete to the round's full text via `settle`, so the narration
+  stays in the channel above the tool-activity lines) while still completing
+  the round's thinking into its terminal line; the next round streams its own
+  fresh live messages below it. Settled narration is posted but never
+  recorded — only the final reply reaches the channel history. `onToolRound`
+  no longer fires for the cutoff round: its text is the final reply, posted
+  (and recorded) by the caller's `finish()`, so it is neither settled twice
+  nor deleted.
+  - `src/bot/writer.ts`: `discard()` captures the round's full text (the
+    throttled live preview may lag the buffer) and settles the live messages
+    in place instead of deleting them.
+  - `src/tools/loop.ts`: `onToolRound` fires only for rounds that actually
+    execute tools.
+- **Tests**: the discard smoke tests now assert the text is settled in place
+  (not deleted), plus a multi-round scenario (two narrations + activity
+  lines + final reply: nothing deleted, channel order preserved, only the
+  final reply recorded).
+
+## Done (earlier pass)
+
 ### 9. A chunked bot reply re-seeds as N separate assistant entries after restart
 - **Where**: the seed path — `ChannelContext.seedFrom` (compaction) and the
   classic `contextFromMessages` own-reply path — saw the channel's last-N

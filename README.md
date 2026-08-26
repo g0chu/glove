@@ -107,12 +107,12 @@ claims tools it does not have.
   a second. `wikipedia_read` returns the article as clean plain text
   (references, TOC and navigation dropped).
 
-A turn may run several model rounds: rounds that end in tool calls are
-transient (their streamed preview is deleted), the tools execute — each
-call is posted as its own persistent activity message (name + arguments
-only; `DISCORD_SHOW_TOOL_ACTIVITY`) — and the next round continues with
-the results in context. Only the final reply is posted and recorded in the
-channel history. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
+A turn may run several model rounds: a round that ends in tool calls keeps
+its text in place (it stays in the channel above the activity lines), the
+tools execute — each call is posted as its own persistent activity message
+(name + arguments only; `DISCORD_SHOW_TOOL_ACTIVITY`) — and the next round
+continues with the results in context. Only the final reply is recorded in
+the channel history. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
 
 ### Setup
 

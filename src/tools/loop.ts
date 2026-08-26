@@ -23,11 +23,13 @@ export interface ToolTurnDeps {
   maxRounds: number;
   /**
    * Called right after a response that contains tool calls is fully
-   * received (and before the next round starts). The caller uses this to
-   * discard the round's streamed preview *text* — it is transient, not the
-   * answer — while the round's thinking is kept (its live thinking message
-   * is completed into a terminal line so the reasoning shows up between
-   * the tool-activity messages).
+   * received (and before the next round starts) — never for the cutoff
+   * round, whose text the caller's `finish()` posts as the final reply.
+   * The caller uses this to settle the round's streamed preview *text* in
+   * place (the round's narration stays in the channel between the
+   * tool-activity lines) and to complete the round's thinking into a
+   * terminal line so the reasoning shows up between the tool-activity
+   * messages.
    */
   onToolRound?: () => void;
   /**
@@ -58,8 +60,11 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
     }
     if (toolRounds >= deps.maxRounds) {
       // The model still wants tools but the budget is spent: stop and let
-      // the caller post what it has (possibly nothing at all).
-      deps.onToolRound?.();
+      // the caller post what it has (possibly nothing at all). This round
+      // is the turn's last — its text is the final reply (posted and
+      // recorded by the caller's `finish()`, which also completes the
+      // round's thinking line), so no onToolRound: the text is not
+      // transient here.
       return { content: res.content, toolRounds, exhausted: true };
     }
     deps.onToolRound?.();

@@ -1518,9 +1518,9 @@ const ok = (name: string): void => {
   assert.ok((w4d as unknown as { reasoningBuffer: string }).reasoningBuffer.length <= 8000, "the buffer holds only a tail");
   ok("writer: long reasoning keeps the preview bounded (tail + line count)");
 
-  // discard(): a tool-call round's streamed *text* preview is deleted (no
-  // reasoning here, so nothing to persist), and the next round streams a
-  // fresh live message
+  // discard(): a tool-call round's streamed *text* is settled in place (it
+  // stays in the channel between the tool-activity lines — not deleted), and
+  // the next round streams a fresh live message below it
   const msgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const dchan = {
     sendTyping: async (): Promise<void> => {},
@@ -1551,7 +1551,8 @@ const ok = (name: string): void => {
   w5.discard();
   await ticks(3);
   assert.equal(msgs.length, 1, "preview message created");
-  assert.equal(msgs[0].deleted, true, "preview deleted on discard");
+  assert.equal(msgs[0].deleted, false, "the round's text is not deleted on discard");
+  assert.equal(msgs[0].content, "transient", "settled to the round's full text in place");
   w5.chunk("Final answer!");
   await ticks(2);
   const p5 = await w5.finish("Final answer!");
@@ -1559,8 +1560,65 @@ const ok = (name: string): void => {
   assert.equal(msgs[1].deleted, false);
   assert.equal(msgs[1].content, "Final answer!");
   assert.equal(p5!.text, "Final answer!");
-  assert.deepEqual(p5!.messageIds, [msgs[1].id]);
-  ok("writer: discard() deletes the transient preview, next round is fresh");
+  assert.deepEqual(p5!.messageIds, [msgs[1].id], "only the final reply is recorded");
+  ok("writer: discard() settles the round's text in place, next round is fresh");
+
+  // Multi-round turn (the reported bug): with many tool calls in one turn the
+  // text between the rounds used to be deleted — every round's narration
+  // must now stay in the channel above the tool-activity lines (posted by
+  // the caller), and only the final reply is recorded.
+  const multiMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const multiChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `mm${String(multiMsgs.length)}`, content: data.content, deleted: false };
+      multiMsgs.push(m);
+      return {
+        id: m.id,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const wMulti = new ResponseWriter({
+    channel: multiChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  wMulti.start();
+  // Round 1: narration + tool call — the narration stays; the activity line
+  // (caller-posted) lands below it
+  wMulti.chunk("Let me check the docs.");
+  await ticks(2);
+  wMulti.discard();
+  await ticks(3);
+  await multiChan.send({ content: "🔎 web_search (activity)" });
+  // Round 2: a fresh narration below the activity line, then another call
+  wMulti.chunk("Now the second step.");
+  await ticks(2);
+  assert.equal(multiMsgs.length, 3, "narration 1 + activity + narration 2");
+  assert.equal(multiMsgs[0].deleted, false, "round 1's text is not deleted");
+  assert.equal(multiMsgs[0].content, "Let me check the docs.", "round 1's narration settled in place");
+  assert.equal(multiMsgs[1].content, "🔎 web_search (activity)", "activity line sits between the narrations");
+  assert.equal(multiMsgs[2].content, "Now the second step.", "round 2's narration is a fresh message");
+  wMulti.discard();
+  await ticks(3);
+  await multiChan.send({ content: "📁 file_read (activity)" });
+  // Final round: the reply is posted (and recorded)
+  wMulti.chunk("Here is the answer.");
+  await ticks(2);
+  const pMulti = await wMulti.finish("Here is the answer.");
+  assert.equal(multiMsgs.length, 5, "two narrations, two activity lines, final reply");
+  assert.deepEqual(multiMsgs.map((m) => m.deleted), [false, false, false, false, false], "nothing is deleted between the tool-activity lines");
+  assert.equal(multiMsgs[4].content, "Here is the answer.", "the final reply settles in place");
+  assert.deepEqual(pMulti!.messageIds, [multiMsgs[4].id], "only the final reply is recorded");
+  ok("writer: a multi-round turn keeps every round's narration in place");
 
   // LaTeX in model output is sanitized before posting (and in the history).
   const f = makeChannel();
@@ -1702,8 +1760,8 @@ const ok = (name: string): void => {
     throttleMs: 2000,
   });
   wT.start();
-  // Round 1: thinking only, then a tool call (transient text discarded,
-  // thinking persisted by discard()).
+  // Round 1: thinking only (no text to settle), then a tool call — thinking
+  // persisted by discard().
   wT.reason("Round one: gather the data.");
   await ticks(2);
   wT.discard();
@@ -1733,9 +1791,10 @@ const ok = (name: string): void => {
   assert.equal(tMsgs[3].content, "The final answer.", "the reply settles in place");
   assert.deepEqual(tMsgs.map((m) => m.deleted), [false, false, false, false], "no thinking line is deleted");
   ok("writer: every tool-call round's reasoning persists as its own terminal line");
-  // A round that streams both reasoning and transient text: the thinking line
-  // completes when the text takes over, and discard() deletes only the text —
-  // it must NOT post a second terminal line for the same round.
+  // A round that streams both reasoning and text: the thinking line completes
+  // when the text takes over, and discard() settles the text in place (keeps
+  // it, no deletion) — it must NOT post a second terminal line for the same
+  // round.
   const uMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const uChan = {
     sendTyping: async (): Promise<void> => {},
@@ -1765,17 +1824,18 @@ const ok = (name: string): void => {
   await ticks(2);
   wU.chunk("transient text");
   await ticks(2);
-  assert.equal(uMsgs.length, 2, "thinking line + transient text");
+  assert.equal(uMsgs.length, 2, "thinking line + text preview");
   assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*$/, "thinking completes when the text starts");
   assert.equal(uMsgs[0].deleted, false);
   assert.equal(uMsgs[1].content, "transient text");
   wU.discard();
   await ticks(3);
   assert.equal(uMsgs.length, 2, "discard() posts no second terminal line");
-  assert.equal(uMsgs[1].deleted, true, "transient text deleted");
+  assert.equal(uMsgs[1].deleted, false, "the round's text is settled in place (not deleted)");
+  assert.equal(uMsgs[1].content, "transient text", "settled to the round's full text");
   assert.equal(uMsgs[0].deleted, false, "the thinking line is kept");
   assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*$/, "the thinking line is unchanged");
-  ok("writer: a reasoning + text round posts exactly one terminal line");
+  ok("writer: a reasoning + text round posts exactly one terminal line and keeps the text");
 
   // non-stream mode: the whole reasoning arrives at once (one reason() call,
   // no chunks); on finish the thinking line completes in place and the
@@ -1816,8 +1876,8 @@ const ok = (name: string): void => {
   assert.equal(p10!.messageIds.length, 1, "only the note is recorded");
   ok("writer: reasoning-only turn keeps the thinking line, note posted fresh");
 
-  // discard() must delete even a live message whose initial send is still in
-  // flight when discard() runs (the capture happens in the chain step, which
+  // discard() must settle even a live message whose initial send is still in
+  // flight when discard() runs (the settle happens in the chain step, which
   // is queued behind the pending updateLive)
   const raceMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const raceChan = {
@@ -1852,8 +1912,9 @@ const ok = (name: string): void => {
   w11.discard();
   await ticks(4);
   assert.equal(raceMsgs.length, 1, "the preview message was created");
-  assert.equal(raceMsgs[0].deleted, true, "in-flight preview deleted on discard");
-  ok("writer: discard() also deletes a preview whose initial send is in flight");
+  assert.equal(raceMsgs[0].deleted, false, "in-flight preview settled (not deleted) on discard");
+  assert.equal(raceMsgs[0].content, "transient", "settled to the round's full text");
+  ok("writer: discard() also settles a preview whose initial send is in flight");
 
   // long streaming reply: a fresh live message is created per ~2000-char
   // slice, and the final post settles the live messages in place (no re-post)
@@ -2017,7 +2078,7 @@ const ok = (name: string): void => {
   });
   assert.equal(out2.exhausted, true);
   assert.equal(out2.toolRounds, 2);
-  assert.equal(toolRoundSignals, 3, "onToolRound fires for every tool-call response, incl. the cutoff");
+  assert.equal(toolRoundSignals, 2, "onToolRound fires only for the rounds that execute — the cutoff round's text is the final reply, not transient");
   assert.equal(callsSeen2.length, 2, "onToolCalls fires only for executed rounds, not the cutoff");
   ok("loop: maxRounds cutoff reported as exhausted");
 
