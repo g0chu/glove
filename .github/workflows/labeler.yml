@@ -1,16 +1,16 @@
-name: Labeler
-
+name: "Pull Request Labeler"
 on:
-  pull_request_target:
-
-permissions:
-  labels: write
-  pull-requests: write
+- pull_request_target
 
 jobs:
   labeler:
+    permissions:
+      contents: read
+      labels: write
+      pull-requests: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/labeler@v5
-        with:
-          dot-github: .github
+    - uses: actions/checkout@v6
+    - uses: actions/labeler@v6
+      with:
+        configuration-path: '.github/labeler.yml'
