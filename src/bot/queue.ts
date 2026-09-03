@@ -1,29 +1,43 @@
 import { errMsg, log } from "../log.js";
 
+/**
+ * One queued turn: the triggering message (in the channel context when the
+ * turn runs) plus whether the model must first decide whether to respond at
+ * all. `chime: false` is a mention — the bot always responds. `chime: true`
+ * is a message from another bot that did not mention the bot (chime
+ * enabled): the model decides, and a NO stays silent.
+ */
+export interface TurnRequest {
+  id: string;
+  chime: boolean;
+}
+
 export interface QueueDeps {
   /**
-   * Run one full turn for a queued mention. The mention is already in the
-   * channel history (see index.ts); this callback builds the request from
-   * the current history, calls the model, and posts the reply.
+   * Run one full turn for a queued turn request. The triggering message is
+   * already in the channel context (see index.ts); this callback builds the
+   * request from the current context, calls the model, and posts the reply
+   * (a declined chime posts nothing).
    */
-  runTurn: (channelId: string, mentionId: string) => Promise<void>;
+  runTurn: (channelId: string, turn: TurnRequest) => Promise<void>;
 }
 
 /**
  * FIFO queue + serial worker for a single channel (PLAN.md §4).
  *
- * Every trackable message lands in the channel history as soon as it
- * arrives (mention or ambient); this queue only holds *mentions*, i.e. the
- * turns to run. Semantics:
- *  - one turn (mention -> model reply) at a time;
- *  - mentions arriving while a turn is in flight are queued, not dropped;
+ * Every trackable message lands in the channel context as soon as it
+ * stabilizes (mention or ambient); this queue only holds the *turns to run*:
+ * mentions (which always respond) and, with chime enabled, other bots'
+ * non-mention messages (which the model may decline). Semantics:
+ *  - one turn (trigger -> model reply) at a time;
+ *  - turns arriving while one is in flight are queued, not dropped;
  *  - turns run in arrival order;
- *  - ambient (non-mention) messages never trigger a turn;
- *  - a mention whose message left the channel context (deleted) before its
+ *  - ambient (non-mention, non-chime) messages never trigger a turn;
+ *  - a trigger whose message left the channel context (deleted) before its
  *    turn runs is skipped by runTurn.
  */
 export class ChannelQueue {
-  private pending: string[] = [];
+  private pending: TurnRequest[] = [];
   private pumping = false;
 
   constructor(
@@ -35,9 +49,9 @@ export class ChannelQueue {
     return this.pending.length;
   }
 
-  /** Queue a mention to be answered, in arrival order. */
-  push(mentionId: string): void {
-    this.pending.push(mentionId);
+  /** Queue a turn to run, in arrival order. */
+  push(request: TurnRequest): void {
+    this.pending.push(request);
     void this.pump();
   }
 
@@ -46,9 +60,9 @@ export class ChannelQueue {
     this.pumping = true;
     try {
       while (this.pending.length > 0) {
-        const mentionId = this.pending.shift()!;
+        const turn = this.pending.shift()!;
         try {
-          await this.deps.runTurn(this.channelId, mentionId);
+          await this.deps.runTurn(this.channelId, turn);
         } catch (err) {
           // runTurn is expected to handle its own errors; belt and braces so
           // the worker never dies and the channel loop keeps going.

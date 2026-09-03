@@ -1,20 +1,30 @@
 import type { ChatMessage, MessageAttachmentLike } from "./client.js";
 import { isImageAttachment } from "./client.js";
-import type { Role } from "./history.js";
-import { speakerLabel } from "./history.js";
+
+/** The role of one context entry (the request `messages` array uses it). */
+export type Role = "user" | "assistant";
 
 /**
- * The persistent per-channel conversation context (compaction mode).
+ * The speaker label the model sees on a non-bot message: the author's
+ * display name, with a "(bot)" marker for other bots (mirroring Discord's
+ * badge). The bot's own replies carry no label — the assistant role already
+ * says who.
+ */
+export function speakerLabel(name: string, isBot: boolean): string {
+  return isBot ? `${name} (bot)` : name;
+}
+
+/**
+ * The persistent per-channel conversation context.
  *
- * Where ChannelHistory is a sliding window that drops old messages, this
- * context grows: the channel's last N messages are seeded in when the bot
- * first talks in the channel after a start (so the context is exactly what
- * is in the channel, every author included), every new trackable message
- * and bot reply is appended, and nothing is dropped until the context fills
- * up. When the estimated request size passes the configured token budget,
- * the older part is folded into a model-written summary (compaction); the
- * newest messages stay verbatim. Everything is in-memory: after a restart
- * the context re-seeds from the channel again.
+ * The context grows: the channel's last N messages are seeded in when the
+ * bot first talks in the channel after a start (so the context is exactly
+ * what is in the channel, every author included), every new trackable
+ * message and bot reply is appended, and nothing is dropped until the
+ * context fills up. When the estimated request size passes the configured
+ * token budget, the older part is folded into a model-written summary
+ * (compaction); the newest messages stay verbatim. Everything is in-memory:
+ * after a restart the context re-seeds from the channel again.
  */
 
 /** One entry in the persistent channel context: exactly one Discord message, or one bot reply. */
@@ -52,9 +62,8 @@ export interface SeedEntry {
  * one chunked reply. Chunks of one reply land within the same posting burst
  * (a few seconds at most, even under rate limits), while separate replies
  * are a full turn (seconds to minutes) apart — so a 5 s gap never merges two
- * distinct replies. Used by the startup seed and the classic live fetch to
- * group a reply's chunks back into one entry (matching how the live stores
- * keep them: one entry, one id per chunk).
+ * distinct replies. Used by the startup seed to group a reply's chunks back
+ * into one entry (one entry, one id per chunk).
  */
 export const BOT_REPLY_GROUP_GAP_MS = 5000;
 
