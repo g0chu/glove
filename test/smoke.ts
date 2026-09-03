@@ -31,7 +31,7 @@ import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../
 import { buildChannelContext, contextFromMessages, contextToMessages, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
-import { formatToolCall } from "../src/tools/activity.js";
+import { formatToolCall, ToolActivityPoster } from "../src/tools/activity.js";
 import { buildTools } from "../src/tools/index.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
 import { FetchCache } from "../src/tools/web/cache.js";
@@ -678,7 +678,7 @@ const ok = (name: string): void => {
   const oldReply = m(authors.bot, "old reply"); // not in history (bot restarted since)
   const beep = m(authors.carl, "beep");
   const think = m(authors.bot, "🤔 *Let me check the units first. (3s)*"); // our UI line
-  const activity = m(authors.bot, "🔎 *web_search(query=\"x\")*"); // our UI line
+  const activity = m(authors.bot, '🔎 *web_search(query="x")*\n📁 *file_read(path="notes.md")*'); // our UI line (one batched message per turn)
   const wiki = m(authors.bot, "📚 *wikipedia_search(query=\"loop\")*"); // our UI line
   const chunkA = m(authors.bot, "part one");
   const chunkB = m(authors.bot, "part two");
@@ -2173,6 +2173,120 @@ const ok = (name: string): void => {
   // JSON-escaped backslash: the parsed query value is the LaTeX `$\alpha$`
   assert.equal(formatToolCall({ id: "d2", name: "web_search", arguments: '{"query":"$x^2$ and $\\\\alpha$"}' }), '🔎 *web_search(query="x² and α")*', "math in args sanitized");
   ok("activity: one line per call, args truncated, asterisks dropped, math sanitized");
+
+  // The turn's whole tool activity lives in a single message (posted by the
+  // first round, edited in place by every later round — a round's calls
+  // arrive together, so they cost one edit) — one new Discord message per
+  // turn, no matter how many calls run.
+  const batched: Array<{ id: string; content: string; edits: number }> = [];
+  const batchedChan = {
+    send: async (data: { content: string }) => {
+      const m = { id: `ta${String(batched.length + 1)}`, content: data.content, edits: 0 };
+      batched.push(m);
+      return {
+        id: m.id,
+        content: m.content,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          m.edits += 1;
+          return m;
+        },
+      };
+    },
+  };
+  const poster = new ToolActivityPoster(batchedChan as unknown as GuildTextBasedChannel);
+  await poster.addCalls([
+    { id: "t1", name: "web_search", arguments: '{"query":"quantum computing"}' },
+    { id: "t2", name: "file_read", arguments: '{"path":"notes.md"}' },
+    { id: "t3", name: "shell_exec", arguments: '{"command":"git status"}' },
+  ]);
+  assert.equal(batched.length, 1, "one new message for the whole turn");
+  assert.equal(batched[0].edits, 0, "the first round posts, not edits");
+  assert.equal(
+    batched[0].content,
+    ['🔎 *web_search(query="quantum computing")*', '📁 *file_read(path="notes.md")*', '🐚 *shell_exec(command="git status")*'].join("\n"),
+    "a round's lines land together, in call order",
+  );
+  await poster.addCalls([{ id: "t4", name: "wikipedia_search", arguments: '{"query":"z"}' }]);
+  assert.equal(batched.length, 1, "the second round reuses the message");
+  assert.equal(batched[0].edits, 1, "later rounds edit it in place");
+  assert.ok(batched[0].content.endsWith('📚 *wikipedia_search(query="z")*'), "the new round's line is appended");
+  assert.match(batched[0].content, /^🔎 \*/, "the first line keeps its icon (the message stays a UI line, never context)");
+  ok("activity: the turn's rounds share one message (posted once, edited in place)");
+
+  // The 2000-char cap: the oldest lines are dropped behind the "… N earlier
+  // calls …" header (which keeps a leading icon, so the message stays a UI
+  // line) and the newest lines are kept.
+  let capSends = 0;
+  let capContent = "";
+  const capChan = {
+    send: async (data: { content: string }) => {
+      capSends += 1;
+      capContent = data.content;
+      return {
+        id: "tc1",
+        content: capContent,
+        edit: async (u: { content: string }) => {
+          capContent = u.content;
+          return { id: "tc1", content: capContent };
+        },
+      };
+    },
+  };
+  const capPoster = new ToolActivityPoster(capChan as unknown as GuildTextBasedChannel);
+  const capArgs = JSON.stringify({ query: "q".repeat(60), url: "https://example.com/" + "x".repeat(60) });
+  await capPoster.addCalls(Array.from({ length: 40 }, (_, i) => ({ id: `c${String(i)}`, name: "web_search", arguments: capArgs })));
+  assert.equal(capSends, 1, "still one message after 40 calls");
+  assert.ok(capContent.length <= 2000, `the cap keeps the message under 2000 (got ${capContent.length})`);
+  const capLines = capContent.split("\n");
+  const earlier = Number(capLines[0].match(/… (\d+) earlier calls …/)?.[1] ?? -1);
+  assert.ok(earlier > 0, `the header counts the dropped lines (got: ${capLines[0]})`);
+  assert.equal(earlier + capLines.length - 1, 40, "kept + dropped = every call");
+  assert.match(capLines[capLines.length - 1], /web_search/, "the newest lines are kept");
+  ok("activity: the 2000-char cap drops the oldest lines behind the header");
+
+  // A failed first post is retried on the next round (the retry carries
+  // every call so far); a failed edit keeps the last good content and is
+  // retried the same way.
+  const flaky = { sends: 0, edits: 0, content: "", failSend: false, failEdit: false };
+  const flakyChan = {
+    send: async (data: { content: string }) => {
+      flaky.sends += 1;
+      if (flaky.failSend) {
+        flaky.failSend = false;
+        throw new Error("rate limited");
+      }
+      flaky.content = data.content;
+      return {
+        id: "tf1",
+        content: flaky.content,
+        edit: async (u: { content: string }) => {
+          flaky.edits += 1;
+          if (flaky.failEdit) {
+            flaky.failEdit = false;
+            throw new Error("rate limited");
+          }
+          flaky.content = u.content;
+          return { id: "tf1", content: flaky.content };
+        },
+      };
+    },
+  };
+  const flakyPoster = new ToolActivityPoster(flakyChan as unknown as GuildTextBasedChannel);
+  flaky.failSend = true;
+  await flakyPoster.addCalls([{ id: "f1", name: "web_search", arguments: '{"query":"a"}' }]);
+  assert.equal(flaky.sends, 1, "the first post was attempted");
+  await flakyPoster.addCalls([{ id: "f2", name: "file_read", arguments: '{"path":"b"}' }]);
+  assert.equal(flaky.sends, 2, "the failed post is retried on the next round");
+  assert.ok(flaky.content.includes("web_search") && flaky.content.includes("file_read"), "the retried post carries every call");
+  flaky.failEdit = true;
+  await flakyPoster.addCalls([{ id: "f3", name: "shell_exec", arguments: '{"command":"c"}' }]);
+  assert.equal(flaky.edits, 1, "the edit was attempted");
+  assert.ok(!flaky.content.includes("shell_exec"), "a failed edit keeps the last good content");
+  await flakyPoster.addCalls([{ id: "f4", name: "wikipedia_search", arguments: '{"query":"d"}' }]);
+  assert.equal(flaky.edits, 2, "the next round retries the edit");
+  assert.ok(flaky.content.includes("shell_exec") && flaky.content.includes("wikipedia_search"), "the retried edit carries every call");
+  ok("activity: failed posts/edits are retried on the next round");
 }
 
 // ------------------------------------------------------------ web tools --

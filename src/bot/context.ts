@@ -97,9 +97,11 @@ interface ContextEntry {
 }
 
 /**
- * The bot's own UI lines — tool activity ("🔎 *…*", "📁 *…*", "📚 *…*",
- * "🔧 *…*") and the thinking line ("🤔 *thought for Ns*") — are posted for humans,
- * not part of the conversation: they never enter the model context.
+ * The bot's own UI lines — the tool-activity message (one per turn, edited
+ * in place as calls arrive: its first line is "🔎 *…*", "📁 *…*", "📚 *…*",
+ * "🔧 *…*" or the "🔧 *… N earlier calls …*" header) and the thinking line
+ * ("🤔 *thought for Ns*") — are posted for humans, not part of the
+ * conversation: they never enter the model context.
  */
 const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚|🧹) \*/;
 

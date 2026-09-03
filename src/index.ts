@@ -9,7 +9,7 @@ import { ChannelContextStore, type ChannelContext } from "./llm/context.js";
 import { ConversationStore, type ChannelHistory } from "./llm/history.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
-import { formatToolCall } from "./tools/activity.js";
+import { ToolActivityPoster } from "./tools/activity.js";
 import { buildTools } from "./tools/index.js";
 import { runToolTurn } from "./tools/loop.js";
 
@@ -93,6 +93,11 @@ async function main(): Promise<void> {
       typingIntervalMs: cfg.discord.typingIntervalMs,
       throttleMs: cfg.discord.streamUpdateThrottleMs,
     });
+    // All of the turn's tool calls share one activity message (the first
+    // round posts it, later rounds edit it in place) instead of one new
+    // message per call — the channel stays quiet even when the model runs
+    // many rounds.
+    const activity = new ToolActivityPoster(textChannel);
     try {
       // Build the context before the typing indicator starts: it is a
       // channel fetch (+ image downloads, + one summarization call when the
@@ -155,18 +160,12 @@ async function main(): Promise<void> {
         onToolRound: () => writer.discard(),
         onToolCalls: async (calls) => {
           if (!cfg.discord.showToolActivity) return;
-          // One persistent message per call. Bot messages never enter the
-          // channel history (isTrackable), so the model's context is
-          // untouched — the results, which stay internal, are what matter.
-          for (const call of calls) {
-            try {
-              // The activity line shows tool args, which may carry a stray
-              // mention: suppress everyone/role pings (see SAFE_MENTIONS).
-              await textChannel.send({ content: formatToolCall(call), allowedMentions: SAFE_MENTIONS });
-            } catch (err) {
-              log.warn(`failed to post tool activity: ${errMsg(err)}`);
-            }
-          }
+          // Every call of the turn lands in the one shared activity message
+          // (the first round posts it, later rounds edit it in place). Bot
+          // messages never enter the channel history (isTrackable), so the
+          // model's context is untouched — the results, which stay internal,
+          // are what matter.
+          await activity.addCalls(calls);
         },
       });
       if (outcome.toolRounds > 0) {
