@@ -28,16 +28,39 @@ npm run dev            # or: npm run build && npm start
 
 ## Behavior
 
-- **Trigger:** the bot answers only when @mentioned (replies to its messages
+- **Trigger:** the bot answers when @mentioned (replies to its messages
   count as mentions) in any text channel of `DISCORD_GUILD_ID` — or of any
   guild the bot is a member of when `DISCORD_GUILD_ID` is left empty (DMs
-  are never tracked).
-- **Memory:** per-channel sliding window of the last
-  `MODEL_CONTEXT_MAX_MESSAGES` (default 20) messages; an optional
-  `MODEL_SYSTEM_PROMPT` is prepended to every request. Every message in the
-  channel enters the window as soon as it arrives (mentions and non-mentions
-  alike), and edits and deletions are reflected, so the model always sees
-  the channel's current state.
+  are never tracked). Mentions from other bots queue a turn too, so a bot's
+  answer can ask the model for more; other bots' messages are tracked as
+  context and labeled `(bot)` in it, while the bot's own messages never
+  are. Without a mention, a message only triggers the bot when chime is on
+  (below).
+- **Chime** (`BOT_CHIME_ENABLED`, default off): the bot can *chime in* to
+  conversations it is not mentioned in — but only when another bot speaks,
+  and only if the model wants to. Each such message queues a turn in which
+  the model first makes one small tool-less decision (a YES/NO answer over
+  the channel's transcript): YES runs a normal turn (streamed reply, tools
+  and all), NO stays completely silent (no typing indicator, no message,
+  nothing recorded; a failed decision stays silent too). Human non-mentions
+  never trigger a chime.
+- **Stability gate:** a message is committed to the channel context (and
+  able to queue a turn) only once it has been unchanged for
+  `DISCORD_MESSAGE_STABLE_MS` (default 2000). Other bots stream their
+  replies by posting a message and editing it as the text arrives; the gate
+  commits the completed message instead of every partial edit, so the model
+  sees it whole — and a mention that only exists in the final form queues
+  exactly one turn. A message deleted while still pending never enters the
+  context (nothing is lost: it simply never happened).
+- **Memory:** per-channel context that starts with the channel's last
+  `MODEL_CONTEXT_MAX_MESSAGES` (default 20) messages when the bot first
+  talks there, then only grows as new messages arrive — every message is
+  tracked (mentions and non-mentions alike), and edits and deletions are
+  reflected, so nothing is lost from the context. When the estimated
+  request size reaches `CONTEXT_COMPACTION_MAX_TOKENS`, the older part is
+  replaced by a summary the model itself writes and the newest
+  `CONTEXT_COMPACTION_KEEP_MESSAGES` messages stay verbatim. An optional
+  `MODEL_SYSTEM_PROMPT` is prepended to every request.
 - **Streaming:** by default the answer is built up live: typing indicator
   while generating, message created on the first chunk, edits throttled to
   at least `DISCORD_STREAM_UPDATE_THROTTLE_MS` apart. Set `MODEL_STREAM=false`
@@ -72,10 +95,10 @@ npm run dev            # or: npm run build && npm start
 - **Clear:** sending `!clear` (exact match, case-insensitive) in a text
   channel resets that channel's model context for a fresh chat: the command
   is neither tracked nor answered, the bot posts a short confirmation line
-  ("🧹 *…*"), and everything before it is forgotten — in compaction mode the
-  context (entries + summary) is dropped and not re-seeded, in classic mode
-  the live fetch only considers messages after the command. Mentions queued
-  before the clear are skipped.
+  ("🧹 *…*"), the context (entries + summary) is dropped and not re-seeded,
+  and the next turn starts from messages that arrive after the clear.
+  Mentions queued before the clear are skipped (their mention is no longer
+  in the context).
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 

@@ -1,13 +1,12 @@
 /**
- * Smoke tests: config parsing, history window, code-fence-aware chunk
- * splitting, image attachment downloads, turn-context building (last-N
- * channel messages) incl. the compaction mode (persistent per-channel
- * context: seed, growth, summarization, emergency trim) and the !clear
- * command (fresh-chat reset in both modes), queue semantics,
- * response writer behavior (incl.
- * multi-message streaming of long replies), the tool executor and tool
- * loop, the in-process web/file/shell/zim tools (against a synthetic ZIM
- * file built in a temp dir), and the LLM client (stream +
+ * Smoke tests: config parsing, the stability gate (a message commits once
+ * it has been unchanged for the window), code-fence-aware chunk splitting,
+ * image attachment downloads, turn-context building (the persistent
+ * per-channel context: seed, growth, compaction, emergency trim) and the
+ * !clear command (fresh-chat reset), queue semantics, response writer
+ * behavior (incl. multi-message streaming of long replies), the tool
+ * executor and tool loop, the in-process web/file/shell/zim tools (against
+ * a synthetic ZIM file built in a temp dir), and the LLM client (stream +
  * non-stream + tool calls + errors + multimodal wire shape) against a
  * local mock OpenAI-compatible server. Run with: npm test
  */
@@ -19,16 +18,17 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
-import { ChannelHistory, ConversationStore, toRequestMessages } from "../src/llm/history.js";
-import { CLEAR_CONFIRMATION, isClearCommand, isTrackable } from "../src/bot/router.js";
+import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable } from "../src/bot/router.js";
 import { ChannelContext, COMPACTION_SYSTEM_PROMPT, estimateTokens } from "../src/llm/context.js";
+import { MessageGate, type GateMessage } from "../src/bot/gate.js";
+import { CHIME_SYSTEM_PROMPT, decideChime } from "../src/bot/chime.js";
 import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
-import { ChannelQueue } from "../src/bot/queue.js";
+import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, contextFromMessages, contextToMessages, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, contextToMessages, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { formatToolCall, ToolActivityPoster } from "../src/tools/activity.js";
@@ -88,6 +88,8 @@ const ok = (name: string): void => {
   assert.equal(config.discord.streamUpdateThrottleMs, 2000); // default
   assert.equal(config.discord.showReasoning, true); // default
   assert.equal(config.discord.showToolActivity, true); // default
+  assert.equal(config.discord.messageStableMs, 2000); // default
+  assert.equal(config.discord.chimeEnabled, false); // default
   ok("config: parses valid env and applies defaults");
 
   const { errors: badErrors } = parseConfig({
@@ -129,7 +131,8 @@ const ok = (name: string): void => {
     TOOLS_MAX_ROUNDS: "7",
     DISCORD_SHOW_REASONING: "false",
     DISCORD_SHOW_TOOL_ACTIVITY: "false",
-    CONTEXT_COMPACTION_ENABLED: "false",
+    DISCORD_MESSAGE_STABLE_MS: "350",
+    BOT_CHIME_ENABLED: "true",
   });
   assert.deepEqual(te, []);
   assert.equal(tc.discord.showReasoning, false);
@@ -150,7 +153,8 @@ const ok = (name: string): void => {
   assert.equal(tc.tools.shell.maxOutputBytes, 2048);
   assert.equal(tc.tools.maxResultChars, 12345);
   assert.equal(tc.tools.maxRounds, 7);
-  assert.equal(tc.model.compactionEnabled, false);
+  assert.equal(tc.discord.messageStableMs, 350);
+  assert.equal(tc.discord.chimeEnabled, true);
   ok("config: tools section parses env and applies defaults");
 
   const { config: td } = parseConfig({
@@ -171,7 +175,6 @@ const ok = (name: string): void => {
   assert.equal(td.model.imagesMaxBytes, 10_485_760); // default
   assert.equal(td.model.enableFileContents, false, "file contents off by default");
   assert.equal(td.model.fileContentsMaxBytes, 1_000_000); // default
-  assert.equal(td.model.compactionEnabled, true, "compaction on by default");
   assert.equal(td.model.compactionMaxTokens, 4000); // default
   assert.equal(td.model.compactionKeepMessages, 20); // default
   ok("config: tools disabled by default");
@@ -196,82 +199,6 @@ const ok = (name: string): void => {
   assert.deepEqual(gaErrors, []);
   assert.equal(ga.discord.guildId, "", "no DISCORD_GUILD_ID -> respond in every guild");
   ok("config: DISCORD_GUILD_ID is optional (empty = any guild the bot is in)");
-}
-
-// --------------------------------------------------------------- history --
-{
-  const h = new ChannelHistory(3);
-  h.push("user", "a", ["1"]);
-  h.push("assistant", "b", ["2"]);
-  h.push("user", "c", ["3"]);
-  h.push("user", "d", ["4"]);
-  h.push("assistant", "e", ["5"]);
-  assert.deepEqual(
-    h.snapshot().map((m) => `${m.role}:${m.content}`),
-    ["user:c", "user:d", "assistant:e"],
-  );
-  ok("history: sliding window keeps only the last N");
-
-  // Edits update in place (keeping position); deletes drop the entry.
-  const h2 = new ChannelHistory(10);
-  h2.push("user", "hi", ["10"]);
-  h2.push("assistant", "hello", ["11"]);
-  h2.push("user", "thanks", ["12"]);
-  h2.updateContent("10", "hii (edited)");
-  assert.deepEqual(h2.snapshot().map((m) => m.content), ["hii (edited)", "hello", "thanks"]);
-  assert.equal(h2.has("11"), true);
-  assert.equal(h2.removeById("11"), true, "assistant entry removed by its message id");
-  assert.deepEqual(h2.snapshot().map((m) => m.content), ["hii (edited)", "thanks"]);
-  assert.equal(h2.removeById("nope"), false, "unknown id is a no-op");
-  ok("history: id-based edit/delete keeps the window in sync");
-
-  // Chunked assistant replies: any chunk id resolves the entry, and editing
-  // a chunk rebuilds the visible text from the stored chunks.
-  const h3 = new ChannelHistory(10);
-  h3.push("assistant", "canonical full reply", ["20", "21"], ["part one", "part two"]);
-  assert.equal(h3.find("21")!.content, "canonical full reply");
-  h3.updateChunk("21", "part two (edited)");
-  assert.equal(h3.find("21")!.content, "part one\npart two (edited)");
-  assert.equal(h3.find("20")!.content, "part one\npart two (edited)", "first chunk id resolves the same entry");
-  h3.updateChunk("21", "part two");
-  assert.equal(h3.find("20")!.content, "part one\npart two", "editing back rebuilds too");
-  assert.equal(h3.removeById("20"), true, "deleting any chunk drops the whole reply");
-  assert.equal(h3.length, 0);
-  ok("history: chunked assistant entries (rebuild on edit, drop on delete)");
-
-  const h4 = new ChannelHistory(10);
-  h4.push("user", "", ["30"]); // e.g. a bare mention: tracked, but no text
-  h4.push("user", "hi", ["31"], undefined, "Alice");
-  h4.push("user", "beep", ["32"], undefined, "Carl", true); // another bot
-  assert.deepEqual(toRequestMessages(h4, "You are helpful."), [
-    { role: "system", content: "You are helpful." },
-    { role: "user", content: "Alice: hi" },
-    { role: "user", content: "Carl (bot): beep" },
-  ]);
-  assert.deepEqual(toRequestMessages(h4, "   "), [
-    { role: "user", content: "Alice: hi" },
-    { role: "user", content: "Carl (bot): beep" },
-  ], "the bot flag marks the label, humans are unmarked");
-  ok("history: request messages skip textless entries, label speakers (bot marker), system prompt optional");
-
-  // !clear (classic mode): the store clears the window and records the
-  // boundary message id; a newer clear moves it; forgetting the channel
-  // (delete) forgets it too.
-  const store = new ConversationStore(5);
-  store.get("c1").push("user", "old talk", ["o1"], undefined, "Alice");
-  assert.equal(store.getResetAfter("c1"), null, "no boundary yet");
-  store.markCleared("c1", "cl1");
-  assert.equal(store.get("c1").length, 0, "the in-memory window is cleared");
-  assert.equal(store.getResetAfter("c1"), "cl1");
-  store.get("c1").push("user", "new talk", ["n1"], undefined, "Alice");
-  store.markCleared("c1", "cl2");
-  assert.equal(store.getResetAfter("c1"), "cl2", "a newer clear moves the boundary");
-  assert.equal(store.get("c1").length, 0, "cleared again");
-  store.markCleared("c2", "cl3");
-  assert.equal(store.getResetAfter("c2"), "cl3", "works for a channel without a window yet");
-  store.clear("c1");
-  assert.equal(store.getResetAfter("c1"), null, "forgetting the channel forgets the boundary");
-  ok("history: !clear clears the window and records/moves the boundary (channel clear forgets it)");
 }
 
 // ---------------------------------------------------------------- clear --
@@ -313,6 +240,206 @@ const ok = (name: string): void => {
   assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText, { id: botId, bot: true }), botId, ""), false, "our own messages are never tracked");
   assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildVoice, human), botId, ""), false, "voice channels are ignored");
   ok("router: isTrackable (empty guild id = any guild; DMs/voice never tracked, other bots tracked)");
+
+  // A mention queues a turn from any author — a human's or another bot's
+  // (the latter is what lets a bot's streamed reply ask the LLM for more).
+  const withMentions = (bot: boolean, mentioned: boolean): Message =>
+    ({
+      author: { id: bot ? "bot2" : "user1", bot },
+      mentions: { has: (id: string) => mentioned && id === botId },
+    }) as unknown as Message;
+  assert.equal(isMentionOf(withMentions(false, true), botId), true, "a human mention");
+  assert.equal(isMentionOf(withMentions(true, true), botId), true, "another bot's mention queues a turn too");
+  assert.equal(isMentionOf(withMentions(true, false), botId), false, "no mention, no turn");
+  ok("router: isMentionOf works for any author (humans and other bots alike)");
+}
+
+// ----------------------------------------------------------------- gate --
+{
+  // The stability gate, driven with an injected timer (no real sleeps): a
+  // message commits exactly once, when it has been unchanged for the
+  // window, carrying the latest (final) state it has seen. That is what
+  // makes other bots' streamed replies (posted, then edited as the text
+  // arrives) reach the LLM complete — and a mention only in the final
+  // content queue exactly one turn.
+  const fakeMsg = (id: string, channelId: string, content: string): GateMessage =>
+    ({ id, channel: { id: channelId }, content }) as unknown as GateMessage;
+  const makeTimers = () => {
+    const live = new Map<number, () => void>();
+    const cbs = new Map<number, () => void>();
+    let seq = 0;
+    const schedule = (fn: () => void, _ms: number): number => {
+      const t = ++seq;
+      cbs.set(t, fn);
+      live.set(t, fn);
+      return t;
+    };
+    const cancel = (t: number): void => {
+      live.delete(t);
+    };
+    return { live, cbs, schedule, cancel };
+  };
+
+  // A fresh, unedited message commits once the window fires — and only
+  // once (a stale re-firing of the timer is a no-op).
+  {
+    const fired: GateMessage[] = [];
+    const timers = makeTimers();
+    const gate = new MessageGate({
+      stableMs: 2000,
+      onCommit: (m) => fired.push(m),
+      schedule: timers.schedule,
+      cancel: timers.cancel,
+    });
+    const m = fakeMsg("1", "c1", "hello");
+    gate.arrive(m);
+    assert.equal(gate.isPending("1"), true);
+    assert.equal(gate.size, 1);
+    const [t0] = [...timers.live.keys()];
+    timers.live.get(t0)!(); // the window elapsed with no edits
+    assert.deepEqual(fired, [m], "committed exactly once, with the final state");
+    assert.equal(gate.isPending("1"), false);
+    assert.equal(gate.size, 0);
+    timers.live.get(t0)!(); // re-firing the stale timer must not commit again
+    assert.equal(fired.length, 1, "the commit is a no-op after the entry is gone");
+  }
+  ok("gate: a stable message commits exactly once with its final state");
+
+  // Other bots stream their replies: posted as a placeholder, edited as the
+  // text arrives. Every edit restarts the window (cancelling the old timer),
+  // and the commit carries the final content — the mention only exists in
+  // the final form, so it queues exactly one turn, not one per partial.
+  {
+    const fired: GateMessage[] = [];
+    const timers = makeTimers();
+    const gate = new MessageGate({
+      stableMs: 2000,
+      onCommit: (m) => fired.push(m),
+      schedule: timers.schedule,
+      cancel: timers.cancel,
+    });
+    const streamed = fakeMsg("9", "c1", ""); // the bot's placeholder
+    gate.arrive(streamed);
+    const t1 = [...timers.live.keys()][0];
+    streamed.content = "Hel"; // streamed partial: the update handler refreshes
+    gate.arrive(streamed);
+    const t2 = [...timers.live.keys()].filter((t) => t !== t1)[0];
+    streamed.content = "Hello, @glove, do the thing"; // the final edit
+    gate.arrive(streamed);
+    const t3 = [...timers.live.keys()].filter((t) => t !== t1 && t !== t2)[0];
+    assert.equal(gate.isPending("9"), true, "still pending while it keeps being edited");
+    assert.equal(timers.live.has(t1), false, "the first window was cancelled by the first edit");
+    assert.equal(timers.live.has(t2), false, "the second window was cancelled by the final edit");
+    assert.equal(fired.length, 0, "no partial content ever commits");
+    timers.live.get(t3)!(); // the final edit's window fires: stable now
+    assert.equal(fired.length, 1, "exactly one commit");
+    assert.equal(fired[0], streamed);
+    assert.equal(fired[0].content, "Hello, @glove, do the thing", "the commit carries the final content");
+    assert.equal(gate.isPending("9"), false);
+  }
+  ok("gate: a streamed (edited-as-arriving) message commits once, with its final content");
+
+  // A message deleted while pending never commits — even if its (cancelled)
+  // timer fires anyway. A second drop is a no-op.
+  {
+    let committed = false;
+    const cbs: Array<() => void> = [];
+    const gate = new MessageGate({
+      stableMs: 2000,
+      onCommit: () => {
+        committed = true;
+      },
+      // a no-op cancel: keep the callbacks reachable so the stale firing
+      // below can prove the guard, not just the cancellation, works
+      schedule: (fn) => {
+        cbs.push(fn);
+        return cbs.length;
+      },
+      cancel: () => {},
+    });
+    gate.arrive(fakeMsg("x", "c1", "gone soon"));
+    assert.equal(gate.isPending("x"), true);
+    assert.equal(gate.drop("x"), true, "a pending message is dropped");
+    assert.equal(gate.drop("x"), false, "a second drop is a no-op");
+    assert.equal(gate.drop("never-there"), false);
+    cbs[0](); // the cancelled timer fires anyway: the guard keeps it out
+    assert.equal(committed, false, "a dropped message never commits");
+  }
+  ok("gate: a message deleted while pending never commits");
+
+  // Independence: messages commit individually; clearChannel forgets only
+  // that channel's pending messages; clear() forgets everything.
+  {
+    const fired: string[] = [];
+    const timers = makeTimers();
+    const gate = new MessageGate({
+      stableMs: 2000,
+      onCommit: (m) => fired.push(m.id),
+      schedule: timers.schedule,
+      cancel: timers.cancel,
+    });
+    const a = fakeMsg("a", "c1", "A");
+    const b = fakeMsg("b", "c1", "B");
+    const d = fakeMsg("d", "c2", "D");
+    gate.arrive(a);
+    gate.arrive(b);
+    gate.arrive(d);
+    assert.equal(gate.size, 3);
+    const [ta, _tb, td] = [...timers.live.keys()];
+    timers.live.get(ta)!(); // only a's window fires
+    assert.deepEqual(fired, ["a"], "each message commits on its own window");
+    gate.clearChannel("c1");
+    assert.equal(gate.isPending("b"), false, "b's channel was cleared");
+    assert.equal(gate.isPending("d"), true, "another channel is untouched");
+    gate.clear();
+    assert.equal(gate.size, 0, "clear() forgets everything");
+    timers.cbs.get(td)!(); // d's cancelled timer fires anyway: no commit
+    assert.deepEqual(fired, ["a"], "cleared messages never commit");
+  }
+  ok("gate: per-message commits; clearChannel/clear forget pending messages without committing");
+}
+
+// --------------------------------------------------------------- chime --
+{
+  // The chime decision (driven with a fake client — no HTTP): the model sees
+  // the system prompt + the transcript and answers YES/NO; anything that is
+  // not a YES (garbage, empty, a failed call) keeps the bot silent.
+  const fakeLlm = (content: string, fail = false): LlmClient =>
+    ({
+      chat: async (): Promise<ChatResult> => {
+        if (fail) throw new Error("llm down");
+        return { content, toolCalls: [] };
+      },
+    }) as unknown as LlmClient;
+  const transcript: ChatMessage[] = [
+    { role: "user", content: "Alice: hi" },
+    { role: "user", content: "Bob (bot): should we ship it?" },
+  ];
+  assert.equal(await decideChime(fakeLlm("YES"), transcript), true);
+  assert.equal(await decideChime(fakeLlm("yes"), transcript), true, "case-insensitive");
+  assert.equal(await decideChime(fakeLlm("YES — it asks a direct question"), transcript), true, "the leading word decides");
+  assert.equal(await decideChime(fakeLlm("NO"), transcript), false);
+  assert.equal(await decideChime(fakeLlm("no, it is just chatter"), transcript), false);
+  assert.equal(await decideChime(fakeLlm("maybe"), transcript), false, "garbage stays silent");
+  assert.equal(await decideChime(fakeLlm(""), transcript), false, "an empty answer stays silent");
+  assert.equal(await decideChime(fakeLlm("", true), transcript), false, "a failed call stays silent");
+  ok("chime: YES only on a YES answer (NO, garbage, empty, and errors stay silent)");
+
+  // The decision call is tool-less: system prompt first, then the transcript
+  // (which ends with the message to decide about) — nothing else.
+  let sent: ChatMessage[] = [];
+  const spying = {
+    chat: async (msgs: ChatMessage[]): Promise<ChatResult> => {
+      sent = msgs;
+      return { content: "YES", toolCalls: [] };
+    },
+  } as unknown as LlmClient;
+  await decideChime(spying, transcript);
+  assert.equal(sent.length, transcript.length + 1);
+  assert.equal(sent[0].role, "system");
+  assert.equal(sent[0].content, CHIME_SYSTEM_PROMPT);
+  assert.deepEqual(sent.slice(1), transcript);
+  ok("chime: the decision is one tool-less call (system prompt + transcript)");
 }
 
 // ----------------------------------------------------------------- split --
@@ -662,315 +789,6 @@ const ok = (name: string): void => {
   ok("files: size caps and download failures become notes, per-message cap");
 }
 
-// ---------------------------------------------------------------- context --
-{
-  const authors = {
-    alice: { id: "alice", bot: false, name: "Alice" },
-    carl: { id: "carl", bot: true, name: "Carl" }, // another bot: unfiltered, enters as user
-    bot: { id: "bot1", bot: true, name: "Glove" },
-  };
-  let n = 0;
-  const m = (author: { id: string; bot: boolean }, content: string, attachments: MessageAttachmentLike[] = []): MessageLike => ({
-    id: `x${String(++n)}`,
-    createdTimestamp: 1_000_000 + n * 1000,
-    content,
-    author,
-    attachments,
-  });
-
-  const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
-  const imageFetch: ImageFetch = () => Promise.resolve(new Response(imgBytes));
-  const imgAtt: MessageAttachmentLike = { url: "https://cdn.discordapp.com/attachments/1/2/3/i.png", name: "img.png", size: imgBytes.length, contentType: "image/png" };
-  const bigAtt: MessageAttachmentLike = { url: "https://cdn.discordapp.com/attachments/1/2/3/b.png", name: "big.png", size: 2048, contentType: "image/png" };
-
-  const hello = m(authors.alice, "hello");
-  const oldReply = m(authors.bot, "old reply"); // not in history (bot restarted since)
-  const beep = m(authors.carl, "beep");
-  const think = m(authors.bot, "🤔 *Let me check the units first. (3s)*"); // our UI line
-  const activity = m(authors.bot, '🔎 *web_search(query="x")*\n📁 *file_read(path="notes.md")*'); // our UI line (one batched message per turn)
-  const shell = m(authors.bot, '🐚 *shell_exec(command="git status")*'); // our UI line (shell icon, a shell-only turn's first line)
-  const wiki = m(authors.bot, "📚 *wikipedia_search(query=\"loop\")*"); // our UI line
-  const chunkA = m(authors.bot, "part one");
-  const chunkB = m(authors.bot, "part two");
-  const thanks = m(authors.alice, "thanks");
-  const imgOnly = m(authors.alice, "", [imgAtt]);
-  const sure = m(authors.bot, "sure!");
-  const big = m(authors.alice, "look at this", [bigAtt]);
-  const errNote = m(authors.bot, "⚠️ *generation failed: boom*");
-  // the mention carries an image too: it must survive the history lookup
-  const mention = m(authors.alice, "<@bot1> describe this", [imgAtt]);
-  const fetchedList = [hello, oldReply, beep, think, activity, shell, wiki, chunkA, chunkB, thanks, imgOnly, sure, big, errNote, mention];
-
-  const hist = new ChannelHistory(20);
-  hist.push("assistant", "full reply", [chunkA.id, chunkB.id], ["part one", "part two"]);
-  hist.push("assistant", "sure!", [sure.id]);
-  hist.push("assistant", "⚠️ *generation failed: boom*", [errNote.id]);
-  hist.push("user", "describe this", [mention.id]);
-
-  const opts = {
-    botId: "bot1",
-    systemPrompt: "sys",
-    maxMessages: 20,
-    enableImages: true,
-    imagesMaxBytes: 1024,
-    imageFetch,
-    enableFileContents: false,
-    fileContentsMaxBytes: 1024,
-  };
-  const imgPart = { type: "image_url", image_url: { url: `data:image/png;base64,${imgBytes.toString("base64")}` } };
-  const res = await contextFromMessages(fetchedList, hist, mention.id, opts);
-  assert.deepEqual(res, [
-    { role: "system", content: "sys" },
-    { role: "user", content: "Alice: hello" },
-    { role: "assistant", content: "old reply" },
-    { role: "user", content: "Carl (bot): beep" },
-    { role: "assistant", content: "full reply" },
-    { role: "user", content: "Alice: thanks" },
-    { role: "user", content: [{ type: "text", text: "Alice:" }, imgPart] },
-    { role: "assistant", content: "sure!" },
-    { role: "user", content: "Alice: look at this\n*[attachment \"big.png\" not sent: 2 KB exceeds the 1 KB limit]*" },
-    { role: "assistant", content: "⚠️ *generation failed: boom*" },
-    { role: "user", content: [{ type: "text", text: "Alice: describe this" }, imgPart] },
-  ]);
-  ok("context: last-N mapping (speaker labels, bot marker, UI lines skipped, chunked reply once, no merging, images, mention stripped)");
-
-  // Images disabled: attachments ignored entirely (no images, no notes).
-  const res2 = await contextFromMessages(fetchedList, hist, mention.id, { ...opts, enableImages: false });
-  assert.deepEqual(res2, [
-    { role: "system", content: "sys" },
-    { role: "user", content: "Alice: hello" },
-    { role: "assistant", content: "old reply" },
-    { role: "user", content: "Carl (bot): beep" },
-    { role: "assistant", content: "full reply" },
-    { role: "user", content: "Alice: thanks" },
-    { role: "assistant", content: "sure!" },
-    { role: "user", content: "Alice: look at this" },
-    { role: "assistant", content: "⚠️ *generation failed: boom*" },
-    { role: "user", content: "Alice: describe this" },
-  ]);
-  // The mention gone from the window (deleted / pushed out) -> null: skip the turn.
-  assert.equal(await contextFromMessages(fetchedList.slice(0, -1), hist, mention.id, opts), null);
-  ok("context: images disabled ignores attachments; mention gone -> null");
-
-  // File contents: non-image attachments are inlined as labeled, fenced
-  // blocks; images are left to the image pipeline; a skipped attachment
-  // leaves a note; disabled -> ignored entirely (as with images).
-  const fileAtt: MessageAttachmentLike = {
-    url: "https://cdn.discordapp.com/attachments/1/2/3/notes.md",
-    name: "notes.md",
-    size: 11,
-    contentType: "text/markdown",
-  };
-  const fileBytes = Buffer.from("# Notes\nbody");
-  const fileFetch: FileFetch = () => Promise.resolve(new Response(fileBytes));
-  const fileBlock = '[attachment "notes.md" (1 KB)]:\n```\n# Notes\nbody\n```';
-  const fcOpts = { ...opts, enableFileContents: true, fileFetch };
-  const fm1 = m(authors.alice, "here is the file", [fileAtt]);
-  const fm2 = m(authors.alice, "<@bot1> read this", [fileAtt]);
-  const fres = await contextFromMessages([fm1, fm2], hist, fm2.id, fcOpts);
-  assert.deepEqual(fres, [
-    { role: "system", content: "sys" },
-    { role: "user", content: `Alice: here is the file\n${fileBlock}` },
-    { role: "user", content: `Alice: read this\n${fileBlock}` },
-  ]);
-  // A message with both an image and a file: the image part plus the text
-  // part carrying the file block.
-  const mixed = m(authors.alice, "both", [imgAtt, fileAtt]);
-  const mres = await contextFromMessages([mixed], hist, mixed.id, fcOpts);
-  assert.deepEqual(mres, [
-    { role: "system", content: "sys" },
-    { role: "user", content: [{ type: "text", text: `Alice: both\n${fileBlock}` }, imgPart] },
-  ]);
-  // An oversized attachment leaves a note (no download).
-  const bigFileAtt: MessageAttachmentLike = {
-    url: "https://cdn.discordapp.com/attachments/1/2/3/big.md",
-    name: "big.md",
-    size: 4096,
-    contentType: "text/markdown",
-  };
-  const bigMsg = m(authors.alice, "too big", [bigFileAtt]);
-  const bres = await contextFromMessages([bigMsg], hist, bigMsg.id, fcOpts);
-  assert.deepEqual(bres, [
-    { role: "system", content: "sys" },
-    { role: "user", content: 'Alice: too big\n*[attachment "big.md" not sent: 4 KB exceeds the 1 KB limit]*' },
-  ]);
-  // File contents off (images on): the classic behavior is unchanged — the
-  // image pipeline notes the non-image attachment as an unsupported type
-  // (nothing else handles it). Both pipelines off: ignored entirely.
-  const fres2 = await contextFromMessages([fm1, fm2], hist, fm2.id, { ...fcOpts, enableFileContents: false });
-  assert.deepEqual(fres2, [
-    { role: "system", content: "sys" },
-    { role: "user", content: 'Alice: here is the file\n*[attachment "notes.md" not sent: unsupported type text/markdown]*' },
-    { role: "user", content: 'Alice: read this\n*[attachment "notes.md" not sent: unsupported type text/markdown]*' },
-  ]);
-  const fres3 = await contextFromMessages([fm1, fm2], hist, fm2.id, { ...fcOpts, enableFileContents: false, enableImages: false });
-  assert.deepEqual(fres3, [
-    { role: "system", content: "sys" },
-    { role: "user", content: "Alice: here is the file" },
-    { role: "user", content: "Alice: read this" },
-  ]);
-  ok("context: file contents inlined as labeled fenced blocks; oversized -> note; off -> classic note / ignored");
-
-  // A chunked reply from before a restart (no history entry): the
-  // consecutive own messages posted close together (the reply's chunks) are
-  // one assistant entry again; a reply posted later stays separate.
-  const gm = (content: string, ts: number): MessageLike => ({
-    id: `g${String(++n)}`,
-    createdTimestamp: ts,
-    content,
-    author: authors.bot,
-    attachments: [],
-  });
-  const um = (content: string, ts: number): MessageLike => ({
-    id: `u${String(++n)}`,
-    createdTimestamp: ts,
-    content,
-    author: authors.alice,
-    attachments: [],
-  });
-  const ga = gm("chunk one", 2_000_000);
-  const gb = gm("chunk two", 2_000_000 + 1500);
-  const gc = gm("chunk three", 2_000_000 + 3000);
-  const gd = gm("a later reply", 2_000_000 + 20_000); // 17 s after gc: a distinct reply
-  const gq = um("the question", 2_000_000 + 30_000);
-  const glist = [ga, gb, gc, gd, gq];
-  const gres = await contextFromMessages(glist, new ChannelHistory(20), gq.id, opts);
-  assert.deepEqual(gres, [
-    { role: "system", content: "sys" },
-    { role: "assistant", content: "chunk one\nchunk two\nchunk three" },
-    { role: "assistant", content: "a later reply" },
-    { role: "user", content: "Alice: the question" },
-  ]);
-  // A user message between two chunks breaks the group.
-  const gs = gm("chunk one", 3_000_000);
-  const gt = um("interrupting", 3_000_000 + 500);
-  const gu = gm("chunk two", 3_000_000 + 1000);
-  const gres2 = await contextFromMessages([gs, gt, gu], new ChannelHistory(20), gt.id, opts);
-  assert.deepEqual(gres2, [
-    { role: "system", content: "sys" },
-    { role: "assistant", content: "chunk one" },
-    { role: "user", content: "Alice: interrupting" },
-    { role: "assistant", content: "chunk two" },
-  ]);
-  ok("context: unrecorded chunked reply (close-together own messages) is one assistant entry again");
-
-  // Wrapper: fetches with limit = maxMessages, sorts oldest-first, and a
-  // fetch failure falls back to the in-memory window (bot keeps working).
-  // discord.js-shaped (the wrapper adapts them): the second message has a
-  // guild nickname, which must win over the username.
-  const apiList = [
-    { id: "b", content: "second", createdTimestamp: 200, author: { id: "alice", bot: false, username: "Alice" }, member: { displayName: "Al" }, attachments: [] },
-    { id: "a", content: "first", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
-  ];
-  let seenLimit: number | undefined;
-  const chan = {
-    messages: {
-      fetch: async (o: { limit?: number }) => {
-        seenLimit = o.limit;
-        return { values: () => apiList.values() };
-      },
-    },
-  } as unknown as GuildTextBasedChannel;
-  const wOpts = {
-    botId: "bot1",
-    systemPrompt: "",
-    maxMessages: 20,
-    enableImages: false,
-    imagesMaxBytes: 1024,
-    enableFileContents: false,
-    fileContentsMaxBytes: 1024,
-  };
-  const wr = await buildChannelContext(chan, new ChannelContext(), new ChannelHistory(20), "b", wOpts);
-  assert.equal(seenLimit, 20, "fetch limit is the window size");
-  assert.deepEqual(
-    wr,
-    [
-      { role: "user", content: "Alice: first" },
-      { role: "user", content: "Al: second" },
-    ],
-    "sorted oldest-first, one message per Discord message (no merging)",
-  );
-  assert.equal(await buildChannelContext(chan, new ChannelContext(), new ChannelHistory(20), "nope", wOpts), null);
-
-  const throwing = { messages: { fetch: async () => { throw new Error("api down"); } } } as unknown as GuildTextBasedChannel;
-  const fh = new ChannelHistory(20);
-  fh.push("user", "hi", ["1"], undefined, "Alice");
-  const fb = await buildChannelContext(throwing, new ChannelContext(), fh, "1", { ...wOpts, systemPrompt: "sys" });
-  assert.deepEqual(fb, [
-    { role: "system", content: "sys" },
-    { role: "user", content: "Alice: hi" },
-  ], "fetch failure falls back to the in-memory window (speakers labeled)");
-  // A same-millisecond burst: the API returns newest-first, so a
-  // timestamp-only sort would keep the reversed order — the snowflake id
-  // tie-break restores the true creation order.
-  const burst = [
-    { id: "1000000000000000003", content: "third", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
-    { id: "1000000000000000005", content: "fifth", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
-    { id: "1000000000000000001", content: "first", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
-  ];
-  const burstChan = { messages: { fetch: async () => ({ values: () => burst.values() }) } } as unknown as GuildTextBasedChannel;
-  assert.deepEqual(
-    await buildChannelContext(burstChan, new ChannelContext(), new ChannelHistory(20), "1000000000000000005", { ...wOpts, systemPrompt: "" }),
-    [
-      { role: "user", content: "Alice: first" },
-      { role: "user", content: "Alice: third" },
-      { role: "user", content: "Alice: fifth" },
-    ],
-    "same-millisecond messages ordered by id, not by the API's newest-first order",
-  );
-  ok("context: wrapper fetch (limit, ordering) and in-memory fallback");
-
-  // !clear boundary: only messages strictly after the clear command's own
-  // message enter the context; a mention before it never runs its turn; when
-  // the boundary fell out of the last-N window, everything is kept.
-  const clearMsg = m(authors.alice, "!clear");
-  const fresh = m(authors.alice, "fresh question");
-  const clearOpts = { ...opts, systemPrompt: "", resetAfter: clearMsg.id };
-  assert.deepEqual(
-    await contextFromMessages([hello, clearMsg, fresh], new ChannelHistory(20), fresh.id, clearOpts),
-    [{ role: "user", content: "Alice: fresh question" }],
-    "only messages after the boundary (the clear itself included in neither)",
-  );
-  assert.equal(
-    await contextFromMessages([hello, clearMsg, fresh], new ChannelHistory(20), hello.id, clearOpts),
-    null,
-    "a pre-clear mention never runs its turn",
-  );
-  assert.deepEqual(
-    await contextFromMessages([fresh], new ChannelHistory(20), fresh.id, { ...opts, systemPrompt: "", resetAfter: "gone" }),
-    [{ role: "user", content: "Alice: fresh question" }],
-    "boundary out of the window: nothing dropped",
-  );
-  ok("context: the !clear boundary drops earlier messages (pre-clear mention -> null, out-of-window boundary -> kept)");
-
-  // The clear confirmation line is a bot UI line: never context.
-  const confirmed = m(authors.bot, CLEAR_CONFIRMATION);
-  const afterClear = m(authors.alice, "now we start fresh");
-  assert.deepEqual(
-    await contextFromMessages([confirmed, afterClear], new ChannelHistory(20), afterClear.id, { ...opts, systemPrompt: "" }),
-    [{ role: "user", content: "Alice: now we start fresh" }],
-  );
-  ok("context: the clear confirmation line is a UI line, never context");
-
-  // Wrapper: the live fetch respects the boundary end to end.
-  const cApiList = [
-    { id: "co1", content: "old talk", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
-    { id: "ccl", content: "!clear", createdTimestamp: 200, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
-    { id: "cn1", content: "fresh talk", createdTimestamp: 300, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
-  ];
-  const cChan = {
-    messages: {
-      fetch: async () => ({ values: () => cApiList.values() }),
-    },
-  } as unknown as GuildTextBasedChannel;
-  const cwOpts = { ...wOpts, resetAfter: "ccl" };
-  assert.deepEqual(await buildChannelContext(cChan, new ChannelContext(), new ChannelHistory(20), "cn1", cwOpts), [
-    { role: "user", content: "Alice: fresh talk" },
-  ]);
-  assert.equal(await buildChannelContext(cChan, new ChannelContext(), new ChannelHistory(20), "co1", cwOpts), null, "pre-clear mention -> null");
-  ok("context: wrapper live fetch respects the !clear boundary (pre-clear mention -> null)");
-}
-
 // ----------------------------------------------------------- compaction --
 {
   const noFetch = { messages: { fetch: async () => { throw new Error("no"); } } } as unknown as GuildTextBasedChannel;
@@ -1033,11 +851,18 @@ const ok = (name: string): void => {
 
   // A window bigger than Discord's 100-message fetch cap: the seed still
   // happens (capped at what Discord can give), so pre-startup messages are
-  // not silently missing from the context.
+  // not silently missing from the context. The fetch comes back newest-first
+  // (like the API): same-millisecond messages must be ordered by their
+  // snowflake id, not the API's order, and our own UI lines never enter the
+  // seed.
   let seedLimit: number | undefined;
   const seedMsgs = [
-    { id: "sc1", content: "pre-startup", createdTimestamp: 50, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
     { id: "sc2", content: "the mention", createdTimestamp: 60, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "sc0", content: "🤔 *thought for 3s*", createdTimestamp: 58, author: { id: "bot1", bot: true, username: "Glove" }, attachments: [] },
+    { id: "1000000000000000005", content: "burst three", createdTimestamp: 55, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "1000000000000000003", content: "burst two", createdTimestamp: 55, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "1000000000000000001", content: "burst one", createdTimestamp: 55, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "sc1", content: "pre-startup", createdTimestamp: 50, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
   ];
   const seedChan = {
     messages: {
@@ -1049,7 +874,7 @@ const ok = (name: string): void => {
   } as unknown as GuildTextBasedChannel;
   const capStore = new ChannelContext();
   capStore.pushUser("Alice", "the mention", "sc2", 60, []);
-  const capRes = await buildChannelContext(seedChan, capStore, new ChannelHistory(20), "sc2", {
+  const capRes = await buildChannelContext(seedChan, capStore, "sc2", {
     botId: "bot1",
     systemPrompt: "",
     maxMessages: 150,
@@ -1057,15 +882,17 @@ const ok = (name: string): void => {
     imagesMaxBytes: 1024,
     enableFileContents: false,
     fileContentsMaxBytes: 1024,
-    compaction: { maxTokens: 100_000, keepMessages: 10, summarize: async () => "never" },
+    maxTokens: 100_000,
+    keepMessages: 10,
+    summarize: async () => "never",
   });
   assert.equal(seedLimit, 100, "the seed fetch is capped at Discord's limit");
   assert.equal(capStore.seeded, true, "the seed happened (not retried every turn)");
   assert.deepEqual(
     capRes!.map((x) => String(x.content)),
-    ["Alice: pre-startup", "Alice: the mention"],
+    ["Alice: pre-startup", "Alice: burst one", "Alice: burst two", "Alice: burst three", "Alice: the mention"],
   );
-  ok("compaction: a window over Discord's 100-fetch cap still seeds (capped)");
+  ok("compaction: a window over Discord's 100-fetch cap still seeds (capped, UI lines skipped, burst ordered by id)");
 
   // A single tracked reply grouped with a tracked multi-chunk reply (the
   // seed): the chunk list must stay aligned with the id list — a
@@ -1142,9 +969,11 @@ const ok = (name: string): void => {
     imagesMaxBytes: 1024,
     enableFileContents: false,
     fileContentsMaxBytes: 1024,
-    compaction: { maxTokens: 20, keepMessages: 3, summarize },
+    maxTokens: 20,
+    keepMessages: 3,
+    summarize,
   };
-  const cres = await buildChannelContext(noFetch, cstore, new ChannelHistory(20), "m1", cOpts);
+  const cres = await buildChannelContext(noFetch, cstore, "m1", cOpts);
   assert.deepEqual(cres, [
     { role: "system", content: "sys" },
     { role: "user", content: "Summary of the earlier messages in this channel (older messages were compacted):\nthey discussed the launch plan" },
@@ -1164,7 +993,7 @@ const ok = (name: string): void => {
 
   // A later compaction folds the previous summary into the new one.
   cstore.pushUser("Bob", "more talk", "m2", 10000, []);
-  const cres2 = await buildChannelContext(noFetch, cstore, new ChannelHistory(20), "m2", cOpts);
+  const cres2 = await buildChannelContext(noFetch, cstore, "m2", cOpts);
   assert.equal(seenTranscripts.length, 2, "second compaction runs");
   assert.ok(seenTranscripts[1].includes("Running summary of the older messages:"), "previous summary folded in");
   assert.ok(seenTranscripts[1].includes("they discussed the launch plan"));
@@ -1179,7 +1008,7 @@ const ok = (name: string): void => {
   // The mention deleted before its turn -> null (the turn is skipped).
   const dstore = new ChannelContext();
   dstore.pushUser("Alice", "hi", "d1", 1, []);
-  assert.equal(await buildChannelContext(noFetch, dstore, new ChannelHistory(20), "gone", cOpts), null);
+  assert.equal(await buildChannelContext(noFetch, dstore, "gone", cOpts), null);
   ok("compaction: mention deleted before its turn -> null");
 
   // Summarizer failure (or nothing to fold): the emergency trim drops the
@@ -1189,15 +1018,13 @@ const ok = (name: string): void => {
   fstore.pushUser("Alice", "the mention", "fm", 99, []);
   const fOpts = {
     ...cOpts,
-    compaction: {
-      maxTokens: 50,
-      keepMessages: 2,
-      summarize: async (): Promise<string> => {
-        throw new Error("llm down");
-      },
+    maxTokens: 50,
+    keepMessages: 2,
+    summarize: async (): Promise<string> => {
+      throw new Error("llm down");
     },
   };
-  const fres = await buildChannelContext(noFetch, fstore, new ChannelHistory(20), "fm", fOpts);
+  const fres = await buildChannelContext(noFetch, fstore, "fm", fOpts);
   assert.ok(fres !== null, "the turn still runs");
   assert.ok(fstore.has("fm"), "the mention survived the trim");
   assert.ok(!fstore.has("f0"), "the oldest message was trimmed");
@@ -1207,8 +1034,8 @@ const ok = (name: string): void => {
   const tstore = new ChannelContext();
   tstore.pushUser("A", "a".repeat(400), "t1", 1, []);
   tstore.pushUser("B", "b".repeat(400), "t2", 2, []);
-  const tOpts = { ...cOpts, compaction: { maxTokens: 150, keepMessages: 5, summarize: async () => "s" } };
-  await buildChannelContext(noFetch, tstore, new ChannelHistory(20), "t2", tOpts);
+  const tOpts = { ...cOpts, maxTokens: 150, keepMessages: 5, summarize: async () => "s" };
+  await buildChannelContext(noFetch, tstore, "t2", tOpts);
   assert.equal(tstore.getSummary(), null, "nothing was folded");
   assert.ok(!tstore.has("t1"), "the oldest was trimmed to fit the budget");
   assert.ok(tstore.has("t2"), "the mention was protected");
@@ -1349,9 +1176,11 @@ const ok = (name: string): void => {
     imagesMaxBytes: 1024,
     enableFileContents: false,
     fileContentsMaxBytes: 1024,
-    compaction: { maxTokens: 10_000, keepMessages: 5, summarize: async () => "never" },
+    maxTokens: 10_000,
+    keepMessages: 5,
+    summarize: async () => "never",
   };
-  assert.deepEqual(await buildChannelContext(noFetch, kstore, new ChannelHistory(20), "k3", kOpts), [
+  assert.deepEqual(await buildChannelContext(noFetch, kstore, "k3", kOpts), [
     { role: "user", content: "Alice: fresh start" },
   ]);
   // A mention queued before the clear: its message left the context, the
@@ -1359,7 +1188,7 @@ const ok = (name: string): void => {
   const kcleared = new ChannelContext();
   kcleared.pushUser("Alice", "queued before the clear", "km", 150, []);
   kcleared.reset();
-  assert.equal(await buildChannelContext(noFetch, kcleared, new ChannelHistory(20), "km", kOpts), null, "pre-clear mention -> null");
+  assert.equal(await buildChannelContext(noFetch, kcleared, "km", kOpts), null, "pre-clear mention -> null");
   ok("compaction: reset() drops entries + summary, suppresses the seed (pre-clear mention -> null)");
 }
 
@@ -1369,34 +1198,34 @@ const ok = (name: string): void => {
   let gate: (() => void) | null = null;
   let turnCount = 0;
   const deps = {
-    runTurn: async (ch: string, mentionId: string): Promise<void> => {
+    runTurn: async (ch: string, turn: TurnRequest): Promise<void> => {
       turnCount++;
-      events.push(`turn:${ch}:${mentionId}`);
-      if (mentionId === "m1") await new Promise<void>((r) => (gate = r));
+      events.push(`turn:${ch}:${turn.id}`);
+      if (turn.id === "m1") await new Promise<void>((r) => (gate = r));
     },
   };
 
   const q = new ChannelQueue("c1", deps);
-  q.push("m1");
-  q.push("m2");
+  q.push({ id: "m1", chime: false });
+  q.push({ id: "m2", chime: true });
   await ticks(3);
-  assert.deepEqual(events, ["turn:c1:m1"], "second mention waits for the first turn to finish");
+  assert.deepEqual(events, ["turn:c1:m1"], "second turn waits for the first to finish");
   gate!();
   await ticks(5);
-  assert.deepEqual(events, ["turn:c1:m1", "turn:c1:m2"], "mentions run in arrival order");
+  assert.deepEqual(events, ["turn:c1:m1", "turn:c1:m2"], "turns run in arrival order (mention, chime)");
   assert.equal(turnCount, 2);
-  ok("queue: one turn at a time, FIFO");
+  ok("queue: one turn at a time, FIFO (mentions and chimes alike)");
 
   // A turn that throws must not kill the worker.
   const events2: string[] = [];
   const q2 = new ChannelQueue("c2", {
-    runTurn: async (_c: string, mentionId: string): Promise<void> => {
-      if (mentionId === "a") throw new Error("boom");
-      events2.push(mentionId);
+    runTurn: async (_c: string, turn: TurnRequest): Promise<void> => {
+      if (turn.id === "a") throw new Error("boom");
+      events2.push(turn.id);
     },
   });
-  q2.push("a");
-  q2.push("b");
+  q2.push({ id: "a", chime: false });
+  q2.push({ id: "b", chime: false });
   await ticks(5);
   assert.deepEqual(events2, ["b"], "worker survives a failed turn and keeps going");
   ok("queue: worker survives a failed turn");

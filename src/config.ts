@@ -11,6 +11,22 @@ export interface DiscordConfig {
   showReasoning: boolean;
   /** Show which tools are running while a turn executes (names + args; results never shown). */
   showToolActivity: boolean;
+  /**
+   * The stability window (ms) before a trackable message is committed to the
+   * channel context and can queue a turn: the message must be unchanged
+   * (no edits) for this long. Other bots stream their replies by editing a
+   * posted message as the text arrives, so the window keeps the model from
+   * seeing partial text.
+   */
+  messageStableMs: number;
+  /**
+   * Chime: with this on, a message from another bot that does not mention
+   * the bot still queues a turn in which the model decides (one small
+   * tool-less YES/NO call over the channel transcript) whether to respond
+   * at all — YES runs a normal turn, NO stays silent. Mentions (from any
+   * author) always respond; human non-mentions are ambient context only.
+   */
+  chimeEnabled: boolean;
 }
 
 export interface ModelConfig {
@@ -26,10 +42,8 @@ export interface ModelConfig {
   fileContentsMaxBytes: number;
   stream: boolean;
   systemPrompt: string;
-  /** Last-N seed size / image window (and the sliding window in classic mode). */
+  /** Last-N seed size / image window. */
   contextMaxMessages: number;
-  /** Compaction mode (persistent growing context + summaries) vs the classic sliding window. */
-  compactionEnabled: boolean;
   /** Estimated tokens at which the channel context is compacted. */
   compactionMaxTokens: number;
   /** How many of the newest messages survive a compaction verbatim. */
@@ -187,6 +201,8 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       streamUpdateThrottleMs: intEnv("DISCORD_STREAM_UPDATE_THROTTLE_MS", 2000, 500),
       showReasoning: boolEnv("DISCORD_SHOW_REASONING", true),
       showToolActivity: boolEnv("DISCORD_SHOW_TOOL_ACTIVITY", true),
+      messageStableMs: intEnv("DISCORD_MESSAGE_STABLE_MS", 2000, 0),
+      chimeEnabled: boolEnv("BOT_CHIME_ENABLED", false),
     },
     model: {
       apiUrl,
@@ -199,7 +215,6 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       stream: boolEnv("MODEL_STREAM", true),
       systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),
-      compactionEnabled: boolEnv("CONTEXT_COMPACTION_ENABLED", true),
       compactionMaxTokens: intEnv("CONTEXT_COMPACTION_MAX_TOKENS", 4000, 128),
       compactionKeepMessages: intEnv("CONTEXT_COMPACTION_KEEP_MESSAGES", 20, 1),
       timeoutMs: intEnv("MODEL_TIMEOUT_S", 120, 1) * 1000,

@@ -1,12 +1,13 @@
 import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext } from "./bot/context.js";
+import { decideChime } from "./bot/chime.js";
+import { MessageGate, type GateMessage } from "./bot/gate.js";
+import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, stripMention } from "./bot/router.js";
-import { QueueStore } from "./bot/queue.js";
 import { ResponseWriter, SAFE_MENTIONS } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
 import { ChannelContextStore, type ChannelContext } from "./llm/context.js";
-import { ConversationStore, type ChannelHistory } from "./llm/history.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
 import { ToolActivityPoster } from "./tools/activity.js";
@@ -15,9 +16,6 @@ import { runToolTurn } from "./tools/loop.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
-  // Classic mode: the per-channel sliding window. Compaction mode: the
-  // persistent per-channel context (seeded once, growing, compacted).
-  const compaction = cfg.model.compactionEnabled;
   log.info(
     "config loaded:",
     cfg.discord.guildId !== "" ? `guild=${cfg.discord.guildId}` : "guilds=all",
@@ -27,9 +25,9 @@ async function main(): Promise<void> {
     `images=${cfg.model.enableImages}`,
     `files=${cfg.model.enableFileContents}`,
     `window=${cfg.model.contextMaxMessages}`,
-    compaction
-      ? `compaction=on (budget ~${cfg.model.compactionMaxTokens} est. tokens, keep ${cfg.model.compactionKeepMessages})`
-      : "compaction=off (classic sliding window)",
+    `compaction=on (budget ~${cfg.model.compactionMaxTokens} est. tokens, keep ${cfg.model.compactionKeepMessages})`,
+    `stable=${cfg.discord.messageStableMs}ms`,
+    `chime=${cfg.discord.chimeEnabled ? "on" : "off"}`,
   );
 
   const client = createDiscordClient();
@@ -40,7 +38,6 @@ async function main(): Promise<void> {
     stream: cfg.model.stream,
     timeoutMs: cfg.model.timeoutMs,
   });
-  const histories = new ConversationStore(cfg.model.contextMaxMessages);
   const contexts = new ChannelContextStore();
   const tools = buildTools(cfg);
   if (tools.registry.size > 0) {
@@ -52,20 +49,19 @@ async function main(): Promise<void> {
   }
 
   /**
-   * One full turn for a queued mention. In compaction mode the model's
-   * context is the channel's persistent context (seeded once with the
-   * channel's last N messages, grown by every arrival, compacted when it
-   * fills the token budget); in classic mode it is built from the channel's
-   * last N Discord messages, fetched live each turn. The mention itself is
+   * One full turn for a queued turn request (a mention — which always
+   * responds — or a chime, where the model first decides whether to respond
+   * at all). The model's context is the channel's persistent context
+   * (seeded once with the channel's last N messages, grown by every arrival,
+   * compacted when it fills the token budget). The triggering message is
    * part of the context, so edits that happened while the turn was queued
    * are picked up automatically.
    */
-  const runTurn = async (channelId: string, mentionId: string): Promise<void> => {
+  const runTurn = async (channelId: string, turn: TurnRequest): Promise<void> => {
     const context = contexts.get(channelId);
-    const history = histories.get(channelId);
-    if (compaction ? !context.has(mentionId) : !history.has(mentionId)) {
+    if (!context.has(turn.id)) {
       // Deleted before its turn ran.
-      log.info(`mention ${mentionId} in ${channelId} left the channel context; skipping turn`);
+      log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
       return;
     }
 
@@ -111,14 +107,14 @@ async function main(): Promise<void> {
       // that ends in tool calls streams its narration (settled in place via
       // onToolRound, so it stays above the tool-activity lines), the tools
       // run, and the next round continues with the results in context. Only
-      // the final reply is recorded in the channel history.
+      // the final reply is recorded in the channel context.
       // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
       // note (listing only the enabled families) is added when any are
       // registered.
       const systemPrompt = [cfg.model.systemPrompt, tools.systemNote]
         .filter((p): p is string => p !== null && p.trim().length > 0)
         .join("\n\n");
-      const messages = await buildChannelContext(textChannel, context, history, mentionId, {
+      const messages = await buildChannelContext(textChannel, context, turn.id, {
         botId,
         systemPrompt,
         maxMessages: cfg.model.contextMaxMessages,
@@ -126,23 +122,28 @@ async function main(): Promise<void> {
         imagesMaxBytes: cfg.model.imagesMaxBytes,
         enableFileContents: cfg.model.enableFileContents,
         fileContentsMaxBytes: cfg.model.fileContentsMaxBytes,
-        compaction: compaction
-          ? {
-              maxTokens: cfg.model.compactionMaxTokens,
-              keepMessages: cfg.model.compactionKeepMessages,
-              // The summarizer is the same endpoint as the replies: one
-              // plain (tool-less) chat call over the old transcript.
-              summarize: async (msgs) => (await llm.chat(msgs)).content,
-            }
-          : undefined,
-        // Classic mode only: the live fetch must not resurrect the messages
-        // the user cleared (!clear boundary).
-        resetAfter: compaction ? undefined : histories.getResetAfter(channelId),
+        maxTokens: cfg.model.compactionMaxTokens,
+        keepMessages: cfg.model.compactionKeepMessages,
+        // The summarizer is the same endpoint as the replies: one
+        // plain (tool-less) chat call over the old transcript.
+        summarize: async (msgs) => (await llm.chat(msgs)).content,
       });
       if (messages === null) {
         // Deleted while queued.
-        log.info(`mention ${mentionId} in ${channelId} left the channel context; skipping turn`);
+        log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
         return;
+      }
+      if (turn.chime) {
+        // A chime turn: the model decides whether to respond at all. One
+        // small tool-less call over the transcript (the reply's system
+        // prompt is not part of it; the transcript ends with the
+        // triggering message). NO — or a failed call — stays silent: no
+        // typing indicator, no message, nothing recorded.
+        const transcript = systemPrompt.trim().length > 0 ? messages.slice(1) : messages;
+        if (!(await decideChime(llm, transcript))) {
+          log.info(`channel ${channelId}: chime decision NO for message ${turn.id}; staying silent`);
+          return;
+        }
       }
       writer.start();
       const outcome = await runToolTurn(messages, {
@@ -162,7 +163,7 @@ async function main(): Promise<void> {
           if (!cfg.discord.showToolActivity) return;
           // Every call of the turn lands in the one shared activity message
           // (the first round posts it, later rounds edit it in place). Bot
-          // messages never enter the channel history (isTrackable), so the
+          // messages never enter the channel context (isTrackable), so the
           // model's context is untouched — the results, which stay internal,
           // are what matter.
           await activity.addCalls(calls);
@@ -186,17 +187,104 @@ async function main(): Promise<void> {
 
   /** Record the bot's posted reply in the channel's conversation store. */
   const recordReply = (channelId: string, posted: { text: string; messageIds: string[]; chunks?: string[] }): void => {
-    if (compaction) contexts.get(channelId).pushAssistant(posted.text, posted.messageIds, posted.chunks);
-    else histories.get(channelId).push("assistant", posted.text, posted.messageIds, posted.chunks);
+    contexts.get(channelId).pushAssistant(posted.text, posted.messageIds, posted.chunks);
   };
 
-  /** The conversation store that tracks a channel (one is active per mode). */
-  const conversationFor = (channelId: string): ChannelHistory | ChannelContext | null => {
-    if (compaction) return contexts.has(channelId) ? contexts.get(channelId) : null;
-    return histories.has(channelId) ? histories.get(channelId) : null;
+  /** The channel's context store, if the channel is tracked at all. */
+  const conversationFor = (channelId: string): ChannelContext | null => {
+    return contexts.has(channelId) ? contexts.get(channelId) : null;
   };
 
   const queues = new QueueStore({ runTurn });
+
+  /**
+   * Commit a stable trackable message (it has been unchanged for
+   * DISCORD_MESSAGE_STABLE_MS): `!clear` resets the channel's model context
+   * (only humans may issue it — other bots are tracked now, so a bot posting
+   * the command is just context; the command itself is neither tracked nor
+   * answered, and a bot mention alongside it is swallowed too), otherwise the
+   * message enters the context (humans and other bots alike — bot authors
+   * are labeled "(bot)") and, when its final content mentions the bot, queues
+   * a turn. With chime enabled, an other-bot message without a mention queues
+   * a chime turn (the model decides whether to respond). The checks run on
+   * the final (stable) content: an edit that adds a mention before
+   * stabilization queues the turn; one that removes it does not.
+   */
+  const commitArrival = (message: GateMessage): void => {
+    const botId = client.user?.id;
+    if (!botId) return;
+    const channelId = message.channel?.id;
+    if (!channelId) return; // the channel vanished while the message was pending
+    if (!message.author) return;
+    if (!message.author.bot && isClearCommand(message.content, botId)) {
+      // Drop entries + summary and suppress the startup seed: the next turn
+      // starts from messages that arrive after the clear, not from the
+      // channel's last-N. Mentions queued before the clear are dropped with
+      // the context: their mention is no longer in it, so their turns are
+      // skipped.
+      contexts.get(channelId).reset();
+      log.info(`channel ${channelId}: conversation reset by ${message.author.username}`);
+      const channel = message.channel;
+      if (channel && channel.isTextBased()) {
+        channel.send({ content: CLEAR_CONFIRMATION, allowedMentions: SAFE_MENTIONS }).catch((err) => {
+          log.warn(`failed to post the clear confirmation: ${errMsg(err)}`);
+        });
+      }
+      return;
+    }
+    // The display name (guild nickname when set, else the global username)
+    // labels this message in the context; the attachment metadata is what
+    // the image parts are downloaded from at turn time. The bot flag marks
+    // other bots' messages ("(bot)" label in the context).
+    const name = message.member?.displayName ?? message.author.username;
+    const content = stripMention(message, botId);
+    const ctx = contexts.get(channelId);
+    if (ctx.has(message.id)) {
+      // The startup seed raced the stabilization: the message is already in
+      // the context (with the content the API saw at seed time), so refresh
+      // it in place instead of appending a duplicate entry.
+      ctx.updateContent(message.id, content);
+    } else {
+      ctx.pushUser(
+        name,
+        content,
+        message.id,
+        message.createdTimestamp,
+        [...message.attachments.values()].map((a) => ({
+          url: a.url,
+          name: a.name,
+          size: a.size,
+          contentType: a.contentType ?? null,
+        })),
+        message.author.bot,
+      );
+    }
+    // A mention from any author (human or another bot) queues a turn that
+    // always responds. With chime enabled, a message from another bot that
+    // does not mention the bot queues a chime turn instead: the model decides
+    // whether to respond at all (NO stays silent). Human non-mentions stay
+    // ambient context.
+    if (isMentionOf(message, botId)) {
+      queues.get(channelId).push({ id: message.id, chime: false });
+    } else if (cfg.discord.chimeEnabled && message.author.bot) {
+      queues.get(channelId).push({ id: message.id, chime: true });
+    }
+  };
+
+  /**
+   * The stability gate: a trackable message is committed (tracked in the
+   * context, able to queue a turn) only once it has been unchanged for
+   * DISCORD_MESSAGE_STABLE_MS. Other bots stream their replies by posting a
+   * message and editing it as the text arrives; without the window the model
+   * would see (and be asked to answer) partial text. Edits while pending
+   * restart the window, and the commit always carries the final state. A
+   * message deleted while pending never commits (it was never tracked); a
+   * channel delete forgets its pending messages.
+   */
+  const gate = new MessageGate({
+    stableMs: cfg.discord.messageStableMs,
+    onCommit: commitArrival,
+  });
 
   client.once("clientReady", () => {
     log.info(`connected as ${client.user?.tag} (id ${client.user?.id})`);
@@ -217,82 +305,36 @@ async function main(): Promise<void> {
     }
   });
 
-  // Every trackable message enters the channel's context immediately, keyed
-  // by its Discord id so edits/deletes can be reflected (handlers below) —
-  // humans and other bots alike (bot authors are labeled "(bot)" in the
-  // context). Only mentions additionally queue a turn (from any author);
-  // ambient messages never trigger one on their own.
+  // Every trackable message (a human's or another bot's) starts its
+  // stability window here; it is committed by the gate once it has been
+  // unchanged for the window — see commitArrival. Ambient messages never
+  // trigger a turn on their own; only ones whose final content mentions the
+  // bot do.
   client.on("messageCreate", (message) => {
     const botId = client.user?.id;
     if (!botId) return;
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
-    // `!clear` resets the channel's model context for a fresh chat: the
-    // command is neither tracked nor answered (a bot mention alongside it is
-    // swallowed too). Only humans may issue it — other bots are tracked
-    // now, so a bot posting "!clear" must not wipe the channel's context.
-    // Mentions queued before the clear are dropped with the
-    // context: their mention is no longer in it (compaction) or sits before
-    // the boundary (classic), so their turns are skipped.
-    if (!message.author.bot && isClearCommand(message.content, botId)) {
-      if (compaction) {
-        // Drop entries + summary and suppress the startup seed: the next
-        // turn starts from messages that arrive after the clear, not from
-        // the channel's last-N.
-        contexts.get(message.channelId).reset();
-      } else {
-        // The live fetch is the source of truth in classic mode, so the
-        // clear is a boundary: only messages after the command's own id
-        // enter the context. The in-memory window is cleared too (fallback
-        // and recorded replies stay fresh).
-        histories.markCleared(message.channelId, message.id);
-      }
-      log.info(`channel ${message.channelId}: conversation reset by ${message.author.username}`);
-      const channel = message.channel;
-      if (channel && channel.isTextBased()) {
-        channel.send({ content: CLEAR_CONFIRMATION, allowedMentions: SAFE_MENTIONS }).catch((err) => {
-          log.warn(`failed to post the clear confirmation: ${errMsg(err)}`);
-        });
-      }
-      return;
-    }
-    // The display name (guild nickname when set, else the global username)
-    // labels this message in the context; the attachment metadata is what
-    // the image parts are downloaded from at turn time. The bot flag marks
-    // other bots' messages ("(bot)" label in the context).
-    const name = message.member?.displayName ?? message.author.username;
-    if (compaction) {
-      contexts.get(message.channelId).pushUser(
-        name,
-        stripMention(message, botId),
-        message.id,
-        message.createdTimestamp,
-        [...message.attachments.values()].map((a) => ({
-          url: a.url,
-          name: a.name,
-          size: a.size,
-          contentType: a.contentType ?? null,
-        })),
-        message.author.bot,
-      );
-    } else {
-      histories.get(message.channelId).push("user", stripMention(message, botId), [message.id], undefined, name, message.author.bot);
-    }
-    if (isMentionOf(message, botId)) {
-      queues.get(message.channelId).push(message.id);
-    }
+    gate.arrive(message);
   });
 
-  // Edits: keep the context in sync. Single-message entries (a human or
-  // other bot's message, or a short bot reply) take the new content as-is;
-  // chunked bot replies rebuild their visible text from the stored chunks.
-  // The bot's own final post of a chunk matches the stored chunk, so it is a
-  // no-op — only real edits (by anyone) change anything. Note: an edit that
-  // *adds* a mention does not queue a turn; only fresh messages do.
+  // Edits: a message still in its stability window refreshes the gate (the
+  // commit will carry the final state) — this is how other bots' streamed
+  // replies complete. An already-committed message syncs the context instead.
+  // Single-message entries (a human or other bot's message, or a short bot
+  // reply) take the new content as-is; chunked bot replies rebuild their
+  // visible text from the stored chunks. The bot's own final post of a chunk
+  // matches the stored chunk, so it is a no-op — only real edits (by anyone)
+  // change anything. Note: an edit that *adds* a mention does not queue a
+  // turn; only fresh (stabilizing) messages do.
   client.on("messageUpdate", (_oldMessage, message) => {
     const botId = client.user?.id;
     if (!botId) return;
     const channelId = message.channel?.id;
     if (!channelId) return;
+    if (gate.isPending(message.id)) {
+      gate.arrive(message);
+      return;
+    }
     const conv = conversationFor(channelId);
     if (!conv) return; // the channel has no context yet
     const entry = conv.find(message.id);
@@ -308,31 +350,35 @@ async function main(): Promise<void> {
     }
   });
 
-  // Deletions: drop the entry, wherever it is in the context. (A delete of
-  // any chunk of a chunked reply drops the whole reply.)
+  // Deletions: drop the still-pending message (it never committed, so there
+  // is nothing to remove from the context) and, wherever an entry is in the
+  // context, drop it too. (A delete of any chunk of a chunked reply drops
+  // the whole reply.)
   client.on("messageDelete", (message) => {
     const channelId = message.channel?.id;
     if (!channelId) return;
+    gate.drop(message.id);
     conversationFor(channelId)?.removeById(message.id);
   });
 
   client.on("messageDeleteBulk", (messages, channel) => {
     const conv = conversationFor(channel.id);
-    if (!conv) return;
     for (const m of messages.values()) {
-      conv.removeById(m.id);
+      gate.drop(m.id);
+      conv?.removeById(m.id);
     }
   });
 
-  // A deleted channel's context is gone; forget it.
+  // A deleted channel's context and pending messages are gone; forget them.
   client.on("channelDelete", (channel) => {
-    histories.clear(channel.id);
     contexts.clear(channel.id);
+    gate.clearChannel(channel.id);
   });
 
   // Lifecycle: cancel in-flight generation, destroy the client, exit cleanly.
   const shutdown = (signal: string): void => {
     log.info(`${signal} received, shutting down`);
+    gate.clear();
     llm.abort();
     for (const c of tools.clients) c.abort();
     client.destroy();
