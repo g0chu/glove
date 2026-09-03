@@ -218,19 +218,22 @@ async function main(): Promise<void> {
   });
 
   // Every trackable message enters the channel's context immediately, keyed
-  // by its Discord id so edits/deletes can be reflected (handlers below).
-  // Only mentions additionally queue a turn; ambient messages never trigger
-  // one on their own.
+  // by its Discord id so edits/deletes can be reflected (handlers below) —
+  // humans and other bots alike (bot authors are labeled "(bot)" in the
+  // context). Only mentions additionally queue a turn (from any author);
+  // ambient messages never trigger one on their own.
   client.on("messageCreate", (message) => {
     const botId = client.user?.id;
     if (!botId) return;
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
     // `!clear` resets the channel's model context for a fresh chat: the
     // command is neither tracked nor answered (a bot mention alongside it is
-    // swallowed too). Mentions queued before the clear are dropped with the
+    // swallowed too). Only humans may issue it — other bots are tracked
+    // now, so a bot posting "!clear" must not wipe the channel's context.
+    // Mentions queued before the clear are dropped with the
     // context: their mention is no longer in it (compaction) or sits before
     // the boundary (classic), so their turns are skipped.
-    if (isClearCommand(message.content, botId)) {
+    if (!message.author.bot && isClearCommand(message.content, botId)) {
       if (compaction) {
         // Drop entries + summary and suppress the startup seed: the next
         // turn starts from messages that arrive after the clear, not from
@@ -254,7 +257,8 @@ async function main(): Promise<void> {
     }
     // The display name (guild nickname when set, else the global username)
     // labels this message in the context; the attachment metadata is what
-    // the image parts are downloaded from at turn time.
+    // the image parts are downloaded from at turn time. The bot flag marks
+    // other bots' messages ("(bot)" label in the context).
     const name = message.member?.displayName ?? message.author.username;
     if (compaction) {
       contexts.get(message.channelId).pushUser(
@@ -268,21 +272,22 @@ async function main(): Promise<void> {
           size: a.size,
           contentType: a.contentType ?? null,
         })),
+        message.author.bot,
       );
     } else {
-      histories.get(message.channelId).push("user", stripMention(message, botId), [message.id], undefined, name);
+      histories.get(message.channelId).push("user", stripMention(message, botId), [message.id], undefined, name, message.author.bot);
     }
     if (isMentionOf(message, botId)) {
       queues.get(message.channelId).push(message.id);
     }
   });
 
-  // Edits: keep the context in sync. Single-message entries (a human
-  // message, or a short bot reply) take the new content as-is; chunked bot
-  // replies rebuild their visible text from the stored chunks. The bot's own
-  // final post of a chunk matches the stored chunk, so it is a no-op — only
-  // real edits (by anyone) change anything. Note: an edit that *adds* a
-  // mention does not queue a turn; only fresh messages do.
+  // Edits: keep the context in sync. Single-message entries (a human or
+  // other bot's message, or a short bot reply) take the new content as-is;
+  // chunked bot replies rebuild their visible text from the stored chunks.
+  // The bot's own final post of a chunk matches the stored chunk, so it is a
+  // no-op — only real edits (by anyone) change anything. Note: an edit that
+  // *adds* a mention does not queue a turn; only fresh messages do.
   client.on("messageUpdate", (_oldMessage, message) => {
     const botId = client.user?.id;
     if (!botId) return;

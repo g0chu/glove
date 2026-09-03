@@ -1,6 +1,6 @@
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
-import { BOT_REPLY_GROUP_GAP_MS, type ChannelContext, type SeedEntry } from "../llm/context.js";
+import { BOT_REPLY_GROUP_GAP_MS, compareDiscordIds, type ChannelContext, type SeedEntry } from "../llm/context.js";
 import { ChannelHistory, speakerLabel, toRequestMessages } from "../llm/history.js";
 import { errMsg, log } from "../log.js";
 import { fetchMessageFiles, type FileFetch } from "./files.js";
@@ -98,12 +98,14 @@ interface ContextEntry {
 
 /**
  * The bot's own UI lines — the tool-activity message (one per turn, edited
- * in place as calls arrive: its first line is "🔎 *…*", "📁 *…*", "📚 *…*",
- * "🔧 *…*" or the "🔧 *… N earlier calls …*" header) and the thinking line
- * ("🤔 *thought for Ns*") — are posted for humans, not part of the
- * conversation: they never enter the model context.
+ * in place as calls arrive: its first line is "🔎 *…*", "📁 *…*", "🐚 *…*",
+ * "📚 *…*", "🔧 *…*" or the "🔧 *… N earlier calls …*" header) and the
+ * thinking line ("🤔 *thought for Ns*") — are posted for humans, not part
+ * of the conversation: they never enter the model context. Every icon the
+ * activity lines can start with (see iconFor in tools/activity.ts) must be
+ * listed here — a missed icon lets that activity line into the context.
  */
-const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚|🧹) \*/;
+const BOT_UI_RE = /^(?:🤔|🔎|📁|🐚|🔧|📚|🧹) \*/;
 
 /**
  * Build the `messages` array for a turn.
@@ -119,10 +121,13 @@ const BOT_UI_RE = /^(?:🤔|🔎|📁|🔧|📚|🧹) \*/;
  * queued): the turn should be skipped.
  *
  * Classic mode (opts.compaction unset): the channel's last `maxMessages`
- * Discord messages, fetched live each turn. Mapping (chronological order;
- * every Discord message is its own request message — except our own
- * unrecorded replies, whose chunks are grouped back into one entry — so
- * the model sees the chat as it actually went):
+ * Discord messages, fetched live each turn (Discord's fetch caps at 100 —
+ * a bigger window falls back to the in-memory window, with a warning). The
+ * fetch is sorted in true creation order (timestamp, then snowflake id —
+ * see compareDiscordIds). Mapping (chronological order; every Discord
+ * message is its own request message — except our own unrecorded replies,
+ * whose chunks are grouped back into one entry — so the model sees the chat
+ * as it actually went):
  *  - our recorded replies (in the channel history) appear once with their
  *    canonical text, no matter how many Discord messages back them;
  *  - our unrecorded replies (posted before a restart) appear once as well:
@@ -169,13 +174,20 @@ export async function buildChannelContext(
     try {
       const col = await channel.messages.fetch({ limit: opts.maxMessages });
       fetched = [...col.values()]
-        .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+        .sort((a, b) => a.createdTimestamp - b.createdTimestamp || compareDiscordIds(a.id, b.id))
         .map(toMessageLike);
     } catch (err) {
       log.warn(
         `could not fetch the channel's last ${opts.maxMessages} messages (${errMsg(err)}); using the in-memory window`,
       );
     }
+  } else {
+    // Discord's fetch cap: the live fetch is impossible, so the in-memory
+    // window is the only source — say so, so the config mistake is not
+    // silent (pre-startup messages are simply not in it).
+    log.warn(
+      `the context window (${opts.maxMessages} messages) exceeds Discord's ${DISCORD_FETCH_LIMIT}-message fetch cap; classic mode uses the in-memory window instead of a live fetch`,
+    );
   }
   if (fetched === null) return toRequestMessages(history, opts.systemPrompt);
   return contextFromMessages(fetched, history, mentionId, opts);
@@ -220,16 +232,21 @@ async function buildCompactedContext(
   return contextToMessages(context, opts);
 }
 
-/** The channel's last N messages in chronological order, or null (failure / over the fetch cap). */
+/**
+ * The channel's last min(N, 100) messages in chronological order (Discord's
+ * fetch caps at 100 — a bigger window seeds with what Discord can give, so
+ * the context still gains the pre-startup messages), or null (fetch
+ * failure: the seed is retried on the next turn).
+ */
 async function seedMessages(channel: GuildTextBasedChannel, limit: number): Promise<MessageLike[] | null> {
-  if (limit > DISCORD_FETCH_LIMIT) return null;
+  const n = Math.min(limit, DISCORD_FETCH_LIMIT);
   try {
-    const col = await channel.messages.fetch({ limit });
+    const col = await channel.messages.fetch({ limit: n });
     return [...col.values()]
-      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp || compareDiscordIds(a.id, b.id))
       .map(toMessageLike);
   } catch (err) {
-    log.warn(`could not seed the channel context from its last ${limit} messages (${errMsg(err)}); retrying next turn`);
+    log.warn(`could not seed the channel context from its last ${n} messages (${errMsg(err)}); retrying next turn`);
     return null;
   }
 }

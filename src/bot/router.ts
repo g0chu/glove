@@ -2,16 +2,20 @@ import { ChannelType, type Message } from "discord.js";
 
 /**
  * A message is *trackable* when it is worth considering at all: it is in a
- * text channel of the target guild(s) and was written by a human. An empty
- * `guildId` means every guild the bot is a member of.
+ * text channel of the target guild(s) and was written by a human or another
+ * bot (our own messages are never tracked — they are posted by the writer
+ * and recorded explicitly). An empty `guildId` means every guild the bot is
+ * a member of. Other bots are labeled "(bot)" in the context (see
+ * speakerLabel) so the model can tell them apart from humans.
  *
  * Trackable messages come in two flavors:
- *  - mentions of the bot  -> start a turn (see queue.ts)
+ *  - mentions of the bot  -> start a turn (see queue.ts) — from humans and
+ *                            other bots alike
  *  - everything else      -> ambient context, buffered until a mention
  *                            rides along with them (PLAN.md §4)
  */
 export function isTrackable(message: Message, botId: string, guildId: string): boolean {
-  if (message.author.bot) return false; // bots (incl. ourselves) are never tracked
+  if (message.author.id === botId) return false; // our own messages are never tracked
   const guild = message.guild;
   if (!guild) return false; // ignore DMs
   if (guildId !== "" && guild.id !== guildId) return false; // ignore other guilds
@@ -21,7 +25,9 @@ export function isTrackable(message: Message, botId: string, guildId: string): b
 
 /**
  * True when the message mentions the bot. Replies to a bot message count as
- * a mention (discord.js default), which is the natural "talk back" UX.
+ * a mention (discord.js default), which is the natural "talk back" UX. Works
+ * for any author — a mention from another bot queues a turn like one from a
+ * human.
  */
 export function isMentionOf(message: Message, botId: string): boolean {
   return message.mentions.has(botId);

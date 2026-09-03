@@ -19,6 +19,8 @@ export interface HistoryMessage {
   chunks?: string[];
   /** The author's display name (user entries only): labels the fallback context. */
   name?: string;
+  /** True when the author is another bot (labeled "(bot)" in the context). */
+  bot?: boolean;
 }
 
 /** Per-channel in-memory sliding window of the last N messages. */
@@ -27,17 +29,22 @@ export class ChannelHistory {
 
   constructor(private readonly maxMessages: number) {}
 
-  /** Append an entry backed by Discord message id(s); trims the window. */
+  /**
+   * Append an entry backed by Discord message id(s); trims the window.
+   * `name`/`bot` label user entries (other bots are marked "(bot)").
+   */
   push(
     role: Role,
     content: string,
     ids: string[],
     chunks?: string[],
     name?: string,
+    bot?: boolean,
   ): HistoryMessage {
     const entry: HistoryMessage = { role, content, ids: [...ids] };
     if (chunks) entry.chunks = [...chunks];
     if (name !== undefined) entry.name = name;
+    if (bot) entry.bot = true;
     this.messages.push(entry);
     while (this.messages.length > this.maxMessages) {
       this.messages.shift();
@@ -164,10 +171,10 @@ export function toRequestMessages(history: ChannelHistory, systemPrompt: string)
   }
   for (const m of history.snapshot()) {
     if (m.content.length === 0) continue;
-    // Window user entries are always human (bots are never tracked), so the
-    // label needs no "(bot)" marker.
+    // User entries may be other bots now: the "(bot)" marker keeps the model
+    // from confusing them with humans (mirroring Discord's badge).
     const content =
-      m.role === "user" && m.name ? `${speakerLabel(m.name, false)}: ${m.content}` : m.content;
+      m.role === "user" && m.name ? `${speakerLabel(m.name, m.bot ?? false)}: ${m.content}` : m.content;
     out.push({ role: m.role, content });
   }
   return out;
