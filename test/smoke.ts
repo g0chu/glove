@@ -242,12 +242,17 @@ const ok = (name: string): void => {
   const h4 = new ChannelHistory(10);
   h4.push("user", "", ["30"]); // e.g. a bare mention: tracked, but no text
   h4.push("user", "hi", ["31"], undefined, "Alice");
+  h4.push("user", "beep", ["32"], undefined, "Carl", true); // another bot
   assert.deepEqual(toRequestMessages(h4, "You are helpful."), [
     { role: "system", content: "You are helpful." },
     { role: "user", content: "Alice: hi" },
+    { role: "user", content: "Carl (bot): beep" },
   ]);
-  assert.deepEqual(toRequestMessages(h4, "   "), [{ role: "user", content: "Alice: hi" }]);
-  ok("history: request messages skip textless entries, label speakers, system prompt optional");
+  assert.deepEqual(toRequestMessages(h4, "   "), [
+    { role: "user", content: "Alice: hi" },
+    { role: "user", content: "Carl (bot): beep" },
+  ], "the bot flag marks the label, humans are unmarked");
+  ok("history: request messages skip textless entries, label speakers (bot marker), system prompt optional");
 
   // !clear (classic mode): the store clears the window and records the
   // boundary message id; a newer clear moves it; forgetting the channel
@@ -286,24 +291,28 @@ const ok = (name: string): void => {
 // ------------------------------------------------------------- router --
 {
   const botId = "bot1";
-  const fakeMsg = (guildId: string | null, channelType: number, bot = false): Message =>
+  const fakeMsg = (guildId: string | null, channelType: number, author: { id: string; bot: boolean }): Message =>
     ({
-      author: { bot },
+      author,
       guild: guildId === null ? null : { id: guildId },
       channel: { type: channelType },
     }) as unknown as Message;
+  const human = { id: "user1", bot: false };
+  const otherBot = { id: "bot2", bot: true };
   // empty guild id: any guild's text channel is trackable, DMs are not
-  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText), botId, ""), true);
-  assert.equal(isTrackable(fakeMsg("999", ChannelType.GuildText), botId, ""), true, "another guild too");
-  assert.equal(isTrackable(fakeMsg(null, ChannelType.GuildText), botId, ""), false, "DMs are never tracked");
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText, human), botId, ""), true);
+  assert.equal(isTrackable(fakeMsg("999", ChannelType.GuildText, human), botId, ""), true, "another guild too");
+  assert.equal(isTrackable(fakeMsg(null, ChannelType.GuildText, human), botId, ""), false, "DMs are never tracked");
   // a set guild id: only that guild is trackable
-  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText), botId, "123"), true);
-  assert.equal(isTrackable(fakeMsg("999", ChannelType.GuildText), botId, "123"), false, "other guilds are ignored");
-  assert.equal(isTrackable(fakeMsg(null, ChannelType.GuildText), botId, "123"), false, "DMs are never tracked");
-  // bots and non-text channels are never trackable
-  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText, true), botId, ""), false, "bot messages are never tracked");
-  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildVoice), botId, ""), false, "voice channels are ignored");
-  ok("router: isTrackable (empty guild id = any guild; DMs/bots/voice never tracked)");
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText, human), botId, "123"), true);
+  assert.equal(isTrackable(fakeMsg("999", ChannelType.GuildText, human), botId, "123"), false, "other guilds are ignored");
+  assert.equal(isTrackable(fakeMsg(null, ChannelType.GuildText, human), botId, "123"), false, "DMs are never tracked");
+  // other bots' messages are trackable too (labeled "(bot)" in the context);
+  // our own messages are never tracked; voice channels are ignored
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText, otherBot), botId, ""), true, "other bots are tracked");
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildText, { id: botId, bot: true }), botId, ""), false, "our own messages are never tracked");
+  assert.equal(isTrackable(fakeMsg("123", ChannelType.GuildVoice, human), botId, ""), false, "voice channels are ignored");
+  ok("router: isTrackable (empty guild id = any guild; DMs/voice never tracked, other bots tracked)");
 }
 
 // ----------------------------------------------------------------- split --
@@ -679,6 +688,7 @@ const ok = (name: string): void => {
   const beep = m(authors.carl, "beep");
   const think = m(authors.bot, "🤔 *Let me check the units first. (3s)*"); // our UI line
   const activity = m(authors.bot, '🔎 *web_search(query="x")*\n📁 *file_read(path="notes.md")*'); // our UI line (one batched message per turn)
+  const shell = m(authors.bot, '🐚 *shell_exec(command="git status")*'); // our UI line (shell icon, a shell-only turn's first line)
   const wiki = m(authors.bot, "📚 *wikipedia_search(query=\"loop\")*"); // our UI line
   const chunkA = m(authors.bot, "part one");
   const chunkB = m(authors.bot, "part two");
@@ -689,7 +699,7 @@ const ok = (name: string): void => {
   const errNote = m(authors.bot, "⚠️ *generation failed: boom*");
   // the mention carries an image too: it must survive the history lookup
   const mention = m(authors.alice, "<@bot1> describe this", [imgAtt]);
-  const fetchedList = [hello, oldReply, beep, think, activity, wiki, chunkA, chunkB, thanks, imgOnly, sure, big, errNote, mention];
+  const fetchedList = [hello, oldReply, beep, think, activity, shell, wiki, chunkA, chunkB, thanks, imgOnly, sure, big, errNote, mention];
 
   const hist = new ChannelHistory(20);
   hist.push("assistant", "full reply", [chunkA.id, chunkB.id], ["part one", "part two"]);
@@ -890,6 +900,24 @@ const ok = (name: string): void => {
     { role: "system", content: "sys" },
     { role: "user", content: "Alice: hi" },
   ], "fetch failure falls back to the in-memory window (speakers labeled)");
+  // A same-millisecond burst: the API returns newest-first, so a
+  // timestamp-only sort would keep the reversed order — the snowflake id
+  // tie-break restores the true creation order.
+  const burst = [
+    { id: "1000000000000000003", content: "third", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "1000000000000000005", content: "fifth", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "1000000000000000001", content: "first", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+  ];
+  const burstChan = { messages: { fetch: async () => ({ values: () => burst.values() }) } } as unknown as GuildTextBasedChannel;
+  assert.deepEqual(
+    await buildChannelContext(burstChan, new ChannelContext(), new ChannelHistory(20), "1000000000000000005", { ...wOpts, systemPrompt: "" }),
+    [
+      { role: "user", content: "Alice: first" },
+      { role: "user", content: "Alice: third" },
+      { role: "user", content: "Alice: fifth" },
+    ],
+    "same-millisecond messages ordered by id, not by the API's newest-first order",
+  );
   ok("context: wrapper fetch (limit, ordering) and in-memory fallback");
 
   // !clear boundary: only messages strictly after the clear command's own
@@ -952,16 +980,32 @@ const ok = (name: string): void => {
   const store = new ChannelContext();
   store.pushUser("Alice", "hello from the past", "s1", 1000, []);
   store.pushUser("Bob", "new message", "s2", 5000, []);
+  // The same-millisecond pair arrives newest-first (like the API): the id
+  // tie-break must restore the true order.
   store.seedFrom([
     { id: "s1", ts: 1000, role: "user", content: "old copy", name: "Alice", attachments: [] },
     { id: "s3", ts: 3000, role: "user", content: "between", name: "Carol", attachments: [] },
+    { id: "1000000000000000002", ts: 6000, role: "user", content: "tie second", name: "Eve", attachments: [] },
+    { id: "1000000000000000001", ts: 6000, role: "user", content: "tie first", name: "Frank", attachments: [] },
     { id: "s4", ts: 9000, role: "user", content: "after", name: "Dan", attachments: [] },
   ]);
   assert.deepEqual(
     store.snapshot().map((e) => `${e.name}:${e.content}`),
-    ["Alice:hello from the past", "Carol:between", "Bob:new message", "Dan:after"],
+    ["Alice:hello from the past", "Carol:between", "Bob:new message", "Frank:tie first", "Eve:tie second", "Dan:after"],
   );
   assert.equal(store.seeded, true);
+  // A bot-flagged arrival renders with the "(bot)" marker (the compaction
+  // path, like the fallback path).
+  const botStore = new ChannelContext();
+  botStore.pushUser("Carl", "beep", "cb1", 1, [], true);
+  assert.deepEqual(await contextToMessages(botStore, {
+    systemPrompt: "",
+    maxMessages: 10,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
+  }), [{ role: "user", content: "Carl (bot): beep" }]);
   // Token estimate: ~4 chars/token + a fixed cost per image in the window.
   assert.equal(estimateTokens("12345678"), 2);
   const est = new ChannelContext();
@@ -986,6 +1030,60 @@ const ok = (name: string): void => {
   // both cap to 1000 -> ceil(1000/4) each).
   assert.equal(fest.estimateTokens("", 2, 1000), 1502, "on: text + image + two capped file costs");
   ok("compaction store: seed merges chronologically (tracked ids win), token estimate");
+
+  // A window bigger than Discord's 100-message fetch cap: the seed still
+  // happens (capped at what Discord can give), so pre-startup messages are
+  // not silently missing from the context.
+  let seedLimit: number | undefined;
+  const seedMsgs = [
+    { id: "sc1", content: "pre-startup", createdTimestamp: 50, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "sc2", content: "the mention", createdTimestamp: 60, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+  ];
+  const seedChan = {
+    messages: {
+      fetch: async (o: { limit?: number }) => {
+        seedLimit = o.limit;
+        return { values: () => seedMsgs.values() };
+      },
+    },
+  } as unknown as GuildTextBasedChannel;
+  const capStore = new ChannelContext();
+  capStore.pushUser("Alice", "the mention", "sc2", 60, []);
+  const capRes = await buildChannelContext(seedChan, capStore, new ChannelHistory(20), "sc2", {
+    botId: "bot1",
+    systemPrompt: "",
+    maxMessages: 150,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
+    compaction: { maxTokens: 100_000, keepMessages: 10, summarize: async () => "never" },
+  });
+  assert.equal(seedLimit, 100, "the seed fetch is capped at Discord's limit");
+  assert.equal(capStore.seeded, true, "the seed happened (not retried every turn)");
+  assert.deepEqual(
+    capRes!.map((x) => String(x.content)),
+    ["Alice: pre-startup", "Alice: the mention"],
+  );
+  ok("compaction: a window over Discord's 100-fetch cap still seeds (capped)");
+
+  // A single tracked reply grouped with a tracked multi-chunk reply (the
+  // seed): the chunk list must stay aligned with the id list — a
+  // misaligned lookup would corrupt the entry's content on the next chunk
+  // edit ("undefined" holes, lost text).
+  const gstore = new ChannelContext();
+  const gNow = Date.now();
+  gstore.pushAssistant("single reply", ["g-s1"]);
+  gstore.pushAssistant("g-c1\ng-c2\ng-c3", ["g-c1", "g-c2", "g-c3"], ["g-c1 text", "g-c2 text", "g-c3 text"]);
+  gstore.seedFrom([{ id: "g-u0", ts: gNow - 10_000, role: "user", content: "question", name: "Alice", attachments: [] }]);
+  const gSnap = gstore.snapshot();
+  assert.equal(gSnap.length, 2, "question + grouped reply");
+  const gGrouped = gSnap[1];
+  assert.deepEqual(gGrouped.ids, ["g-s1", "g-c1", "g-c2", "g-c3"]);
+  assert.deepEqual(gGrouped.chunks, ["single reply", "g-c1 text", "g-c2 text", "g-c3 text"], "chunks aligned with ids");
+  gstore.updateChunk("g-c3", "g-c3 text (edited)");
+  assert.equal(gGrouped.content, "single reply\ng-c1 text\ng-c2 text\ng-c3 text (edited)", "the chunk edit re-derives the content, no holes");
+  ok("compaction store: grouping keeps chunks aligned with ids (chunk edits resolve the right slot)");
 
   // A chunked reply in the channel before the bot started (its chunks are
   // separate Discord messages): the seed groups the close-together bot

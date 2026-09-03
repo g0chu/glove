@@ -119,15 +119,17 @@ export class ChannelContext {
   /** Whether the startup seed (the channel's last N messages) has been taken in. */
   seeded = false;
 
-  /** Append a human message (trackable arrivals are human only). */
+  /** Append an arrival (a human's or another bot's message; `bot` labels it "(bot)" in the context). */
   pushUser(
     name: string,
     content: string,
     id: string,
     ts: number,
     attachments: MessageAttachmentLike[],
+    bot = false,
   ): ContextEntry {
     const entry: ContextEntry = { role: "user", content, ids: [id], name, ts, attachments: [...attachments] };
+    if (bot) entry.bot = true;
     this.entries.push(entry);
     return entry;
   }
@@ -206,7 +208,9 @@ export class ChannelContext {
   /**
    * Take in the channel's fetched last-N messages (the startup seed):
    * already-tracked ids win (they track live edits and deletes), new
-   * messages are merged in chronological order.
+   * messages are merged in chronological order (timestamp, then message id
+   * — see compareDiscordIds: same-millisecond messages must not keep the
+   * API's newest-first order).
    */
   seedFrom(seed: SeedEntry[]): void {
     const known = new Set<string>();
@@ -226,7 +230,7 @@ export class ChannelContext {
       if (s.bot !== undefined) entry.bot = s.bot;
       merged.push(entry);
     }
-    merged.sort((a, b) => a.ts - b.ts);
+    merged.sort((a, b) => a.ts - b.ts || compareDiscordIds(a.ids[0], b.ids[0]));
     this.entries.length = 0;
     this.entries.push(...groupConsecutiveReplies(merged));
     this.seeded = true;
@@ -323,7 +327,11 @@ export class ChannelContext {
  * `updateChunk`), all chunk ids, and the per-chunk text so edit/delete
  * bookkeeping matches a live chunked reply (any chunk id resolves the
  * entry; a chunk edit re-derives the content; a chunk delete drops the
- * whole entry). Non-adjacent or far-apart entries are kept as-is.
+ * whole entry). The chunk list stays aligned with the id list (one chunk
+ * text per id — a multi-chunk entry contributes its whole chunk list, not
+ * just its joined content), so `updateChunk`'s id-to-index lookup always
+ * resolves the right slot. Non-adjacent or far-apart entries are kept
+ * as-is.
  */
 function groupConsecutiveReplies(entries: ContextEntry[]): ContextEntry[] {
   const out: ContextEntry[] = [];
@@ -338,13 +346,29 @@ function groupConsecutiveReplies(entries: ContextEntry[]): ContextEntry[] {
       const prevContent = prev.content;
       prev.content = `${prevContent}\n${e.content}`;
       prev.ids = [...prev.ids, ...e.ids];
-      prev.chunks = [...(prev.chunks ?? [prevContent]), e.content];
+      prev.chunks = [...(prev.chunks ?? [prevContent]), ...(e.chunks ?? [e.content])];
       prev.attachments = [...prev.attachments, ...e.attachments];
     } else {
       out.push(e);
     }
   }
   return out;
+}
+
+/**
+ * Compare two Discord message ids in creation order. Snowflake ids are
+ * timestamp + sequence, so their numeric order is the exact message order —
+ * the tie-break every chronological sort needs, because
+ * `createdTimestamp` is only millisecond-precise (Discord's API returns
+ * newest-first, so a timestamp-only sort leaves same-millisecond bursts in
+ * reverse order). Non-numeric ids (tests) compare as equal: the stable
+ * sort keeps their input order.
+ */
+export function compareDiscordIds(a: string, b: string): number {
+  const na = /^\d+$/.test(a) ? BigInt(a) : null;
+  const nb = /^\d+$/.test(b) ? BigInt(b) : null;
+  if (na === null || nb === null) return 0;
+  return na < nb ? -1 : na > nb ? 1 : 0;
 }
 
 /** Lazily creates a ChannelContext per channel id. */
