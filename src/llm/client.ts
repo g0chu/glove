@@ -54,10 +54,20 @@ export interface ChatMessage {
   name?: string;
 }
 
+/** The endpoint's own count of the tokens one request used, when it reports them. */
+export interface TokenUsage {
+  /** Prompt tokens (the request's context, counted by the model's tokenizer). */
+  input: number;
+  /** Generated (completion) tokens. */
+  output: number;
+}
+
 /** What the model answered: text, tool calls, or both. */
 export interface ChatResult {
   content: string;
   toolCalls: ToolCall[];
+  /** The endpoint's token count for this request, when it reports one. */
+  usage?: TokenUsage;
 }
 
 /** OpenAI-compatible function spec (the `function` object of a `tools` entry). */
@@ -98,6 +108,10 @@ interface SseDeltaChunk {
   choices?: Array<{
     delta?: { content?: unknown; reasoning?: unknown; reasoning_content?: unknown; tool_calls?: SseToolCallDelta[] };
   }>;
+  /** OpenAI-style usage block (some endpoints send it in the final chunk). */
+  usage?: unknown;
+  /** llama-server's timing block (final chunk): prompt_n + cache_n prompt tokens, predicted_n completion tokens. */
+  timings?: unknown;
 }
 
 interface SseMessageChunk {
@@ -105,6 +119,54 @@ interface SseMessageChunk {
   choices?: Array<{
     message?: { content?: unknown; reasoning?: unknown; reasoning_content?: unknown; tool_calls?: SseToolCallDelta[] };
   }>;
+  /** OpenAI-style usage block. */
+  usage?: unknown;
+  /** llama.cpp's legacy top-level token counters (older builds). */
+  prompt_tokens?: unknown;
+  completion_tokens?: unknown;
+  /** llama-server's timing block: prompt_n + cache_n prompt tokens, predicted_n completion tokens. */
+  timings?: unknown;
+}
+
+/** The token-count fields a response may carry (see parseUsage). */
+interface UsageCarrier {
+  usage?: unknown;
+  prompt_tokens?: unknown;
+  completion_tokens?: unknown;
+  timings?: unknown;
+}
+
+const asNonNegInt = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.trunc(v) : null;
+
+/**
+ * The endpoint's token count for one response, when it reports one.
+ * Precedence: an OpenAI-style `usage` block, then llama.cpp's legacy
+ * top-level `prompt_tokens`/`completion_tokens`, then llama.cpp's `timings`
+ * block (prompt_n + cache_n prompt tokens — the prompt-cache split — and
+ * predicted_n completion tokens; what the final streaming chunk carries
+ * when there is no usage block).
+ */
+function parseUsage(body: UsageCarrier): TokenUsage | undefined {
+  const usage = body.usage;
+  if (usage && typeof usage === "object") {
+    const u = usage as Record<string, unknown>;
+    const input = asNonNegInt(u.prompt_tokens);
+    const output = asNonNegInt(u.completion_tokens);
+    if (input !== null || output !== null) return { input: input ?? 0, output: output ?? 0 };
+  }
+  const input = asNonNegInt(body.prompt_tokens);
+  const output = asNonNegInt(body.completion_tokens);
+  if (input !== null || output !== null) return { input: input ?? 0, output: output ?? 0 };
+  const timings = body.timings;
+  if (timings && typeof timings === "object") {
+    const t = timings as Record<string, unknown>;
+    const predicted = asNonNegInt(t.predicted_n);
+    if (predicted !== null) {
+      return { input: (asNonNegInt(t.prompt_n) ?? 0) + (asNonNegInt(t.cache_n) ?? 0), output: predicted };
+    }
+  }
+  return undefined;
 }
 
 /** The reasoning/thinking text of a message object, if the endpoint sent it. */
@@ -161,6 +223,8 @@ function toWireMessage(m: ChatMessage): Record<string, unknown> {
  * - `abort()` cancels every in-flight request (graceful shutdown)
  * - tool calls: `tools` is sent only when provided; streamed
  *   `delta.tool_calls` chunks are reassembled by index
+ * - usage: captured as `ChatResult.usage` when the endpoint reports it
+ *   (see parseUsage)
  */
 export class LlmClient {
   /**
@@ -268,10 +332,13 @@ export class LlmClient {
     // live preview can still show it (there is no "in real time" in this mode).
     const reasoning = reasoningOf(message);
     if (reasoning.length > 0) callbacks.onReasoning?.(reasoning);
-    return {
+    const result: ChatResult = {
       content: typeof message.content === "string" ? message.content : "",
       toolCalls: (message.tool_calls ?? []).map(normalizeToolCall).filter((c): c is ToolCall => c !== null),
     };
+    const usage = parseUsage(data);
+    if (usage) result.usage = usage;
+    return result;
   }
 
   private async readSse(res: Response, callbacks: StreamCallbacks): Promise<ChatResult> {
@@ -283,6 +350,14 @@ export class LlmClient {
     let full = "";
     // Streamed tool calls arrive as fragments keyed by index; reassemble them.
     const calls = new Map<number, ToolCall>();
+    // The endpoint's token count, when a chunk reports it (the final chunk
+    // carries it; the last report wins).
+    let usage: TokenUsage | undefined;
+    const finish = (): ChatResult => {
+      const result: ChatResult = { content: full, toolCalls: [...calls.values()] };
+      if (usage) result.usage = usage;
+      return result;
+    };
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -295,7 +370,7 @@ export class LlmClient {
         const payload = line.slice(5).trim();
         if (payload === "[DONE]") {
           reader.cancel().catch(() => {});
-          return { content: full, toolCalls: [...calls.values()] };
+          return finish();
         }
         if (!payload) continue;
         let json: SseDeltaChunk;
@@ -309,6 +384,8 @@ export class LlmClient {
             typeof json.error === "string" ? json.error : json.error?.message ?? JSON.stringify(json.error);
           throw new Error(`model endpoint error: ${msg}`);
         }
+        const u = parseUsage(json);
+        if (u) usage = u;
         const delta = json?.choices?.[0]?.delta;
         if (delta && typeof delta === "object") {
           const content = delta.content;
@@ -342,6 +419,6 @@ export class LlmClient {
         }
       }
     }
-    return { content: full, toolCalls: [...calls.values()] };
+    return finish();
   }
 }

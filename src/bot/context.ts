@@ -66,7 +66,7 @@ export interface ContextOptions {
   fileContentsMaxBytes: number;
   /** Test-only: inject the file fetch (production uses the native one). */
   fileFetch?: FileFetch;
-  /** Estimated tokens (see llm/context.ts) at which the context compacts. */
+  /** Tokens (the endpoint's measured prompt size when known, else the char estimate) at which the context compacts. */
   maxTokens: number;
   /** How many of the newest messages survive a compaction verbatim. */
   keepMessages: number;
@@ -90,10 +90,12 @@ const BOT_UI_RE = /^(?:🤔|🔎|📁|🐚|🔧|📚|🧹) \*/;
  * context. The context is seeded once with the channel's last `maxMessages`
  * Discord messages (fetched live, so it survives bot restarts and includes
  * every author, not just the ones seen since the start), then only grows as
- * messages arrive. When its estimated size passes `maxTokens`, the older
- * part is replaced by a model-written summary and the newest
- * `keepMessages` messages stay verbatim. Returns null when the mention is no
- * longer in the context (deleted while queued): the turn should be skipped.
+ * messages arrive. When its size — the endpoint's own measured prompt size
+ * (its tokenizer's truth, remembered from the previous turn) when known,
+ * else the char estimate — passes `maxTokens`, the older part is replaced
+ * by a model-written summary and the newest `keepMessages` messages stay
+ * verbatim. Returns null when the mention is no longer in the context
+ * (deleted while queued): the turn should be skipped.
  */
 export async function buildChannelContext(
   channel: GuildTextBasedChannel,
@@ -113,11 +115,19 @@ export async function buildChannelContext(
   // File contents add a per-attachment cost to the estimate (their size,
   // capped at the download limit); undefined = the feature is off.
   const fileCost = opts.enableFileContents ? opts.fileContentsMaxBytes : undefined;
-  if (context.estimateTokens(opts.systemPrompt, opts.maxMessages, fileCost) > opts.maxTokens) {
+  // The size check prefers the endpoint's own count of this channel's last
+  // request (measured tokens, counted by the model's tokenizer) over the
+  // char estimate; after a compaction attempt the measurement is forgotten,
+  // since it then describes the pre-compaction context.
+  const measured = context.getMeasuredTokens();
+  const estimate = context.estimateTokens(opts.systemPrompt, opts.maxMessages, fileCost);
+  const size = measured !== null ? measured : estimate;
+  if (size > opts.maxTokens) {
     const res = await context.compact(opts.keepMessages, opts.summarize, mentionId);
+    context.setMeasuredTokens(null);
     if (res.ok) {
       log.info(
-        `channel context filled the budget (~${opts.maxTokens} est. tokens); compacted to a summary + ${context.length} recent message(s)`,
+        `channel context filled the budget (${measured !== null ? `measured ${measured}` : `estimated ${estimate}`} tokens > ${opts.maxTokens}); compacted to a summary + ${context.length} recent message(s)`,
       );
     } else {
       log.warn(

@@ -127,6 +127,13 @@ export class ChannelContext {
   private readonly entries: ContextEntry[] = [];
   /** Whether the startup seed (the channel's last N messages) has been taken in. */
   seeded = false;
+  /**
+   * The model endpoint's own count of the last turn's largest request
+   * (prompt tokens, from the usage/timings the endpoint reports) — the
+   * measured context size the compaction trigger prefers over the char
+   * estimate. Null when never measured (or after a reset).
+   */
+  private measuredTokens: number | null = null;
 
   /** Append an arrival (a human's or another bot's message; `bot` labels it "(bot)" in the context). */
   pushUser(
@@ -192,6 +199,7 @@ export class ChannelContext {
     this.summary = null;
     this.entries.length = 0;
     this.seeded = false;
+    this.measuredTokens = null;
   }
 
   /**
@@ -204,6 +212,17 @@ export class ChannelContext {
     this.summary = null;
     this.entries.length = 0;
     this.seeded = true;
+    this.measuredTokens = null;
+  }
+
+  /** The endpoint-reported token size of the last turn's largest request, or null (unmeasured). */
+  getMeasuredTokens(): number | null {
+    return this.measuredTokens;
+  }
+
+  /** Record (or, with null, forget) the endpoint-reported token size of a turn's largest request. */
+  setMeasuredTokens(tokens: number | null): void {
+    this.measuredTokens = tokens;
   }
 
   get length(): number {
@@ -251,7 +270,9 @@ export class ChannelContext {
    * images that would actually be sent (the newest `window` entries) and,
    * when `fileMaxBytes` is given (file contents enabled), a cost for the
    * non-image attachments that would be inlined (their size, capped at
-   * `fileMaxBytes`, same ~4-chars-per-token heuristic).
+   * `fileMaxBytes`, same ~4-chars-per-token heuristic). When the endpoint
+   * reported a measured size (getMeasuredTokens), the compaction trigger
+   * prefers that over this estimate.
    */
   estimateTokens(systemPrompt: string, window: number, fileMaxBytes?: number): number {
     let t = estimateTokens(systemPrompt);
@@ -327,6 +348,56 @@ export class ChannelContext {
       this.entries.splice(i, 1);
     }
   }
+
+  /**
+   * Last-resort shrink when a request overfilled the model's context and the
+   * endpoint rejected it: drop the oldest entries (never the protected one —
+   * the turn's mention) until the estimate fits `targetTokens`, and, if the
+   * remaining entries still do not fit, drop the running summary too (it is
+   * derived data — the only thing left besides the mention). After this, the
+   * next request fits the window again (unless the mention alone does not).
+   */
+  emergencyShrink(
+    protectedId: string,
+    targetTokens: number,
+    systemPrompt: string,
+    window: number,
+    fileMaxBytes?: number,
+  ): void {
+    this.emergencyTrim(protectedId, targetTokens, systemPrompt, window, fileMaxBytes);
+    if (this.estimateTokens(systemPrompt, window, fileMaxBytes) > targetTokens && this.summary !== null) {
+      this.summary = null;
+    }
+  }
+}
+
+/**
+ * Whether a model request failed because the prompt did not fit the model's
+ * context. llama.cpp (llama-server) rejects it before generating — HTTP 400
+ * with the error text "request (N tokens) exceeds the available context
+ * size (M tokens)" (JSON body in both stream and non-stream mode), surfaced
+ * by the LLM client as the status line + body. The other patterns cover
+ * common phrasings of the same condition on other endpoints.
+ */
+export function isContextOverflowError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    /exceed_context_size/i.test(msg) ||
+    /exceeds the available context size/i.test(msg) ||
+    /context window overflow/i.test(msg) ||
+    /maximum context length|context length exceeded/i.test(msg)
+  );
+}
+
+/**
+ * The model's context window (tokens) when the overflow error reports it —
+ * llama.cpp's message carries it ("… available context size (160000
+ * tokens) …"); null when the error is not shaped that way.
+ */
+export function contextWindowFromOverflowError(err: unknown): number | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = /context size \((\d+) tokens\)/.exec(msg);
+  return m !== null ? Number(m[1]) : null;
 }
 
 /**

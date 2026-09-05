@@ -1,4 +1,4 @@
-import type { ChatMessage, LlmClient } from "../llm/client.js";
+import type { ChatMessage, ChatResult } from "../llm/client.js";
 import { errMsg, log } from "../log.js";
 
 /**
@@ -14,16 +14,19 @@ export const CHIME_SYSTEM_PROMPT =
   "Reply with exactly one word: YES if you should respond to the newest message below, NO if you should stay silent. " +
   "Reply with only YES or NO.";
 
+/** One tool-less chat call (the chime decision needs no callbacks and no tools). */
+export type ChimeChat = (messages: ChatMessage[]) => Promise<ChatResult>;
+
 /**
  * One chime decision: a single tool-less chat call over the transcript.
  * YES only when the answer starts with "yes" (case-insensitive); anything
  * else — NO, garbage, an empty answer, or a failed call — stays silent: a
  * broken decision must not make the bot post an unasked-for reply.
  */
-export async function decideChime(llm: LlmClient, transcript: ChatMessage[]): Promise<boolean> {
+export async function decideChime(chat: ChimeChat, transcript: ChatMessage[]): Promise<boolean> {
   let content: string;
   try {
-    content = (await llm.chat([{ role: "system", content: CHIME_SYSTEM_PROMPT }, ...transcript])).content;
+    content = (await chat([{ role: "system", content: CHIME_SYSTEM_PROMPT }, ...transcript])).content;
   } catch (err) {
     log.warn(`chime decision failed: ${errMsg(err)}; staying silent`);
     return false;

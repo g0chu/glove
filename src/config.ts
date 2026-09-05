@@ -44,10 +44,33 @@ export interface ModelConfig {
   systemPrompt: string;
   /** Last-N seed size / image window. */
   contextMaxMessages: number;
-  /** Estimated tokens at which the channel context is compacted. */
+  /**
+   * Tokens (measured by the endpoint when it reports usage, else
+   * estimated) at which the channel context is compacted — or, when
+   * `compactionAuto` is true, the fallback budget until the automatic
+   * budget is derived from the server's context window at startup.
+   */
   compactionMaxTokens: number;
+  /**
+   * True when CONTEXT_COMPACTION_MAX_TOKENS is empty: the budget is set
+   * automatically from the llama-server's context window at startup
+   * (window minus the completion headroom — needs MODEL_METRICS_ENABLED),
+   * falling back to `compactionMaxTokens` until it can be derived.
+   */
+  compactionAuto: boolean;
   /** How many of the newest messages survive a compaction verbatim. */
   compactionKeepMessages: number;
+  /**
+   * When true, the bot uses the model side's own tokenizer counts: the
+   * turn's token usage is reported per turn, the compaction trigger compares
+   * the budget against the endpoint-measured prompt size, and the
+   * llama-server's /slots endpoint is probed for the current context state.
+   */
+  metricsEnabled: boolean;
+  /** The llama-server base URL for metrics (default: the chat endpoint's origin). */
+  metricsUrl: string;
+  /** Per-metrics-request timeout (ms). */
+  metricsTimeoutMs: number;
   timeoutMs: number;
 }
 
@@ -215,8 +238,12 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       stream: boolEnv("MODEL_STREAM", true),
       systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),
-      compactionMaxTokens: intEnv("CONTEXT_COMPACTION_MAX_TOKENS", 4000, 128),
+      compactionMaxTokens: 0, // filled in below (empty env = automatic budget)
+      compactionAuto: false, // filled in below
       compactionKeepMessages: intEnv("CONTEXT_COMPACTION_KEEP_MESSAGES", 20, 1),
+      metricsEnabled: boolEnv("MODEL_METRICS_ENABLED", false),
+      metricsUrl: optional("MODEL_METRICS_URL", ""),
+      metricsTimeoutMs: intEnv("MODEL_METRICS_TIMEOUT_MS", 5000, 100),
       timeoutMs: intEnv("MODEL_TIMEOUT_S", 120, 1) * 1000,
     },
     tools: {
@@ -258,6 +285,32 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
   if (config.tools.zim.enabled && config.tools.zim.file.length === 0) {
     errors.push("ZIM_FILE is required when ZIMTOOLS_ENABLED is true");
   }
+
+  // The compaction budget: an explicit CONTEXT_COMPACTION_MAX_TOKENS wins;
+  // an EMPTY one (the variable is present but blank) means "derive it from
+  // the server's context window at startup" (the fallback budget applies
+  // until that happens); a missing variable keeps the plain default.
+  {
+    const raw = env.CONTEXT_COMPACTION_MAX_TOKENS;
+    if (raw !== undefined && raw.trim() === "") {
+      config.model.compactionAuto = true;
+      config.model.compactionMaxTokens = 4000; // fallback until derived
+    } else {
+      config.model.compactionMaxTokens = intEnv("CONTEXT_COMPACTION_MAX_TOKENS", 4000, 128);
+    }
+  }
+
+  // Metrics probe the llama-server on the chat endpoint's host by default
+  // (llama-server serves /slots next to /v1/chat/completions).
+  if (config.model.metricsUrl === "") {
+    try {
+      config.model.metricsUrl = new URL(apiUrl).origin;
+    } catch {
+      // MODEL_API_URL failed to parse (already reported above): leave the
+      // metrics URL empty; the probes simply fail soft at runtime.
+    }
+  }
+  if (config.model.metricsUrl !== "") httpUrlOk("MODEL_METRICS_URL", config.model.metricsUrl);
 
   return { config, errors };
 }
