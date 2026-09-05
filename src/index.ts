@@ -1,7 +1,7 @@
 import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, type ContextOptions } from "./bot/context.js";
-import { decideChime } from "./bot/chime.js";
+import { decideChime, formatChimeNo } from "./bot/chime.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, stripMention } from "./bot/router.js";
@@ -181,7 +181,7 @@ async function main(): Promise<void> {
           t,
         ),
     );
-    const plainChat: ChatFn = tokens.track((msgs) => llm.chat(msgs));
+    const plainChat: ChatFn = tokens.track((msgs, cbs, tools) => llm.chat(msgs, cbs, tools));
     try {
       // Build the context before the typing indicator starts: it is a
       // channel fetch (+ image downloads, + one summarization call when the
@@ -225,14 +225,26 @@ async function main(): Promise<void> {
         return;
       }
       if (turn.chime) {
-        // A chime turn: the model decides whether to respond at all. One
-        // small tool-less call over the transcript (the reply's system
-        // prompt is not part of it; the transcript ends with the
-        // triggering message). NO — or a failed call — stays silent: no
-        // typing indicator, no message, nothing recorded.
+        // A chime turn: the model decides whether to respond at all, by
+        // calling the chime tool (respond + reason) in one small call over
+        // the transcript (the reply's system prompt is not part of it; the
+        // transcript ends with the triggering message). NO posts the
+        // decision + reason as a one-line UI message (never tracked); null
+        // (a failed or broken decision) stays silent: no typing indicator,
+        // no message, nothing recorded.
         const transcript = systemPrompt.trim().length > 0 ? messages.slice(1) : messages;
-        if (!(await decideChime((msgs) => plainChat(msgs), transcript))) {
-          log.info(`channel ${channelId}: chime decision NO for message ${turn.id}; staying silent`);
+        const decision = await decideChime((msgs, tools) => plainChat(msgs, undefined, tools), transcript);
+        if (decision === null) {
+          log.info(`channel ${channelId}: chime decision failed or was unusable for message ${turn.id}; staying silent`);
+          return;
+        }
+        if (!decision.respond) {
+          log.info(
+            `channel ${channelId}: chime decision NO for message ${turn.id}: ${decision.reason || "(no reason given)"}`,
+          );
+          await textChannel.send({ content: formatChimeNo(decision.reason), allowedMentions: SAFE_MENTIONS }).catch((err) => {
+            log.warn(`failed to post the chime decision: ${errMsg(err)}`);
+          });
           return;
         }
       }
@@ -330,8 +342,9 @@ async function main(): Promise<void> {
    * answered, and a bot mention alongside it is swallowed too), otherwise the
    * message enters the context (humans and other bots alike — bot authors
    * are labeled "(bot)") and, when its final content mentions the bot, queues
-   * a turn. With chime enabled, an other-bot message without a mention queues
-   * a chime turn (the model decides whether to respond). The checks run on
+   * a turn. With chime enabled, any message without a mention (a human's or
+   * another bot's) queues a chime turn (the model decides whether to respond;
+   * a NO posts the decision + reason). The checks run on
    * the final (stable) content: an edit that adds a mention before
    * stabilization queues the turn; one that removes it does not.
    */
@@ -385,13 +398,13 @@ async function main(): Promise<void> {
       );
     }
     // A mention from any author (human or another bot) queues a turn that
-    // always responds. With chime enabled, a message from another bot that
-    // does not mention the bot queues a chime turn instead: the model decides
-    // whether to respond at all (NO stays silent). Human non-mentions stay
-    // ambient context.
+    // always responds. With chime enabled, any other trackable message
+    // (a human's or another bot's, without a mention) queues a chime turn
+    // instead: the model decides whether to respond at all (NO posts the
+    // decision + reason; a broken decision stays silent).
     if (isMentionOf(message, botId)) {
       queues.get(channelId).push({ id: message.id, chime: false });
-    } else if (cfg.discord.chimeEnabled && message.author.bot) {
+    } else if (cfg.discord.chimeEnabled) {
       queues.get(channelId).push({ id: message.id, chime: true });
     }
   };
@@ -463,9 +476,10 @@ async function main(): Promise<void> {
 
   // Every trackable message (a human's or another bot's) starts its
   // stability window here; it is committed by the gate once it has been
-  // unchanged for the window — see commitArrival. Ambient messages never
-  // trigger a turn on their own; only ones whose final content mentions the
-  // bot do.
+  // unchanged for the window — see commitArrival. Without chime, ambient
+  // messages never trigger a turn on their own; only ones whose final
+  // content mentions the bot do. With chime enabled, every non-mention
+  // message queues a turn the model may decline.
   client.on("messageCreate", (message) => {
     const botId = client.user?.id;
     if (!botId) return;
