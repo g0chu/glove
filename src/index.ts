@@ -1,18 +1,24 @@
 import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext } from "./bot/context.js";
+import { buildChannelContext, type ContextOptions } from "./bot/context.js";
 import { decideChime } from "./bot/chime.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { ResponseWriter, SAFE_MENTIONS } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
-import { ChannelContextStore, type ChannelContext } from "./llm/context.js";
+import {
+  ChannelContextStore,
+  contextWindowFromOverflowError,
+  isContextOverflowError,
+  type ChannelContext,
+} from "./llm/context.js";
+import { COMPACT_OUTPUT_RESERVE_TOKENS, LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "./llm/metrics.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
 import { ToolActivityPoster } from "./tools/activity.js";
 import { buildTools } from "./tools/index.js";
-import { runToolTurn } from "./tools/loop.js";
+import { runToolTurn, type ToolTurnOutcome } from "./tools/loop.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -25,7 +31,8 @@ async function main(): Promise<void> {
     `images=${cfg.model.enableImages}`,
     `files=${cfg.model.enableFileContents}`,
     `window=${cfg.model.contextMaxMessages}`,
-    `compaction=on (budget ~${cfg.model.compactionMaxTokens} est. tokens, keep ${cfg.model.compactionKeepMessages})`,
+    `compaction=on (budget ${cfg.model.compactionAuto ? `auto, fallback ${cfg.model.compactionMaxTokens}` : cfg.model.compactionMaxTokens} tokens, keep ${cfg.model.compactionKeepMessages})`,
+    `metrics=${cfg.model.metricsEnabled ? cfg.model.metricsUrl : "off"}`,
     `stable=${cfg.discord.messageStableMs}ms`,
     `chime=${cfg.discord.chimeEnabled ? "on" : "off"}`,
   );
@@ -39,6 +46,36 @@ async function main(): Promise<void> {
     timeoutMs: cfg.model.timeoutMs,
   });
   const contexts = new ChannelContextStore();
+  // The llama-server's own metric endpoint (GET /slots): the model side's
+  // ground truth for its context window and current use. Best-effort —
+  // every probe failure resolves to null and never touches a turn.
+  const metrics = cfg.model.metricsEnabled
+    ? new LlamaMetrics({ baseUrl: cfg.model.metricsUrl, timeoutMs: cfg.model.metricsTimeoutMs })
+    : null;
+  // The effective compaction budget: the configured value, or — when
+  // CONTEXT_COMPACTION_MAX_TOKENS is empty (compactionAuto) — derived from
+  // the llama-server's context window once a probe succeeds (window minus
+  // the completion headroom). The configured value stays the fallback until
+  // the derivation happens; a too-small window gives up after one warning.
+  let compactionBudget = cfg.model.compactionMaxTokens;
+  let compactionBudgetDerived = false;
+  let compactionBudgetExhausted = false;
+  const setAutoCompactionBudget = (ctxSize: number): void => {
+    if (!cfg.model.compactionAuto || compactionBudgetDerived || compactionBudgetExhausted) return;
+    const b = deriveCompactionBudget(ctxSize);
+    if (b === null) {
+      compactionBudgetExhausted = true;
+      log.warn(
+        `cannot derive the compaction budget from a context window of ${ctxSize} tokens (window minus ${COMPACT_OUTPUT_RESERVE_TOKENS} completion headroom is too small); keeping the fallback budget ${compactionBudget}`,
+      );
+      return;
+    }
+    compactionBudget = b;
+    compactionBudgetDerived = true;
+    log.info(
+      `compaction budget set automatically: ${b} tokens (context window ${ctxSize} minus ${COMPACT_OUTPUT_RESERVE_TOKENS} completion headroom)`,
+    );
+  };
   const tools = buildTools(cfg);
   if (tools.registry.size > 0) {
     log.info(
@@ -47,6 +84,37 @@ async function main(): Promise<void> {
       `(max ${cfg.tools.maxRounds} round(s)/turn)`,
     );
   }
+
+  /**
+   * End-of-turn token bookkeeping: report the turn's usage (the endpoint's
+   * own counts, accumulated by `tokens`) and refresh the channel's measured
+   * context size for the next compaction check — the endpoint's count of
+   * this turn's largest prompt, falling back (metrics enabled) to the
+   * llama-server's own report of its last request's size (GET /slots).
+   */
+  const reportTurnTokens = async (channelId: string, context: ChannelContext, tokens: TurnTokens): Promise<void> => {
+    const server = metrics ? await metrics.snapshot() : null;
+    if (server !== null) setAutoCompactionBudget(server.ctxSize); // the automatic budget converges here if the startup probe missed the server
+    if (tokens.calls === 0 && server === null) return;
+    let measured: number | null = tokens.peakInput > 0 ? tokens.peakInput : null;
+    if (measured === null && server !== null && server.lastRequestTokens !== null && server.lastRequestTokens > 0) {
+      measured = server.lastRequestTokens;
+    }
+    if (measured !== null) context.setMeasuredTokens(measured);
+    const pct =
+      server !== null && server.ctxSize > 0 && server.lastRequestTokens !== null
+        ? ` (${Math.round((server.lastRequestTokens / server.ctxSize) * 100)}%)`
+        : "";
+    const serverPart =
+      server !== null ? `, server context ${server.lastRequestTokens ?? "?"}/${server.ctxSize} tokens${pct}` : "";
+    if (tokens.calls > 0) {
+      log.info(
+        `turn in ${channelId}: ${tokens.input} input + ${tokens.output} output tokens over ${tokens.calls} model call(s)${serverPart}`,
+      );
+    } else {
+      log.info(`turn in ${channelId}: no model call ran${serverPart}`);
+    }
+  };
 
   /**
    * One full turn for a queued turn request (a mention — which always
@@ -94,6 +162,26 @@ async function main(): Promise<void> {
     // message per call — the channel stays quiet even when the model runs
     // many rounds.
     const activity = new ToolActivityPoster(textChannel);
+    // Every model call of the turn goes through a tracked wrapper so the
+    // endpoint's reported usage (input/output per call, largest prompt) is
+    // accumulated: the turn's cost is reported at the end, and the largest
+    // prompt becomes the channel's measured context size for the next
+    // compaction check. The reply rounds stream into the writer; the
+    // compaction summarizer and the chime decision use a plain wrapper on
+    // the same account (their text is never posted).
+    const tokens = new TurnTokens();
+    const replyChat: ChatFn = tokens.track(
+      (msgs, _cbs, t) =>
+        llm.chat(
+          msgs,
+          {
+            onDelta: (d) => writer.chunk(d),
+            onReasoning: cfg.discord.showReasoning ? (d) => writer.reason(d) : undefined,
+          },
+          t,
+        ),
+    );
+    const plainChat: ChatFn = tokens.track((msgs) => llm.chat(msgs));
     try {
       // Build the context before the typing indicator starts: it is a
       // channel fetch (+ image downloads, + one summarization call when the
@@ -114,7 +202,9 @@ async function main(): Promise<void> {
       const systemPrompt = [cfg.model.systemPrompt, tools.systemNote]
         .filter((p): p is string => p !== null && p.trim().length > 0)
         .join("\n\n");
-      const messages = await buildChannelContext(textChannel, context, turn.id, {
+      // Shared by the first build and (after an overflow) the rebuild: same
+      // window, budget, and summarizer.
+      const ctxOpts: ContextOptions = {
         botId,
         systemPrompt,
         maxMessages: cfg.model.contextMaxMessages,
@@ -122,12 +212,13 @@ async function main(): Promise<void> {
         imagesMaxBytes: cfg.model.imagesMaxBytes,
         enableFileContents: cfg.model.enableFileContents,
         fileContentsMaxBytes: cfg.model.fileContentsMaxBytes,
-        maxTokens: cfg.model.compactionMaxTokens,
+        maxTokens: compactionBudget,
         keepMessages: cfg.model.compactionKeepMessages,
         // The summarizer is the same endpoint as the replies: one
         // plain (tool-less) chat call over the old transcript.
-        summarize: async (msgs) => (await llm.chat(msgs)).content,
-      });
+        summarize: async (msgs) => (await plainChat(msgs)).content,
+      };
+      const messages = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
       if (messages === null) {
         // Deleted while queued.
         log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
@@ -140,35 +231,67 @@ async function main(): Promise<void> {
         // triggering message). NO — or a failed call — stays silent: no
         // typing indicator, no message, nothing recorded.
         const transcript = systemPrompt.trim().length > 0 ? messages.slice(1) : messages;
-        if (!(await decideChime(llm, transcript))) {
+        if (!(await decideChime((msgs) => plainChat(msgs), transcript))) {
           log.info(`channel ${channelId}: chime decision NO for message ${turn.id}; staying silent`);
           return;
         }
       }
       writer.start();
-      const outcome = await runToolTurn(messages, {
-        chat: (msgs, _cbs, t) =>
-          llm.chat(
-            msgs,
-            {
-              onDelta: (d) => writer.chunk(d),
-              onReasoning: cfg.discord.showReasoning ? (d) => writer.reason(d) : undefined,
-            },
-            t,
-          ),
-        registry: tools.registry,
-        maxRounds: cfg.tools.maxRounds,
-        onToolRound: () => writer.discard(),
-        onToolCalls: async (calls) => {
-          if (!cfg.discord.showToolActivity) return;
-          // Every call of the turn lands in the one shared activity message
-          // (the first round posts it, later rounds edit it in place). Bot
-          // messages never enter the channel context (isTrackable), so the
-          // model's context is untouched — the results, which stay internal,
-          // are what matter.
-          await activity.addCalls(calls);
-        },
-      });
+      const runModel = (msgs: Parameters<typeof runToolTurn>[0]): Promise<ToolTurnOutcome> =>
+        runToolTurn(msgs, {
+          chat: replyChat,
+          registry: tools.registry,
+          maxRounds: cfg.tools.maxRounds,
+          onToolRound: () => writer.discard(),
+          onToolCalls: async (calls) => {
+            if (!cfg.discord.showToolActivity) return;
+            // Every call of the turn lands in the one shared activity message
+            // (the first round posts it, later rounds edit it in place). Bot
+            // messages never enter the channel context (isTrackable), so the
+            // model's context is untouched — the results, which stay internal,
+            // are what matter.
+            await activity.addCalls(calls);
+          },
+        });
+      let outcome: ToolTurnOutcome;
+      try {
+        outcome = await runModel(messages);
+      } catch (err) {
+        // The request did not fit the model's context: the endpoint rejected
+        // it before generating. A summarizer run on the overfilled context
+        // would not fit either, so the only way to make room is dropping
+        // entries — shrink hard (the mention protected, the running summary
+        // as a last resort), rebuild the turn, and retry once. A second
+        // overflow (e.g. the mention alone is too big) falls through to the
+        // error path below.
+        if (!isContextOverflowError(err)) throw err;
+        const window = contextWindowFromOverflowError(err);
+        // The estimate must fit the smaller of the compaction budget and the
+        // window minus the completion headroom — the budget alone may sit
+        // at or above the window (a manual value, or the fallback before the
+        // automatic budget was derived).
+        const target =
+          window !== null
+            ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
+            : compactionBudget;
+        context.setMeasuredTokens(null); // it described the overfilled context
+        context.emergencyShrink(
+          turn.id,
+          target,
+          systemPrompt,
+          cfg.model.contextMaxMessages,
+          cfg.model.enableFileContents ? cfg.model.fileContentsMaxBytes : undefined,
+        );
+        log.warn(
+          `turn in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the turn once`,
+        );
+        const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
+        if (rebuilt === null) {
+          log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
+          return;
+        }
+        outcome = await runModel(rebuilt);
+      }
       if (outcome.toolRounds > 0) {
         log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);
       }
@@ -182,6 +305,8 @@ async function main(): Promise<void> {
       log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
       const posted = await writer.reportError(err);
       if (posted) recordReply(channelId, posted);
+    } finally {
+      await reportTurnTokens(channelId, context, tokens);
     }
   };
 
@@ -286,7 +411,7 @@ async function main(): Promise<void> {
     onCommit: commitArrival,
   });
 
-  client.once("clientReady", () => {
+  client.once("clientReady", async () => {
     log.info(`connected as ${client.user?.tag} (id ${client.user?.id})`);
     log.info(
       cfg.discord.guildId !== ""
@@ -301,6 +426,37 @@ async function main(): Promise<void> {
     if (cfg.model.enableFileContents) {
       log.info(
         `file contents enabled (non-image attachments inlined, max ${cfg.model.fileContentsMaxBytes} bytes per file)`,
+      );
+    }
+    // Metrics on: check the llama-server is reachable, derive the automatic
+    // compaction budget from its context window, and check the budget is not
+    // at or above the window (requests would overflow the model's context
+    // before compaction could trigger — the overflow recovery would still
+    // save the turn, but avoiding it is better).
+    if (metrics) {
+      const s = await metrics.snapshot();
+      if (s === null) {
+        log.warn(
+          `metrics enabled but ${cfg.model.metricsUrl}/slots is not reachable; metrics stay off at runtime` +
+            (cfg.model.compactionAuto
+              ? ` — the automatic compaction budget keeps the fallback ${compactionBudget} until the server is reachable`
+              : ""),
+        );
+      } else {
+        log.info(
+          `llama-server: context window ${s.ctxSize} tokens` +
+            (s.lastRequestTokens !== null ? `, last request ${s.lastRequestTokens} tokens` : ""),
+        );
+        setAutoCompactionBudget(s.ctxSize);
+        if (s.ctxSize > 0 && compactionBudget >= s.ctxSize) {
+          log.warn(
+            `compaction budget ${compactionBudget} is not below the server context window ${s.ctxSize}; compaction would trigger too late`,
+          );
+        }
+      }
+    } else if (cfg.model.compactionAuto) {
+      log.warn(
+        `the compaction budget is set automatically but metrics are disabled; keeping the fallback budget ${compactionBudget}`,
       );
     }
   });

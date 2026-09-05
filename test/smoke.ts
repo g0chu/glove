@@ -6,9 +6,11 @@
  * !clear command (fresh-chat reset), queue semantics, response writer
  * behavior (incl. multi-message streaming of long replies), the tool
  * executor and tool loop, the in-process web/file/shell/zim tools (against
- * a synthetic ZIM file built in a temp dir), and the LLM client (stream +
- * non-stream + tool calls + errors + multimodal wire shape) against a
- * local mock OpenAI-compatible server. Run with: npm test
+ * a synthetic ZIM file built in a temp dir), the LLM client (stream +
+ * non-stream + tool calls + token usage + errors + multimodal wire shape)
+ * against a local mock OpenAI-compatible server, and the llama-server
+ * metrics (the /slots probe and per-turn token accounting). Run with:
+ * npm test
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -19,10 +21,11 @@ import type { AddressInfo } from "node:net";
 import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable } from "../src/bot/router.js";
-import { ChannelContext, COMPACTION_SYSTEM_PROMPT, estimateTokens } from "../src/llm/context.js";
+import { ChannelContext, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError } from "../src/llm/context.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { CHIME_SYSTEM_PROMPT, decideChime } from "../src/bot/chime.js";
 import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
+import { LlamaMetrics, TurnTokens, deriveCompactionBudget } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
@@ -199,6 +202,80 @@ const ok = (name: string): void => {
   assert.deepEqual(gaErrors, []);
   assert.equal(ga.discord.guildId, "", "no DISCORD_GUILD_ID -> respond in every guild");
   ok("config: DISCORD_GUILD_ID is optional (empty = any guild the bot is in)");
+}
+
+// --------------------------------------------------------- config: metrics --
+{
+  const { config, errors } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MODEL_METRICS_ENABLED: "true",
+  });
+  assert.deepEqual(errors, []);
+  assert.equal(config.model.metricsEnabled, true);
+  assert.equal(config.model.metricsUrl, "http://localhost:8080", "defaults to the chat endpoint's origin");
+  assert.equal(config.model.metricsTimeoutMs, 5000); // default
+
+  const { config: c2 } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MODEL_METRICS_ENABLED: "true",
+    MODEL_METRICS_URL: "http://model.example:9090/",
+    MODEL_METRICS_TIMEOUT_MS: "1200",
+  });
+  assert.equal(c2.model.metricsUrl, "http://model.example:9090/");
+  assert.equal(c2.model.metricsTimeoutMs, 1200);
+
+  const { config: c3, errors: e3 } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+  });
+  assert.equal(c3.model.metricsEnabled, false, "off by default");
+  assert.equal(c3.model.metricsUrl, "http://localhost:8080", "derived even when off (the flag gates the probes)");
+  assert.ok(e3.length === 0, `got: ${e3.join("; ")}`);
+
+  const { errors: e4 } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MODEL_METRICS_URL: "ftp://nope",
+    MODEL_METRICS_TIMEOUT_MS: "0",
+  });
+  assert.ok(e4.some((e) => e.includes("MODEL_METRICS_URL")), `got: ${e4.join("; ")}`);
+  assert.ok(e4.some((e) => e.includes("MODEL_METRICS_TIMEOUT_MS")), `got: ${e4.join("; ")}`);
+  ok("config: llama-server metrics env (defaults from the chat URL, override, validation)");
+
+  // The compaction budget: an explicit value is used as-is; an empty
+  // CONTEXT_COMPACTION_MAX_TOKENS switches to the automatic budget (derived
+  // from the server's context window at startup — the fallback budget
+  // applies until that happens).
+  const { config: cb1 } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+  });
+  assert.equal(cb1.model.compactionAuto, false, "unset = the default explicit budget");
+  assert.equal(cb1.model.compactionMaxTokens, 4000);
+  const { config: cb2, errors: cb2e } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    CONTEXT_COMPACTION_MAX_TOKENS: "",
+  });
+  assert.deepEqual(cb2e, []);
+  assert.equal(cb2.model.compactionAuto, true, "empty = automatic");
+  assert.equal(cb2.model.compactionMaxTokens, 4000, "the fallback until the window is known");
+  const { config: cb3 } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    CONTEXT_COMPACTION_MAX_TOKENS: "12345",
+  });
+  assert.equal(cb3.model.compactionAuto, false);
+  assert.equal(cb3.model.compactionMaxTokens, 12345);
+  const { errors: cb4e } = parseConfig({
+    DISCORD_TOKEN: "tok",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    CONTEXT_COMPACTION_MAX_TOKENS: "10",
+  });
+  assert.ok(cb4e.some((e) => e.includes("CONTEXT_COMPACTION_MAX_TOKENS")), `got: ${cb4e.join("; ")}`);
+  ok("config: CONTEXT_COMPACTION_MAX_TOKENS (explicit, and empty = automatic budget)");
 }
 
 // ---------------------------------------------------------------- clear --
@@ -404,36 +481,32 @@ const ok = (name: string): void => {
   // The chime decision (driven with a fake client — no HTTP): the model sees
   // the system prompt + the transcript and answers YES/NO; anything that is
   // not a YES (garbage, empty, a failed call) keeps the bot silent.
-  const fakeLlm = (content: string, fail = false): LlmClient =>
-    ({
-      chat: async (): Promise<ChatResult> => {
-        if (fail) throw new Error("llm down");
-        return { content, toolCalls: [] };
-      },
-    }) as unknown as LlmClient;
+  const fakeChat = (content: string, fail = false): ((msgs: ChatMessage[]) => Promise<ChatResult>) =>
+    async () => {
+      if (fail) throw new Error("llm down");
+      return { content, toolCalls: [] };
+    };
   const transcript: ChatMessage[] = [
     { role: "user", content: "Alice: hi" },
     { role: "user", content: "Bob (bot): should we ship it?" },
   ];
-  assert.equal(await decideChime(fakeLlm("YES"), transcript), true);
-  assert.equal(await decideChime(fakeLlm("yes"), transcript), true, "case-insensitive");
-  assert.equal(await decideChime(fakeLlm("YES — it asks a direct question"), transcript), true, "the leading word decides");
-  assert.equal(await decideChime(fakeLlm("NO"), transcript), false);
-  assert.equal(await decideChime(fakeLlm("no, it is just chatter"), transcript), false);
-  assert.equal(await decideChime(fakeLlm("maybe"), transcript), false, "garbage stays silent");
-  assert.equal(await decideChime(fakeLlm(""), transcript), false, "an empty answer stays silent");
-  assert.equal(await decideChime(fakeLlm("", true), transcript), false, "a failed call stays silent");
+  assert.equal(await decideChime(fakeChat("YES"), transcript), true);
+  assert.equal(await decideChime(fakeChat("yes"), transcript), true, "case-insensitive");
+  assert.equal(await decideChime(fakeChat("YES — it asks a direct question"), transcript), true, "the leading word decides");
+  assert.equal(await decideChime(fakeChat("NO"), transcript), false);
+  assert.equal(await decideChime(fakeChat("no, it is just chatter"), transcript), false);
+  assert.equal(await decideChime(fakeChat("maybe"), transcript), false, "garbage stays silent");
+  assert.equal(await decideChime(fakeChat(""), transcript), false, "an empty answer stays silent");
+  assert.equal(await decideChime(fakeChat("", true), transcript), false, "a failed call stays silent");
   ok("chime: YES only on a YES answer (NO, garbage, empty, and errors stay silent)");
 
   // The decision call is tool-less: system prompt first, then the transcript
   // (which ends with the message to decide about) — nothing else.
   let sent: ChatMessage[] = [];
-  const spying = {
-    chat: async (msgs: ChatMessage[]): Promise<ChatResult> => {
-      sent = msgs;
-      return { content: "YES", toolCalls: [] };
-    },
-  } as unknown as LlmClient;
+  const spying = async (msgs: ChatMessage[]): Promise<ChatResult> => {
+    sent = msgs;
+    return { content: "YES", toolCalls: [] };
+  };
   await decideChime(spying, transcript);
   assert.equal(sent.length, transcript.length + 1);
   assert.equal(sent[0].role, "system");
@@ -1041,6 +1114,78 @@ const ok = (name: string): void => {
   assert.ok(tstore.has("t2"), "the mention was protected");
   ok("compaction: summarizer failure falls back to an emergency trim (mention protected)");
 
+  // The trigger prefers the endpoint's measured count (the model tokenizer's
+  // truth, remembered from the previous turn) over the char estimate: a
+  // measured size over the budget compacts even when the estimate is small,
+  // and a measured size under the budget holds even when the estimate is
+  // over. A compaction attempt forgets the measurement (it then describes
+  // the pre-compaction context).
+  const mstore = new ChannelContext();
+  mstore.pushUser("A", "short", "m1", 1, []);
+  mstore.pushUser("B", "short", "m2", 2, []);
+  mstore.pushUser("C", "short", "m3", 3, []);
+  mstore.pushUser("D", "short", "m4", 4, []);
+  let mCalls = 0;
+  const mOpts = { ...cOpts, maxTokens: 100, keepMessages: 2, summarize: async () => { mCalls += 1; return "m"; } };
+  assert.notEqual(await buildChannelContext(noFetch, mstore, "m4", mOpts), null);
+  assert.equal(mCalls, 0, "estimate under the budget: no compaction");
+  mstore.setMeasuredTokens(5000);
+  assert.notEqual(await buildChannelContext(noFetch, mstore, "m4", mOpts), null);
+  assert.equal(mCalls, 1, "measured over the budget: compaction runs");
+  assert.equal(mstore.getSummary(), "m");
+  assert.equal(mstore.getMeasuredTokens(), null, "the pre-compaction measurement is forgotten");
+  const mstore2 = new ChannelContext();
+  for (let i = 0; i < 4; i++) mstore2.pushUser("U", "x".repeat(400), `mm${String(i)}`, i, []);
+  mstore2.setMeasuredTokens(50);
+  let mCalls2 = 0;
+  const mOpts2 = { ...mOpts, summarize: async () => { mCalls2 += 1; return "m"; } };
+  assert.notEqual(await buildChannelContext(noFetch, mstore2, "mm3", mOpts2), null);
+  assert.equal(mCalls2, 0, "measured under the budget: the estimate does not trigger");
+  assert.equal(mstore2.getSummary(), null);
+  ok("compaction: the endpoint's measured tokens drive the trigger (both directions)");
+
+  // Overflow recovery: the endpoint's rejection of an overfilled request
+  // (llama.cpp's exact shape, as the LLM client surfaces it — HTTP 400 +
+  // body, in stream and non-stream alike) is recognized, and its context
+  // window is read from the error.
+  const overflowErr = new Error(
+    'model endpoint returned HTTP 400 : {"error":{"code":400,"message":"request (310413 tokens) exceeds the available context size (160000 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":310413,"n_ctx":160000}}',
+  );
+  assert.ok(isContextOverflowError(overflowErr), "llama.cpp's rejection matches");
+  assert.equal(contextWindowFromOverflowError(overflowErr), 160000, "the window comes from the error");
+  assert.ok(isContextOverflowError(new Error("context window overflow: n_tokens (99) > n_ctx (8)")));
+  assert.ok(isContextOverflowError(new Error("This model's maximum context length is 4096 tokens.")));
+  assert.ok(!isContextOverflowError(new Error("model request timed out after 600s")), "a timeout is not an overflow");
+  assert.ok(!isContextOverflowError(new Error("model endpoint returned HTTP 500 : boom")), "an ordinary failure is not");
+  assert.equal(contextWindowFromOverflowError(new Error("context window overflow")), null, "no numbers -> null");
+  ok("overflow: detection and the window from the error (llama.cpp's exact shape)");
+
+  // emergencyShrink: drops the oldest entries (never the protected mention)
+  // until the estimate fits the target, and — only then — drops the running
+  // summary.
+  const sh = new ChannelContext();
+  for (let i = 0; i < 6; i++) sh.pushUser("U", "x".repeat(200), `s${String(i)}`, i, []);
+  assert.deepEqual(await sh.compact(2, async () => "summary text"), { ok: true }); // folds s0..s3
+  for (let i = 0; i < 8; i++) sh.pushUser("U", "y".repeat(200), `s${String(6 + i)}`, 100 + i, []);
+  // 10 entries x 50 estimated tokens + the summary (3) = 503 > 500: one
+  // drop brings it under.
+  sh.emergencyShrink("s9", 500, "", 10);
+  assert.equal(sh.length, 9, "the oldest entry is dropped");
+  assert.ok(!sh.has("s4"));
+  assert.ok(sh.has("s5") && sh.has("s13"));
+  assert.ok(sh.has("s9"), "the protected mention survives");
+  assert.equal(sh.getSummary(), "summary text", "the summary is kept while the entries fit");
+  // Only the (huge) protected entry left: no entry can be dropped, so the
+  // summary goes instead.
+  const sh2 = new ChannelContext();
+  sh2.pushUser("A", "a".repeat(200), "a1", 0, []);
+  sh2.pushUser("Big", "z".repeat(10000), "big", 1, []);
+  assert.deepEqual(await sh2.compact(1, async () => "old summary"), { ok: true });
+  sh2.emergencyShrink("big", 1000, "", 10);
+  assert.equal(sh2.getSummary(), null, "the summary is the last thing dropped");
+  assert.ok(sh2.has("big"), "the protected mention always survives");
+  ok("overflow: emergencyShrink drops oldest entries (mention protected), the summary last");
+
   // Image window: older image attachments leave a note, recent ones are
   // downloaded and sent as parts; the summary renders ahead of the entries.
   const istore = new ChannelContext();
@@ -1161,10 +1306,12 @@ const ok = (name: string): void => {
   kstore.pushUser("Bob", "more talk", "k2", 200, []);
   assert.deepEqual(await kstore.compact(1, async () => "sum of old talk"), { ok: true });
   assert.equal(kstore.getSummary(), "sum of old talk");
+  kstore.setMeasuredTokens(123);
   kstore.reset();
   assert.equal(kstore.length, 0, "entries dropped");
   assert.equal(kstore.getSummary(), null, "summary dropped");
   assert.equal(kstore.seeded, true, "no re-seed after a clear");
+  assert.equal(kstore.getMeasuredTokens(), null, "the measurement is forgotten too");
   // The next turn does not seed (the fetch below would throw if attempted)
   // and carries only what arrived after the clear.
   kstore.pushUser("Alice", "fresh start", "k3", 300, []);
@@ -2906,6 +3053,42 @@ const ok = (name: string): void => {
         res.end(JSON.stringify({ choices: [{ message: { content: "the answer", reasoning_content: "the thinking" } }] }));
         return;
       }
+      if (url.includes("usagejson")) {
+        // Non-stream: an OpenAI-style usage block.
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ choices: [{ message: { content: "done" } }], usage: { prompt_tokens: 123, completion_tokens: 45, total_tokens: 168 } }),
+        );
+        return;
+      }
+      if (url.includes("usagelegacy")) {
+        // Non-stream: llama.cpp's legacy top-level counters (no usage block).
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { content: "done" } }], prompt_tokens: 77, completion_tokens: 8 }));
+        return;
+      }
+      if (url.includes("usagetime")) {
+        // Stream: llama.cpp's final chunk carries timings (the prompt-cache
+        // split: cache_n + prompt_n = the full prompt; predicted_n = the
+        // completion) — no usage block.
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`);
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: {} }], timings: { cache_n: 55, prompt_n: 4, predicted_n: 18 } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+      if (url.includes("usagechunk")) {
+        // Stream: the final chunk's usage block wins over its timings.
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`);
+        res.write(
+          `data: ${JSON.stringify({ choices: [{ delta: {} }], usage: { prompt_tokens: 9, completion_tokens: 3 }, timings: { cache_n: 1, prompt_n: 1, predicted_n: 999 } })}\n\n`,
+        );
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
       if (url.includes("tooljson")) {
         // Non-stream: whole tool_calls, arguments as a JSON object (not a string).
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -3012,6 +3195,33 @@ const ok = (name: string): void => {
     stream: false,
   });
   ok("llm: non-streaming single reply");
+
+  // Token usage: the endpoint's own counts, captured when the response
+  // reports them — the usage object, llama.cpp's legacy top-level
+  // counters, and the streamed final chunk's timings (prompt_n + cache_n
+  // prompt tokens, predicted_n completion tokens).
+  const uJson = await new LlmClient({
+    apiUrl: `${base}/v1/usagejson`,
+    apiKey: "none",
+    model: "m",
+    stream: false,
+    timeoutMs: 5000,
+  }).chat([]);
+  assert.deepEqual(uJson.usage, { input: 123, output: 45 });
+  const uLegacy = await new LlmClient({
+    apiUrl: `${base}/v1/usagelegacy`,
+    apiKey: "none",
+    model: "m",
+    stream: false,
+    timeoutMs: 5000,
+  }).chat([]);
+  assert.deepEqual(uLegacy.usage, { input: 77, output: 8 }, "legacy top-level counters");
+  const uTimings = await new LlmClient({ apiUrl: `${base}/v1/usagetime`, apiKey: "none", model: "m", stream: true, timeoutMs: 5000 }).chat([]);
+  assert.deepEqual(uTimings.usage, { input: 59, output: 18 }, "timings: prompt_n + cache_n / predicted_n");
+  const uChunk = await new LlmClient({ apiUrl: `${base}/v1/usagechunk`, apiKey: "none", model: "m", stream: true, timeoutMs: 5000 }).chat([]);
+  assert.deepEqual(uChunk.usage, { input: 9, output: 3 }, "the usage block beats timings");
+  assert.equal(full.usage, undefined, "no usage fields anywhere -> no usage");
+  ok("llm: token usage parsed from responses (usage object, legacy counters, streamed timings)");
 
   const slowClient = new LlmClient({
     apiUrl: `${base}/v1/slow`,
@@ -3129,6 +3339,89 @@ const ok = (name: string): void => {
   ok("llm: multimodal content parts pass through to the wire");
 
   server.close();
+}
+
+// ---------------------------------------------------------------- metrics --
+{
+  // The /slots probe: parses and aggregates the llama-server's slot report
+  // (trailing slash on the base URL tolerated), and fails soft to null on
+  // every kind of failure.
+  let slotsResponse: { status: number; body: string } | "slow" = {
+    status: 200,
+    body: JSON.stringify([
+      { id: 0, n_ctx: 4096, n_prompt_tokens: 1234, is_processing: true },
+      { id: 1, n_ctx: 8192, n_prompt_tokens: 66, state: "available" },
+    ]),
+  };
+  const slotsServer = http.createServer((req, res) => {
+    if ((req.url ?? "") !== "/slots") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    if (slotsResponse === "slow") return; // never responds: the probe's timeout must cut it off
+    res.writeHead(slotsResponse.status, { "Content-Type": "application/json" });
+    res.end(slotsResponse.body);
+  });
+  await new Promise<void>((r) => slotsServer.listen(0, "127.0.0.1", r));
+  const slotsPort = (slotsServer.address() as AddressInfo).port;
+  const m = new LlamaMetrics({ baseUrl: `http://127.0.0.1:${slotsPort}/`, timeoutMs: 400 });
+  assert.deepEqual(await m.snapshot(), {
+    slots: [
+      { id: 0, ctxSize: 4096, lastRequestTokens: 1234, processing: true },
+      { id: 1, ctxSize: 8192, lastRequestTokens: 66, processing: false },
+    ],
+    ctxSize: 12288,
+    lastRequestTokens: 1300,
+    processing: true,
+  });
+  slotsResponse = { status: 500, body: "boom" };
+  assert.equal(await m.snapshot(), null, "non-2xx");
+  slotsResponse = { status: 200, body: JSON.stringify({ slots: [] }) };
+  assert.equal(await m.snapshot(), null, "not an array");
+  slotsResponse = { status: 200, body: "not json" };
+  assert.equal(await m.snapshot(), null, "not JSON");
+  slotsResponse = { status: 200, body: JSON.stringify([{ n_prompt_tokens: 5 }]) };
+  assert.equal(await m.snapshot(), null, "slots without a usable context size");
+  slotsResponse = "slow";
+  assert.equal(await m.snapshot(), null, "the probe's own timeout");
+  assert.equal(
+    await new LlamaMetrics({ baseUrl: "http://127.0.0.1:1", timeoutMs: 500 }).snapshot(),
+    null,
+    "connection refused",
+  );
+  slotsServer.close();
+  ok("metrics: the /slots probe parses and aggregates, and fails soft to null");
+
+  // Per-turn accounting: the endpoint's own counts, summed over the turn's
+  // model calls (the largest prompt kept, not the sum); calls without usage
+  // are ignored.
+  const t = new TurnTokens();
+  let i = 0;
+  const fake = async (_msgs: ChatMessage[]): Promise<ChatResult> => {
+    i += 1;
+    if (i === 1) return { content: "a", toolCalls: [], usage: { input: 100, output: 10 } };
+    if (i === 2) return { content: "b", toolCalls: [] }; // no usage: ignored
+    return { content: "c", toolCalls: [], usage: { input: 50, output: 5 } };
+  };
+  const tracked = t.track(fake);
+  await tracked([{ role: "user", content: "1" }]);
+  await tracked([{ role: "user", content: "2" }]);
+  await tracked([{ role: "user", content: "3" }]);
+  assert.equal(t.input, 150);
+  assert.equal(t.output, 15);
+  assert.equal(t.peakInput, 100, "the largest prompt, not the sum");
+  assert.equal(t.calls, 2);
+  ok("metrics: turn tokens accumulate per call (input/output sums, peak prompt, usage-less calls ignored)");
+
+  // The automatic compaction budget: the window minus the completion
+  // headroom; a window too small to leave room derives nothing.
+  assert.equal(deriveCompactionBudget(160000), 155904);
+  assert.equal(deriveCompactionBudget(5000), 904);
+  assert.equal(deriveCompactionBudget(4500), 404);
+  assert.equal(deriveCompactionBudget(4096), null, "window minus headroom too small");
+  assert.equal(deriveCompactionBudget(1000), null);
+  ok("metrics: the automatic budget = window minus completion headroom (too-small window -> null)");
 }
 
 console.log(`\n${checks} check groups passed`);
