@@ -23,8 +23,8 @@ import { parseConfig } from "../src/config.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable } from "../src/bot/router.js";
 import { ChannelContext, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError } from "../src/llm/context.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
-import { CHIME_SYSTEM_PROMPT, decideChime } from "../src/bot/chime.js";
-import { LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
+import { CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
+import { LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
@@ -479,40 +479,65 @@ const ok = (name: string): void => {
 // --------------------------------------------------------------- chime --
 {
   // The chime decision (driven with a fake client — no HTTP): the model sees
-  // the system prompt + the transcript and answers YES/NO; anything that is
-  // not a YES (garbage, empty, a failed call) keeps the bot silent.
-  const fakeChat = (content: string, fail = false): ((msgs: ChatMessage[]) => Promise<ChatResult>) =>
-    async () => {
-      if (fail) throw new Error("llm down");
-      return { content, toolCalls: [] };
-    };
+  // the system prompt + the transcript and reports the decision as a call of
+  // the chime tool (respond + reason). A plain-text answer falls back to the
+  // leading word; garbage, an empty answer, and a failed call stay silent.
   const transcript: ChatMessage[] = [
     { role: "user", content: "Alice: hi" },
     { role: "user", content: "Bob (bot): should we ship it?" },
   ];
-  assert.equal(await decideChime(fakeChat("YES"), transcript), true);
-  assert.equal(await decideChime(fakeChat("yes"), transcript), true, "case-insensitive");
-  assert.equal(await decideChime(fakeChat("YES — it asks a direct question"), transcript), true, "the leading word decides");
-  assert.equal(await decideChime(fakeChat("NO"), transcript), false);
-  assert.equal(await decideChime(fakeChat("no, it is just chatter"), transcript), false);
-  assert.equal(await decideChime(fakeChat("maybe"), transcript), false, "garbage stays silent");
-  assert.equal(await decideChime(fakeChat(""), transcript), false, "an empty answer stays silent");
-  assert.equal(await decideChime(fakeChat("", true), transcript), false, "a failed call stays silent");
-  ok("chime: YES only on a YES answer (NO, garbage, empty, and errors stay silent)");
-
-  // The decision call is tool-less: system prompt first, then the transcript
-  // (which ends with the message to decide about) — nothing else.
-  let sent: ChatMessage[] = [];
-  const spying = async (msgs: ChatMessage[]): Promise<ChatResult> => {
-    sent = msgs;
-    return { content: "YES", toolCalls: [] };
+  const toolChat = (args: Record<string, unknown>): ChimeChat => async () => ({
+    content: "",
+    toolCalls: [{ id: "t1", name: "chime", arguments: JSON.stringify(args) }],
+  });
+  const textChat = (content: string, fail = false): ChimeChat => async () => {
+    if (fail) throw new Error("llm down");
+    return { content, toolCalls: [] };
   };
-  await decideChime(spying, transcript);
+  assert.deepEqual(await decideChime(toolChat({ respond: true, reason: "direct question" }), transcript),
+    { respond: true, reason: "direct question" });
+  assert.deepEqual(await decideChime(toolChat({ respond: false, reason: "just chatter" }), transcript),
+    { respond: false, reason: "just chatter" });
+  assert.deepEqual(await decideChime(toolChat({ respond: "yes", reason: "asks about me" }), transcript),
+    { respond: true, reason: "asks about me" }, "a string 'yes' decides");
+  assert.deepEqual(await decideChime(toolChat({ respond: "no", reason: "off topic" }), transcript),
+    { respond: false, reason: "off topic" }, "a string 'no' decides");
+  assert.equal(await decideChime(toolChat({ reason: "no flag" }), transcript), null, "a missing respond flag stays silent");
+  assert.deepEqual(await decideChime(toolChat({ respond: false }), transcript),
+    { respond: false, reason: "" }, "a missing reason is tolerated");
+  assert.deepEqual(await decideChime(textChat("YES — it asks a direct question"), transcript),
+    { respond: true, reason: "it asks a direct question" }, "plain text falls back to the leading word");
+  assert.deepEqual(await decideChime(textChat("no, it is just chatter"), transcript),
+    { respond: false, reason: "it is just chatter" }, "the rest of the text is the reason");
+  assert.equal(await decideChime(textChat("maybe"), transcript), null, "plain-text garbage stays silent");
+  assert.equal(await decideChime(textChat(""), transcript), null, "an empty answer stays silent");
+  assert.equal(await decideChime(textChat("", true), transcript), null, "a failed call stays silent");
+  ok("chime: the chime tool decides (respond + reason); plain text falls back; garbage/empty/failed stay silent");
+
+  // The decision call is one request: system prompt first, then the
+  // transcript (which ends with the message to decide about), and the chime
+  // tool is on the wire.
+  let sent: ChatMessage[] = [];
+  let sentTools: ToolSpec[] | undefined;
+  const spying: ChimeChat = async (msgs, tools) => {
+    sent = msgs;
+    sentTools = tools;
+    return { content: "", toolCalls: [{ id: "t1", name: "chime", arguments: '{"respond":false,"reason":"chatter"}' }] };
+  };
+  assert.deepEqual(await decideChime(spying, transcript), { respond: false, reason: "chatter" });
   assert.equal(sent.length, transcript.length + 1);
   assert.equal(sent[0].role, "system");
   assert.equal(sent[0].content, CHIME_SYSTEM_PROMPT);
   assert.deepEqual(sent.slice(1), transcript);
-  ok("chime: the decision is one tool-less call (system prompt + transcript)");
+  assert.deepEqual(sentTools, [CHIME_TOOL_SPEC]);
+  ok("chime: the decision is one call (system prompt + transcript) with the chime tool on the wire");
+
+  // The NO line posted to the channel: a UI line with the reason, truncated.
+  assert.equal(formatChimeNo("just chatter"), "🔕 *chime: no — just chatter*");
+  assert.equal(formatChimeNo(""), "🔕 *chime: no*");
+  assert.ok(formatChimeNo("x".repeat(300)).includes("…"), "long reasons are truncated");
+  assert.ok(formatChimeNo("multi\nline reason").includes("multi line reason"), "newlines collapse to spaces");
+  ok("chime: the NO line is a UI line with the (truncated) reason");
 }
 
 // ----------------------------------------------------------------- split --

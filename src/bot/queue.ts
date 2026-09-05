@@ -4,8 +4,8 @@ import { errMsg, log } from "../log.js";
  * One queued turn: the triggering message (in the channel context when the
  * turn runs) plus whether the model must first decide whether to respond at
  * all. `chime: false` is a mention — the bot always responds. `chime: true`
- * is a message from another bot that did not mention the bot (chime
- * enabled): the model decides, and a NO stays silent.
+ * is any message that did not mention the bot (chime enabled): the model
+ * decides, and a NO posts the decision + reason as a UI line (no reply).
  */
 export interface TurnRequest {
   id: string;
@@ -17,7 +17,7 @@ export interface QueueDeps {
    * Run one full turn for a queued turn request. The triggering message is
    * already in the channel context (see index.ts); this callback builds the
    * request from the current context, calls the model, and posts the reply
-   * (a declined chime posts nothing).
+   * (a declined chime posts only the decision line, never a reply).
    */
   runTurn: (channelId: string, turn: TurnRequest) => Promise<void>;
 }
@@ -27,12 +27,12 @@ export interface QueueDeps {
  *
  * Every trackable message lands in the channel context as soon as it
  * stabilizes (mention or ambient); this queue only holds the *turns to run*:
- * mentions (which always respond) and, with chime enabled, other bots'
- * non-mention messages (which the model may decline). Semantics:
+ * mentions (which always respond) and, with chime enabled, every other
+ * non-mention message (which the model may decline). Semantics:
  *  - one turn (trigger -> model reply) at a time;
  *  - turns arriving while one is in flight are queued, not dropped;
  *  - turns run in arrival order;
- *  - ambient (non-mention, non-chime) messages never trigger a turn;
+ *  - without chime, ambient (non-mention) messages never trigger a turn;
  *  - a trigger whose message left the channel context (deleted) before its
  *    turn runs is skipped by runTurn.
  */

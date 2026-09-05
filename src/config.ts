@@ -20,11 +20,12 @@ export interface DiscordConfig {
    */
   messageStableMs: number;
   /**
-   * Chime: with this on, a message from another bot that does not mention
-   * the bot still queues a turn in which the model decides (one small
-   * tool-less YES/NO call over the channel transcript) whether to respond
-   * at all — YES runs a normal turn, NO stays silent. Mentions (from any
-   * author) always respond; human non-mentions are ambient context only.
+   * Chime: with this on, any message that does not mention the bot (a
+   * human's or another bot's) still queues a turn in which the model decides
+   * (one small call over the channel transcript, answered by calling the
+   * chime tool — respond + reason) whether to respond at all — YES runs a
+   * normal turn, NO posts the decision + reason as a UI line. Mentions
+   * (from any author) always respond.
    */
   chimeEnabled: boolean;
 }

@@ -12,7 +12,9 @@ import { ChannelType, type Message } from "discord.js";
  *  - mentions of the bot  -> start a turn (see queue.ts) — from humans and
  *                            other bots alike
  *  - everything else      -> ambient context, buffered until a mention
- *                            rides along with them (PLAN.md §4)
+ *                            rides along with them (PLAN.md §4); with chime
+ *                            enabled it also queues a chime turn the model
+ *                            may decline (see queue.ts)
  */
 export function isTrackable(message: Message, botId: string, guildId: string): boolean {
   if (message.author.id === botId) return false; // our own messages are never tracked
