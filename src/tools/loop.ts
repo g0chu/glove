@@ -51,7 +51,8 @@ export interface ToolTurnDeps {
    * interruption, see index.ts: the channel changed while the prompt was
    * being processed). An already-aborted signal makes the next call fail
    * with the client's interruption error, which the caller turns into a
-   * quiet-wait and a retry. Tool calls that are already executing run to
+   * quiet-wait, after which the turn is discarded (a newer turn supersedes
+   * it) or retried. Tool calls that are already executing run to
    * completion (they have their own deadlines); only model calls are
    * aborted.
    */

@@ -18,7 +18,7 @@ import {
 import { COMPACT_OUTPUT_RESERVE_TOKENS, LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "./llm/metrics.js";
 import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
-import { ToolActivityPoster } from "./tools/activity.js";
+import { formatToolCall } from "./tools/activity.js";
 import { buildTools } from "./tools/index.js";
 import { runToolTurn, type ToolRound, type ToolTurnOutcome } from "./tools/loop.js";
 
@@ -151,11 +151,18 @@ async function main(): Promise<void> {
    * posts and typing never count) interrupts it: the attempt's in-flight
    * model request is aborted (its partial reply is withdrawn, its thinking
    * line kept), the turn then waits for the channel to go quiet (no
-   * activity for DISCORD_MESSAGE_STABLE_MS), and retries with a freshly
-   * built context — which carries everything that arrived or changed while
-   * it waited, so the new prompt is sent with the new information. An
-   * interrupted attempt records nothing: the channel context (and the
-   * model's history) keep only the attempt that completes.
+   * activity for DISCORD_MESSAGE_STABLE_MS), and the interrupted turn is
+   * judged: superseded (a newer turn will answer the channel — any newer
+   * committed message for a chime decision, a newer pending mention turn
+   * for a mention) it is DISCARDED — never completed later, nothing
+   * recorded — so the model responds to the newest information through the
+   * newer turn's own reply; not superseded (an edit or a typing indicator
+   * interrupted the attempt, so nothing else will answer) it retries with
+   * a freshly built context, which carries everything that arrived or
+   * changed while it waited, so the new prompt is sent with the new
+   * information. An interrupted attempt records nothing either way: the
+   * channel context (and the model's history) keep only the attempt that
+   * completes.
    *
    * A chime turn decides over a still conversation: before the decision it
    * waits for complete stillness (no activity for DISCORD_MESSAGE_STABLE_MS,
@@ -207,11 +214,6 @@ async function main(): Promise<void> {
           typingIntervalMs: cfg.discord.typingIntervalMs,
           throttleMs: cfg.discord.streamUpdateThrottleMs,
         });
-        // All of the attempt's tool calls share one activity message (the
-        // first round posts it, later rounds edit it in place) instead of
-        // one new message per call — the channel stays quiet even when the
-        // model runs many rounds.
-        const activity = new ToolActivityPoster(textChannel);
         const attemptController = new AbortController();
         const unwatch = channelActivity.watch(channelId, () => attemptController.abort());
         // Every model call of the attempt goes through a tracked wrapper so
@@ -366,11 +368,13 @@ async function main(): Promise<void> {
               },
               onToolCalls: async (calls) => {
                 if (!cfg.discord.showToolActivity) return;
-                // Every call of the turn lands in the one shared activity message
-                // (the first round posts it, later rounds edit it in place). The
-                // calls and results are recorded in the channel context when the
-                // turn ends (onRoundComplete), so the model's history keeps them.
-                await activity.addCalls(calls);
+                // Every call of the turn lands in the writer's one shared
+                // activity message (the first line posts it, later rounds
+                // edit it in place — interleaved with the thinking lines in
+                // the order they happened). The calls and results are
+                // recorded in the channel context when the turn ends
+                // (onRoundComplete), so the model's history keeps them.
+                await writer.appendActivityLines(calls.map(formatToolCall));
               },
               onRoundComplete: (round) => {
                 rounds.push(round);
@@ -439,16 +443,18 @@ async function main(): Promise<void> {
           break; // the attempt completed: the turn is done
         } catch (err) {
           if (isInterruptedError(err)) {
-            // The channel changed while the prompt was being processed:
-            // the abort already happened (this error is its trace), so
-            // withdraw the partial reply (the thinking line is kept in the
-            // channel, like a finished round's) and wait for the channel to
-            // go quiet — no activity for the stability window, the window
-            // restarting on every new change. The next attempt's freshly
-            // built context carries everything that arrived or changed
-            // while we waited.
+            // The channel changed while the prompt was being processed
+            // (a new message, an edit, a typing indicator): the abort
+            // already happened (this error is its trace). Withdraw the
+            // partial reply (the thinking line is kept in the channel, like
+            // a finished round's) and wait for the channel to go quiet — no
+            // activity for the stability window, the window restarting on
+            // every new change — so that every message that arrived or
+            // changed while the attempt was interrupted has committed (and
+            // queued its own turn, when it queues one) before the
+            // interrupted turn is judged.
             log.info(
-              `turn in ${channelId}: interrupted by channel activity (attempt ${attempt + 1}); waiting for the channel to go quiet (${cfg.discord.messageStableMs}ms) before retrying with the new information`,
+              `turn in ${channelId}: interrupted by channel activity (attempt ${attempt + 1}); waiting for the channel to go quiet (${cfg.discord.messageStableMs}ms)`,
             );
             await writer.interrupt();
             await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
@@ -458,6 +464,33 @@ async function main(): Promise<void> {
               );
               break;
             }
+            // The interrupted turn's fate — it is never completed later as a
+            // stale turn; the model responds to the newest information
+            // through the turn that answers the channel's newest state:
+            //   superseded -> discarded (nothing recorded). A chime turn is
+            //   superseded by any newer committed user entry (the newer
+            //   message's own turn decides over the still conversation); a
+            //   mention turn by a newer pending mention turn (it always
+            //   responds, over a context that carries everything). A newer
+            //   ambient message does NOT supersede a mention turn: with
+            //   chime off it queued no turn, and with chime on its decision
+            //   may stay silent — the mention must still be answered.
+            //   not superseded -> retried. The interruption carried no new
+            //   message (an edit, a typing indicator), so nothing else will
+            //   answer: the next attempt's freshly built context carries
+            //   everything that arrived or changed while we waited.
+            const supersededBy = turn.chime
+              ? context.newestUserEntryAfter(turn.id)
+              : queues.get(channelId).newestPendingMentionAfter(turn.id);
+            if (supersededBy !== null && context.has(supersededBy)) {
+              log.info(
+                `turn in ${channelId}: superseded by a newer ${turn.chime ? "message" : "mention"} (${supersededBy}) while the attempt was interrupted; discarding the turn — the newer turn responds to the newest information`,
+              );
+              return;
+            }
+            log.info(
+              `turn in ${channelId}: no newer turn supersedes it; retrying with a freshly built context (attempt ${attempt + 2})`,
+            );
             continue; // next attempt: a fresh context, a fresh prompt
           }
           log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);

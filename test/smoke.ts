@@ -36,7 +36,7 @@ import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../
 import { buildChannelContext, chimeTranscript, contextToMessages, endWithTrigger, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
-import { formatToolCall, ToolActivityPoster } from "../src/tools/activity.js";
+import { formatToolCall } from "../src/tools/activity.js";
 import { buildTools } from "../src/tools/index.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
 import { FetchCache } from "../src/tools/web/cache.js";
@@ -2099,6 +2099,31 @@ const ok = (name: string): void => {
   await ticks(5);
   assert.deepEqual(events2, ["b"], "worker survives a failed turn and keeps going");
   ok("queue: worker survives a failed turn");
+
+  // newestPendingMentionAfter (the interrupted-turn supersede check,
+  // index.ts): the queue reports the newest pending mention turn (chime:
+  // false) whose trigger is newer than the given id — a mention turn
+  // interrupted while such a turn waits behind it is discarded, and the
+  // newer turn (which always responds) answers the newest information.
+  // Chime turns never supersede a mention.
+  let gate3: (() => void) | null = null;
+  const q3 = new ChannelQueue("c3", {
+    runTurn: async (_c: string, turn: TurnRequest): Promise<void> => {
+      if (turn.id === "1") await new Promise<void>((r) => (gate3 = r));
+    },
+  });
+  q3.push({ id: "1", chime: false }); // running
+  q3.push({ id: "2", chime: true }); // pending chime: never supersedes
+  q3.push({ id: "3", chime: false }); // pending mention
+  await ticks(3);
+  assert.equal(q3.newestPendingMentionAfter("0"), "3", "the newest pending mention turn is reported");
+  assert.equal(q3.newestPendingMentionAfter("2"), "3", "a pending mention newer than an ambient turn supersedes it");
+  assert.equal(q3.newestPendingMentionAfter("3"), null, "nothing pending is newer than the newest");
+  gate3!();
+  await ticks(5);
+  assert.equal(q3.size, 0, "the queued turns ran");
+  assert.equal(q3.newestPendingMentionAfter("0"), null, "nothing is pending once the queue drains");
+  ok("queue: newestPendingMentionAfter reports the newer pending mention turn that supersedes an interrupted turn");
 }
 
 // --------------------------------------------------------------- writer --
@@ -2363,7 +2388,7 @@ const ok = (name: string): void => {
   const manyLines = Array.from({ length: 2000 }, (_, i) => `thought line ${String(i)} ${"x".repeat(20)}`).join("\n");
   w4d.reason(manyLines);
   await ticks(3);
-  const preview = (w4d as unknown as { reasoningPreview(): string }).reasoningPreview();
+  const preview = (w4d as unknown as { reasoningPreview(max: number): string }).reasoningPreview(2000);
   assert.ok(preview.length <= 2000, `preview is bounded (got ${preview.length})`);
   assert.ok(preview.includes("thought line 1999"), "the last line is visible");
   assert.ok(preview.includes("1995 lines hidden"), `the hidden count spans the whole stream: ${preview.slice(0, 60)}`);
@@ -2578,10 +2603,10 @@ const ok = (name: string): void => {
   assert.ok(thinkLong.length <= 2000, `long preview capped at 2000 (got ${thinkLong.length})`);
   ok("writer: long thinking shows 'N lines hidden' + the last 5 lines");
 
-  // discard() persists the round's thinking (the live thinking message is
-  // completed into its terminal line, not deleted) and clears the reasoning
-  // buffer: the next round's thinking starts fresh instead of continuing
-  // the old one
+  // discard() persists the round's thinking as a terminal line in the
+  // turn's shared activity message (not deleted) and clears the reasoning
+  // buffer: the next round's live preview starts fresh (it shows only the
+  // new round's reasoning, below the old round's terminal line)
   const actMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const actChan = {
     sendTyping: async (): Promise<void> => {},
@@ -2604,29 +2629,32 @@ const ok = (name: string): void => {
   const w8 = new ResponseWriter({
     channel: actChan as unknown as GuildTextBasedChannel,
     typingIntervalMs: 3_600_000,
-    throttleMs: 2000,
+    throttleMs: 0, // the test asserts the live preview edits, not their throttling
   });
   w8.start();
   w8.reason("old round thinking…");
   await ticks(2);
-  assert.equal(actMsgs.length, 1, "thinking preview creates the live message");
+  assert.equal(actMsgs.length, 1, "thinking preview creates the shared message");
   assert.match(actMsgs[0].content, /thinking/);
   w8.discard();
   await ticks(3);
-  assert.equal(actMsgs[0].deleted, false, "thinking message persisted (not deleted) on discard");
+  assert.equal(actMsgs[0].deleted, false, "activity message persisted (not deleted) on discard");
   assert.match(actMsgs[0].content, /^🤔 \*old round thinking… \(\d+s\)\*$/, "completed into its terminal line");
   w8.reason("fresh round thinking");
   await ticks(2);
-  assert.equal(actMsgs.length, 2, "next round gets a fresh message");
-  assert.match(actMsgs[1].content, /fresh round/);
-  assert.doesNotMatch(actMsgs[1].content, /old round/, "cleared reasoning does not leak into the new round");
+  assert.equal(actMsgs.length, 1, "the next round reuses the same message");
+  assert.match(
+    actMsgs[0].content,
+    /^🤔 \*old round thinking… \(\d+s\)\*\n🤔 \*thinking: fresh round thinking\*$/,
+    "the old round's terminal line stays above the new round's live preview (the cleared buffer does not leak into it)",
+  );
   const p8 = await w8.finish("done");
   assert.equal(p8!.text, "done");
-  ok("writer: discard() persists the round's thinking, next round is fresh");
-  // Every tool-call round's reasoning is persisted as its own terminal line
-  // (the live thinking message is completed in place, never deleted), so the
-  // channel shows a thought line between each round's tool activity — not
-  // just one at the very end.
+  ok("writer: discard() persists the round's thinking, next round continues the same message");
+  // Every round's reasoning is persisted as its own terminal line in the
+  // ONE shared activity message (posted on the first line, edited in place
+  // across the rounds), so the channel shows a thought line for every round
+  // — not just one at the very end — without a flood of separate messages.
   const tMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
   const tChan = {
     sendTyping: async (): Promise<void> => {},
@@ -2649,40 +2677,50 @@ const ok = (name: string): void => {
   const wT = new ResponseWriter({
     channel: tChan as unknown as GuildTextBasedChannel,
     typingIntervalMs: 3_600_000,
-    throttleMs: 2000,
+    throttleMs: 0, // the test asserts the live preview edits, not their throttling
   });
   wT.start();
-  // Round 1: thinking only (no text to settle), then a tool call — thinking
-  // persisted by discard().
+  // Round 1: thinking only (no text to settle), then a tool call — the
+  // terminal line lands in the shared message.
   wT.reason("Round one: gather the data.");
   await ticks(2);
   wT.discard();
   await ticks(3);
-  assert.equal(tMsgs.length, 1, "round 1: the thinking line");
+  assert.equal(tMsgs.length, 1, "round 1: the shared message");
   assert.match(tMsgs[0].content, /^🤔 \*Round one: gather the data\. \(\d+s\)\*$/, "round 1 thinking persisted by discard()");
-  assert.equal(tMsgs[0].deleted, false, "round 1 thinking line not deleted");
-  // Round 2: thinking only, then a tool call — a fresh terminal line.
+  assert.equal(tMsgs[0].deleted, false, "shared message not deleted");
+  // Round 2: thinking only, then a tool call — a fresh terminal line in the
+  // same message.
   wT.reason("Round two: analyze it.");
   await ticks(2);
+  assert.match(tMsgs[0].content, /Round one/, "round 1's line stays while round 2 previews below it");
   wT.discard();
   await ticks(3);
-  assert.equal(tMsgs.length, 2, "round 2: a fresh thinking line");
-  assert.match(tMsgs[1].content, /^🤔 \*Round two: analyze it\. \(\d+s\)\*$/, "round 2 thinking persisted by discard()");
-  // Round 3: thinking, then the final answer (the thinking line completes
+  assert.equal(tMsgs.length, 1, "round 2: the same message, a second line");
+  assert.match(
+    tMsgs[0].content,
+    /^🤔 \*Round one: gather the data\. \(\d+s\)\*\n🤔 \*Round two: analyze it\. \(\d+s\)\*$/,
+    "round 2 thinking appended by discard()",
+  );
+  // Round 3: thinking, then the final answer (the terminal line completes
   // when the reply takes over).
   wT.reason("Round three: answer.");
   await ticks(2);
-  assert.equal(tMsgs.length, 3, "round 3: a fresh thinking line");
+  assert.equal(tMsgs.length, 1, "round 3: the same message, a live preview at the bottom");
   wT.chunk("The final answer.");
   await ticks(2);
-  assert.match(tMsgs[2].content, /^🤔 \*Round three: answer\. \(\d+s\)\*$/, "round 3 thinking completes when the reply starts");
-  assert.equal(tMsgs.length, 4, "the reply streams in a fresh message");
-  assert.equal(tMsgs[3].content, "The final answer.", "the reply is a fresh message");
+  assert.match(
+    tMsgs[0].content,
+    /^🤔 \*Round one: gather the data\. \(\d+s\)\*\n🤔 \*Round two: analyze it\. \(\d+s\)\*\n🤔 \*Round three: answer\. \(\d+s\)\*$/,
+    "round 3 thinking completes when the reply starts",
+  );
+  assert.equal(tMsgs.length, 2, "the reply streams in a fresh message");
+  assert.equal(tMsgs[1].content, "The final answer.", "the reply is a fresh message");
   const pT = await wT.finish("The final answer.");
   assert.equal(pT!.text, "The final answer.");
-  assert.equal(tMsgs[3].content, "The final answer.", "the reply settles in place");
-  assert.deepEqual(tMsgs.map((m) => m.deleted), [false, false, false, false], "no thinking line is deleted");
-  ok("writer: every tool-call round's reasoning persists as its own terminal line");
+  assert.equal(tMsgs[1].content, "The final answer.", "the reply settles in place");
+  assert.deepEqual(tMsgs.map((m) => m.deleted), [false, false], "nothing is deleted");
+  ok("writer: every round's reasoning persists as its own line in the one shared activity message");
   // A round that streams both reasoning and text: the thinking line completes
   // when the text takes over, and discard() settles the text in place (keeps
   // it, no deletion) — it must NOT post a second terminal line for the same
@@ -2728,6 +2766,106 @@ const ok = (name: string): void => {
   assert.equal(uMsgs[0].deleted, false, "the thinking line is kept");
   assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*$/, "the thinking line is unchanged");
   ok("writer: a reasoning + text round posts exactly one terminal line and keeps the text");
+
+  // The whole turn's UI lines share ONE activity message, in the order they
+  // happened: each round's thinking terminal line, then that round's
+  // tool-call lines — a 3-round turn costs one activity message + the
+  // reply, not one message per line.
+  const ixMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const ixChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `ix${String(ixMsgs.length)}`, content: data.content, deleted: false };
+      ixMsgs.push(m);
+      return {
+        id: m.id,
+        content: m.content,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const wIx = new ResponseWriter({
+    channel: ixChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 0, // the test asserts the live preview edits, not their throttling
+  });
+  wIx.start();
+  // Round 1: thinking, then its call.
+  wIx.reason("Round one thinking");
+  await ticks(2);
+  wIx.discard();
+  await ticks(3);
+  await wIx.appendActivityLines([formatToolCall({ id: "x1", name: "web_search", arguments: '{"query":"a"}' })]);
+  // Round 2: thinking, then two calls.
+  wIx.reason("Round two thinking");
+  await ticks(2);
+  wIx.discard();
+  await ticks(3);
+  await wIx.appendActivityLines([
+    formatToolCall({ id: "x2", name: "shell_exec", arguments: '{"command":"ls"}' }),
+    formatToolCall({ id: "x3", name: "file_read", arguments: '{"path":"b"}' }),
+  ]);
+  // Round 3: thinking, then the final answer.
+  wIx.reason("Round three thinking");
+  await ticks(2);
+  wIx.chunk("The answer.");
+  await ticks(2);
+  const pIx = await wIx.finish("The answer.");
+  assert.equal(ixMsgs.length, 2, "one activity message + the reply, no matter how many rounds");
+  assert.equal(ixMsgs[0].deleted, false, "the activity message stays in the channel");
+  assert.match(
+    ixMsgs[0].content,
+    /^🤔 \*Round one thinking \(\d+s\)\*\n🔎 \*web_search\(query="a"\)\*\n🤔 \*Round two thinking \(\d+s\)\*\n🐚 \*shell_exec\(command="ls"\)\*\n📁 \*file_read\(path="b"\)\*\n🤔 \*Round three thinking \(\d+s\)\*$/,
+    "thinking lines and call lines interleaved in the order they happened",
+  );
+  assert.equal(ixMsgs[1].content, "The answer.", "the reply is the only other message");
+  assert.equal(pIx!.text, "The answer.");
+  ok("writer: one shared activity message holds every round's lines, in order");
+
+  // A `*` from the model's reasoning (a markdown bullet or bold) must not
+  // break the line's italic wrapping (it used to show as literal
+  // asterisks): it is dropped from the live preview and the terminal line.
+  const sMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const sChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `s${String(sMsgs.length)}`, content: data.content, deleted: false };
+      sMsgs.push(m);
+      return {
+        id: m.id,
+        content: m.content,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const wS = new ResponseWriter({
+    channel: sChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  wS.start();
+  wS.reason("*   User gochu asks to check the logs.");
+  await ticks(2);
+  assert.match(sMsgs[0].content, /^🤔 \*thinking: User gochu asks to check the logs\.\*$/, "asterisks dropped from the live preview");
+  const pS = await wS.finish("ok");
+  assert.match(sMsgs[0].content, /^🤔 \*User gochu asks to check the logs\. \(\d+s\)\*$/, "asterisks dropped from the terminal line");
+  assert.ok(!sMsgs[0].content.includes("**"), "no broken markdown in the line");
+  assert.equal(pS!.text, "ok");
+  ok("writer: a * in the model's reasoning cannot break the line's italics");
 
   // non-stream mode: the whole reasoning arrives at once (one reason() call,
   // no chunks); on finish the thinking line completes in place and the
@@ -3138,11 +3276,15 @@ const ok = (name: string): void => {
       };
     },
   };
-  const poster = new ToolActivityPoster(batchedChan as unknown as GuildTextBasedChannel);
-  await poster.addCalls([
-    { id: "t1", name: "web_search", arguments: '{"query":"quantum computing"}' },
-    { id: "t2", name: "file_read", arguments: '{"path":"notes.md"}' },
-    { id: "t3", name: "shell_exec", arguments: '{"command":"git status"}' },
+  const wAct = new ResponseWriter({
+    channel: batchedChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  await wAct.appendActivityLines([
+    formatToolCall({ id: "t1", name: "web_search", arguments: '{"query":"quantum computing"}' }),
+    formatToolCall({ id: "t2", name: "file_read", arguments: '{"path":"notes.md"}' }),
+    formatToolCall({ id: "t3", name: "shell_exec", arguments: '{"command":"git status"}' }),
   ]);
   assert.equal(batched.length, 1, "one new message for the whole turn");
   assert.equal(batched[0].edits, 0, "the first round posts, not edits");
@@ -3151,7 +3293,7 @@ const ok = (name: string): void => {
     ['🔎 *web_search(query="quantum computing")*', '📁 *file_read(path="notes.md")*', '🐚 *shell_exec(command="git status")*'].join("\n"),
     "a round's lines land together, in call order",
   );
-  await poster.addCalls([{ id: "t4", name: "wikipedia_search", arguments: '{"query":"z"}' }]);
+  await wAct.appendActivityLines([formatToolCall({ id: "t4", name: "wikipedia_search", arguments: '{"query":"z"}' })]);
   assert.equal(batched.length, 1, "the second round reuses the message");
   assert.equal(batched[0].edits, 1, "later rounds edit it in place");
   assert.ok(batched[0].content.endsWith('📚 *wikipedia_search(query="z")*'), "the new round's line is appended");
@@ -3177,16 +3319,29 @@ const ok = (name: string): void => {
       };
     },
   };
-  const capPoster = new ToolActivityPoster(capChan as unknown as GuildTextBasedChannel);
+  const wCap = new ResponseWriter({
+    channel: capChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
   const capArgs = JSON.stringify({ query: "q".repeat(60), url: "https://example.com/" + "x".repeat(60) });
-  await capPoster.addCalls(Array.from({ length: 40 }, (_, i) => ({ id: `c${String(i)}`, name: "web_search", arguments: capArgs })));
+  await wCap.appendActivityLines(
+    Array.from({ length: 40 }, (_, i) => formatToolCall({ id: `c${String(i)}`, name: "web_search", arguments: capArgs })),
+  );
   assert.equal(capSends, 1, "still one message after 40 calls");
   assert.ok(capContent.length <= 2000, `the cap keeps the message under 2000 (got ${capContent.length})`);
   const capLines = capContent.split("\n");
-  const earlier = Number(capLines[0].match(/… (\d+) earlier calls …/)?.[1] ?? -1);
+  const earlier = Number(capLines[0].match(/… (\d+) earlier activity lines …/)?.[1] ?? -1);
   assert.ok(earlier > 0, `the header counts the dropped lines (got: ${capLines[0]})`);
   assert.equal(earlier + capLines.length - 1, 40, "kept + dropped = every call");
   assert.match(capLines[capLines.length - 1], /web_search/, "the newest lines are kept");
+  // A round thinking under a nearly-full message: the live preview gets the
+  // room the settled lines leave, and the message never overflows.
+  await wCap.reason("still thinking…");
+  await ticks(2);
+  assert.ok(capContent.length <= 2000, `the preview fits the remaining room (got ${capContent.length})`);
+  assert.match(capContent, /^🔧 \*… \d+ earlier activity lines …\*\n/, "the header leads");
+  assert.ok(capContent.endsWith("🤔 *thinking: still thinking…*"), "the preview trails the kept lines");
   ok("activity: the 2000-char cap drops the oldest lines behind the header");
 
   // A failed first post is retried on the next round (the retry carries
@@ -3216,18 +3371,22 @@ const ok = (name: string): void => {
       };
     },
   };
-  const flakyPoster = new ToolActivityPoster(flakyChan as unknown as GuildTextBasedChannel);
+  const wFlaky = new ResponseWriter({
+    channel: flakyChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
   flaky.failSend = true;
-  await flakyPoster.addCalls([{ id: "f1", name: "web_search", arguments: '{"query":"a"}' }]);
+  await wFlaky.appendActivityLines([formatToolCall({ id: "f1", name: "web_search", arguments: '{"query":"a"}' })]);
   assert.equal(flaky.sends, 1, "the first post was attempted");
-  await flakyPoster.addCalls([{ id: "f2", name: "file_read", arguments: '{"path":"b"}' }]);
+  await wFlaky.appendActivityLines([formatToolCall({ id: "f2", name: "file_read", arguments: '{"path":"b"}' })]);
   assert.equal(flaky.sends, 2, "the failed post is retried on the next round");
   assert.ok(flaky.content.includes("web_search") && flaky.content.includes("file_read"), "the retried post carries every call");
   flaky.failEdit = true;
-  await flakyPoster.addCalls([{ id: "f3", name: "shell_exec", arguments: '{"command":"c"}' }]);
+  await wFlaky.appendActivityLines([formatToolCall({ id: "f3", name: "shell_exec", arguments: '{"command":"c"}' })]);
   assert.equal(flaky.edits, 1, "the edit was attempted");
   assert.ok(!flaky.content.includes("shell_exec"), "a failed edit keeps the last good content");
-  await flakyPoster.addCalls([{ id: "f4", name: "wikipedia_search", arguments: '{"query":"d"}' }]);
+  await wFlaky.appendActivityLines([formatToolCall({ id: "f4", name: "wikipedia_search", arguments: '{"query":"d"}' })]);
   assert.equal(flaky.edits, 2, "the next round retries the edit");
   assert.ok(flaky.content.includes("shell_exec") && flaky.content.includes("wikipedia_search"), "the retried edit carries every call");
   ok("activity: failed posts/edits are retried on the next round");

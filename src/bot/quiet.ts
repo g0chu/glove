@@ -6,7 +6,9 @@
  * aborted on any activity in the channel it is answering (the attempt
  * watches the tracker); after the interruption the turn waits for the
  * channel to go quiet — no activity for the stability window (
- * DISCORD_MESSAGE_STABLE_MS) — before retrying with the updated context.
+ * DISCORD_MESSAGE_STABLE_MS) — and is then either discarded (a newer turn
+ * supersedes it — the newer turn responds to the newest information) or
+ * retried with the updated context (see index.ts).
  */
 export interface ActivityOptions {
   /** Test-only: inject the sleeper (production uses setTimeout). */
