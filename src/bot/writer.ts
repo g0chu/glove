@@ -568,6 +568,24 @@ export class ResponseWriter {
   }
 
   /**
+   * Interrupt an in-progress attempt (the model request was aborted by
+   * channel activity, see index.ts): stop the typing indicator, complete the
+   * round's thinking line in place (its thinking is kept, like a finished
+   * round's), and delete the reply's live (partial) messages — the caller
+   * then waits for the channel to go quiet and retries the turn with a
+   * fresh writer, so the partial text does not stay in the channel as a
+   * broken reply. A no-op when the writer never started or already finished.
+   */
+  async interrupt(): Promise<void> {
+    if (this.finished) return;
+    this.finished = true;
+    this.stopTyping();
+    await this.chain.catch(() => {});
+    await this.completeThinking();
+    await this.clearLive();
+  }
+
+  /**
    * Describe what was posted. `canonicalText` (the model's full answer) is
    * kept when every chunk landed; otherwise the visible text of whatever
    * was posted is reported. null when nothing was posted.

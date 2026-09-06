@@ -24,8 +24,9 @@ import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable } from "..
 import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError, type ContextEntry } from "../src/llm/context.js";
 import { ChatPersistence } from "../src/llm/persist.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
+import { ChannelActivity } from "../src/bot/quiet.js";
 import { CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
-import { LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
+import { InterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
@@ -477,6 +478,99 @@ const ok = (name: string): void => {
   ok("gate: per-message commits; clearChannel/clear forget pending messages without committing");
 }
 
+// ----------------------------------------------------------------- quiet --
+{
+  // The channel-activity tracker (driven with an injected clock and sleeper
+  // — no real waiting): a channel is quiet once it has been unchanged for
+  // the window, a change while waiting restarts the window, and a running
+  // turn watches the channel to abort its in-flight model request on any
+  // change (the prompt-interruption feature, see index.ts).
+  const makeClock = () => {
+    let t = 1000;
+    const sleepers: Array<() => void> = [];
+    const now = (): number => t;
+    // A sleep jumps the clock to its deadline; wake() lets the sleeper on.
+    const sleep = (ms: number): Promise<void> =>
+      new Promise<void>((resolve) => {
+        t += ms;
+        sleepers.push(resolve);
+      });
+    const wake = (): void => {
+      for (const r of sleepers.splice(0)) r();
+    };
+    return { now, sleep, wake };
+  };
+
+  // A change resolves once the channel stays unchanged for the window; a
+  // channel with no recorded activity is already quiet.
+  {
+    const clock = makeClock();
+    const a = new ChannelActivity({ now: clock.now, sleep: clock.sleep });
+    await a.waitForQuiet("never-seen", 5000); // already quiet
+    a.note("c1"); // activity at t=1000
+    const p = a.waitForQuiet("c1", 5000);
+    assert.equal(clock.now(), 6000, "the wait runs to the deadline (1000 + 5000)");
+    await clock.wake();
+    await p;
+    assert.equal(clock.now(), 6000, "no further waiting once the window elapsed");
+  }
+  ok("quiet: the channel is quiet once it stays unchanged for the window (no-activity channels are quiet at once)");
+
+  // Activity while waiting restarts the window from the newest change.
+  {
+    const clock = makeClock();
+    const a = new ChannelActivity({ now: clock.now, sleep: clock.sleep });
+    a.note("c1"); // activity at t=1000
+    const p = a.waitForQuiet("c1", 5000); // the first window sleeps to t=6000
+    a.note("c1"); // a new change while the wait is pending: the window restarts at 6000
+    await clock.wake(); // the first sleep elapses; the tracker sees the newer change
+    assert.equal(clock.now(), 11000, "the window restarted at the newest change (6000 + 5000)");
+    await clock.wake(); // the restarted window elapses
+    await p;
+    assert.equal(clock.now(), 11000, "no further waiting once the window elapsed");
+  }
+  ok("quiet: activity while waiting restarts the window");
+
+  // A watcher fires on every change for its channel (a running turn uses it
+  // to abort the in-flight model request); the unsubscribe stops it.
+  {
+    const a = new ChannelActivity();
+    let fired = 0;
+    const unwatch = a.watch("c1", () => fired++);
+    a.note("c1");
+    a.note("c2"); // another channel does not fire c1's watcher
+    assert.equal(fired, 1);
+    unwatch();
+    a.note("c1");
+    assert.equal(fired, 1, "an unwatched channel no longer fires");
+    // A watcher that unsubs itself while firing does not break the loop.
+    let self = 0;
+    const unSelf = a.watch("c3", () => {
+      self++;
+      unSelf();
+    });
+    a.note("c3");
+    assert.equal(self, 1);
+  }
+  ok("quiet: watchers fire per channel and unsubscribe cleanly");
+
+  // clearChannel forgets one channel (state and watchers); clear() forgets
+  // everything (a deleted channel's turn must not keep waiting).
+  {
+    const clock = makeClock();
+    const a = new ChannelActivity({ now: clock.now, sleep: clock.sleep });
+    a.note("c1");
+    a.note("c2");
+    a.clearChannel("c1");
+    await a.waitForQuiet("c1", 5000); // forgotten: quiet at once
+    assert.equal(clock.now(), 1000, "no waiting for a cleared channel");
+    a.clear();
+    await a.waitForQuiet("c2", 5000);
+    assert.equal(clock.now(), 1000, "clear() forgets everything");
+  }
+  ok("quiet: clearChannel/clear forget the channel's state");
+}
+
 // --------------------------------------------------------------- chime --
 {
   // The chime decision (driven with a fake client — no HTTP): the model sees
@@ -539,6 +633,26 @@ const ok = (name: string): void => {
   assert.ok(formatChimeNo("x".repeat(300)).includes("…"), "long reasons are truncated");
   assert.ok(formatChimeNo("multi\nline reason").includes("multi line reason"), "newlines collapse to spaces");
   ok("chime: the NO line is a UI line with the (truncated) reason");
+
+  // An interrupted decision call (the channel changed while the decision was
+  // in flight) is re-thrown, not swallowed into a silent NO: the turn waits
+  // for the channel to go quiet and retries the decision.
+  {
+    const interrupting: ChimeChat = async () => {
+      throw new InterruptedError();
+    };
+    await assert.rejects(decideChime(interrupting, transcript), InterruptedError);
+    // The signal rides along to the decision call.
+    let seenSignal: AbortSignal | undefined;
+    const signalChat: ChimeChat = async (_msgs, _tools, signal) => {
+      seenSignal = signal;
+      return { content: "", toolCalls: [] };
+    };
+    const ctrl = new AbortController();
+    await decideChime(signalChat, transcript, ctrl.signal);
+    assert.equal(seenSignal, ctrl.signal);
+  }
+  ok("chime: an interrupted decision is re-thrown (the turn retries); the signal rides along");
 }
 
 // ----------------------------------------------------------------- split --
@@ -1916,6 +2030,36 @@ const ok = (name: string): void => {
   assert.equal(prefixEndIndex(cutStore, cutOpts, "cf"), 5, "the cut at the final reply includes the round's calls and result");
   assert.equal(prefixEndIndex(cutStore, cutOpts, "missing"), null);
   ok("context: prefixEndIndex counts tool entries (the cut stays exact with turns in the history)");
+
+  // newestUserEntryAfter: the chime's supersede check. A chime decision
+  // waits for the channel to go still before deciding, and is cancelled
+  // when a newer trackable message has committed (its own turn, queued
+  // behind, decides over the still conversation — a burst settles into one
+  // decision). The bot's own words (assistant and tool entries) never
+  // supersede: they are not new activity.
+  const supStore = new ChannelContext();
+  assert.equal(supStore.newestUserEntryAfter("missing"), null, "a trigger not in the context has no successor");
+  supStore.pushUser("Alice", "one", "sp1", 1, []);
+  assert.equal(supStore.newestUserEntryAfter("sp1"), null, "the newest message has no successor");
+  supStore.appendTurn(
+    [
+      {
+        content: "n",
+        calls: [{ id: "st", name: "file_read", arguments: "{}" }],
+        results: [{ role: "tool", toolCallId: "st", name: "file_read", content: "d" }],
+        ids: ["sn"],
+      },
+    ],
+    { content: "f", ids: ["sf"] },
+  );
+  assert.equal(supStore.newestUserEntryAfter("sp1"), null, "a turn's rounds and reply do not supersede");
+  supStore.pushUser("Bob", "two", "sp2", 2, []);
+  assert.equal(supStore.newestUserEntryAfter("sp1"), "sp2", "a newer message supersedes the older decision");
+  supStore.pushUser("Bob", "three", "sp3", 3, []);
+  assert.equal(supStore.newestUserEntryAfter("sp1"), "sp3", "the newest successor is reported");
+  assert.equal(supStore.newestUserEntryAfter("sp2"), "sp3", "the middle message is superseded by the newest");
+  assert.equal(supStore.newestUserEntryAfter("sp3"), null, "the newest message decides");
+  ok("context: newestUserEntryAfter reports the newer trackable message that supersedes a chime decision");
 }
 
 // ----------------------------------------------------------------- queue --
@@ -1963,9 +2107,11 @@ const ok = (name: string): void => {
     id: string;
     content: string;
     edit: (u: { content: string }) => Promise<FakeMessage>;
+    delete: () => Promise<void>;
   }
   const makeChannel = () => {
     const sent: string[] = [];
+    const deleted: string[] = [];
     const messages: FakeMessage[] = [];
     let live: FakeMessage | null = null;
     let nextId = 0;
@@ -1979,6 +2125,9 @@ const ok = (name: string): void => {
             m.content = u.content;
             return m;
           },
+          delete: async () => {
+            deleted.push(m.id);
+          },
         };
         live = m;
         messages.push(m);
@@ -1986,7 +2135,7 @@ const ok = (name: string): void => {
         return m;
       },
     };
-    return { channel, sent, messages, getLive: () => live };
+    return { channel, sent, deleted, messages, getLive: () => live };
   };
 
   // first chunk creates the message; final edit applies the full text
@@ -2058,6 +2207,56 @@ const ok = (name: string): void => {
   assert.match(d.getLive()!.content, /generation failed/);
   assert.equal(p4!.messageIds.length, 1, "the error note is recorded in history too");
   ok("writer: error keeps partial text + note");
+
+  // interrupt(): a prompt interrupted by channel activity withdraws the
+  // partial reply — the live (partial) messages are deleted, the thinking
+  // line completes in place (kept, like a finished round's), and the writer
+  // is done (a fresh attempt starts with a fresh writer).
+  const i1 = makeChannel();
+  const wi1 = new ResponseWriter({
+    channel: i1.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  wi1.start();
+  wi1.reason("thinking it through");
+  await ticks(2);
+  wi1.chunk("partial");
+  await ticks(2);
+  assert.equal(i1.sent.length, 2, "the thinking line + the live partial reply");
+  assert.equal(i1.deleted.length, 0);
+  await wi1.interrupt();
+  assert.deepEqual(i1.deleted, [i1.messages[1].id], "the partial reply is withdrawn");
+  assert.ok(i1.messages[0].content.startsWith("🤔"), "the thinking line completes in place");
+  assert.equal(await wi1.interrupt(), undefined, "a second interrupt is a no-op");
+  assert.equal(await wi1.finish("late"), null, "the interrupted writer posts nothing more");
+  ok("writer: interrupt() withdraws the partial reply, keeps the thinking line, and finishes");
+
+  // Interrupted before any reply content streamed: the live thinking
+  // message completes into its terminal line and nothing else is withdrawn.
+  const i2 = makeChannel();
+  const wi2 = new ResponseWriter({
+    channel: i2.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  wi2.start();
+  wi2.reason("still thinking");
+  await ticks(2);
+  assert.equal(i2.sent.length, 1);
+  await wi2.interrupt();
+  assert.ok(i2.messages[0].content.startsWith("🤔 *still thinking"), "the thinking line completes in place");
+  assert.equal(i2.deleted.length, 0, "no partial reply to withdraw");
+  // A writer that never started: interrupt() is a harmless no-op.
+  const i3 = makeChannel();
+  const wi3 = new ResponseWriter({
+    channel: i3.channel as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  await wi3.interrupt();
+  assert.equal(i3.sent.length, 0, "nothing posted, nothing withdrawn");
+  ok("writer: interrupt() before the reply starts keeps the thinking line and posts nothing");
 
   // A chunk that fails mid-settle must not strand the remaining chunks:
   // they are still posted, and the reported text is what actually landed
@@ -3928,6 +4127,28 @@ const ok = (name: string): void => {
   assert.match((r1.reason as Error).message, /timed out/);
   assert.match((r2.reason as Error).message, /timed out/);
   ok("llm: abort() cancels all in-flight requests, not just the latest");
+
+  // The caller's signal (the channel-activity interruption) interrupts an
+  // in-flight request: it is reported as an InterruptedError — not a
+  // timeout — and a pre-aborted signal fails the request at once.
+  {
+    const pre = new AbortController();
+    pre.abort();
+    const t0 = Date.now();
+    await assert.rejects(
+      holdClient.chat([{ role: "user", content: "pre" }], undefined, undefined, pre.signal),
+      InterruptedError,
+    );
+    assert.ok(Date.now() - t0 < 1000, "a pre-aborted signal fails the request at once");
+    const mid = new AbortController();
+    const p = holdClient.chat([{ role: "user", content: "mid" }], undefined, undefined, mid.signal);
+    await ticks(3);
+    const t1 = Date.now();
+    mid.abort();
+    await assert.rejects(p, InterruptedError);
+    assert.ok(Date.now() - t1 < 5000, "the signal cancels promptly, not at the timeout");
+  }
+  ok("llm: the caller's signal interrupts in-flight requests (InterruptedError, not a timeout)");
 
   await assert.rejects(
     new LlmClient({ apiUrl: `${base}/v1/err500`, apiKey: "none", model: "m", stream: false, timeoutMs: 5000 }).chat([]),

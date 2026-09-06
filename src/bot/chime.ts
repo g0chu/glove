@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatResult, ToolSpec } from "../llm/client.js";
+import { isInterruptedError } from "../llm/client.js";
 import { errMsg, log, truncate } from "../log.js";
 
 /**
@@ -46,7 +47,7 @@ export interface ChimeDecision {
 }
 
 /** One chat request that can carry a tool spec (the decision sends the chime tool). */
-export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[]) => Promise<ChatResult>;
+export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[], signal?: AbortSignal) => Promise<ChatResult>;
 
 /**
  * One chime decision: a single chat call over the transcript in which the
@@ -55,13 +56,21 @@ export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[]) => Promise
  * the leading-word parse (YES/NO, the rest of the answer is the reason).
  * Anything else — garbage, an empty answer, a call without a usable respond
  * flag, or a failed call — is null: a broken decision must not make the bot
- * post an unasked-for reply.
+ * post an unasked-for reply. An interrupted call (the channel changed while
+ * the decision was in flight — the channel-activity interruption) is
+ * re-thrown, not swallowed: the turn waits for the channel to go quiet and
+ * retries, so the decision is not lost.
  */
-export async function decideChime(chat: ChimeChat, transcript: ChatMessage[]): Promise<ChimeDecision | null> {
+export async function decideChime(
+  chat: ChimeChat,
+  transcript: ChatMessage[],
+  signal?: AbortSignal,
+): Promise<ChimeDecision | null> {
   let res: ChatResult;
   try {
-    res = await chat([{ role: "system", content: CHIME_SYSTEM_PROMPT }, ...transcript], [CHIME_TOOL_SPEC]);
+    res = await chat([{ role: "system", content: CHIME_SYSTEM_PROMPT }, ...transcript], [CHIME_TOOL_SPEC], signal);
   } catch (err) {
+    if (isInterruptedError(err)) throw err; // the turn handles the quiet-wait + retry
     log.warn(`chime decision failed: ${errMsg(err)}; staying silent`);
     return null;
   }
