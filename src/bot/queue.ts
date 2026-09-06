@@ -1,3 +1,4 @@
+import { compareDiscordIds } from "../llm/context.js";
 import { errMsg, log } from "../log.js";
 
 /**
@@ -47,6 +48,25 @@ export class ChannelQueue {
 
   get size(): number {
     return this.pending.length;
+  }
+
+  /**
+   * The trigger id of the newest pending (not yet run) mention turn
+   * (`chime: false`) whose trigger is newer than `id` (snowflake order), or
+   * null when no such turn is queued. The interrupted-turn supersede check
+   * (index.ts): a mention turn interrupted while a newer mention turn waits
+   * behind it is discarded — the newer turn always responds, over a context
+   * that carries everything, so it is the one that answers the channel's
+   * newest information. Chime turns never supersede a mention (their
+   * decision may stay silent), and a turn whose trigger left the context
+   * will be skipped, so the caller double-checks the id against the context.
+   */
+  newestPendingMentionAfter(id: string): string | null {
+    let found: string | null = null;
+    for (const t of this.pending) {
+      if (!t.chime && compareDiscordIds(t.id, id) > 0) found = t.id;
+    }
+    return found;
   }
 
   /** Queue a turn to run, in arrival order. */

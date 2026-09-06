@@ -58,8 +58,10 @@ export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[], signal?: A
  * flag, or a failed call — is null: a broken decision must not make the bot
  * post an unasked-for reply. An interrupted call (the channel changed while
  * the decision was in flight — the channel-activity interruption) is
- * re-thrown, not swallowed: the turn waits for the channel to go quiet and
- * retries, so the decision is not lost.
+ * re-thrown, not swallowed: the turn waits for the channel to go quiet,
+ * then discards the decision when a newer message supersedes it (the newer
+ * message's own turn decides over the still conversation) or retries it, so
+ * a decision interrupted by an edit or a typing indicator is not lost.
  */
 export async function decideChime(
   chat: ChimeChat,

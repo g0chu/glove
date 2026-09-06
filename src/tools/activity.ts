@@ -1,7 +1,4 @@
-import type { GuildTextBasedChannel, Message } from "discord.js";
-import { DISCORD_MAX_MESSAGE_CHARS, SAFE_MENTIONS } from "../bot/writer.js";
 import { sanitizeForDiscord, truncateActivityContent } from "../bot/format.js";
-import { errMsg, log } from "../log.js";
 import type { ToolCall } from "../llm/client.js";
 import { parseToolArgs } from "./executor.js";
 
@@ -56,59 +53,13 @@ export function formatToolCall(call: ToolCall): string {
 }
 
 /**
- * The turn's whole tool activity in a single Discord message: the first
- * round posts it, every later round edits it in place — one new message
- * per turn (one edit per round), no matter how many calls run (the channel
- * stays quiet). The message stays in the channel when the turn ends as the
- * record of which tools ran. Lines are appended in call order; when the
- * message would outgrow Discord's 2000-char limit the oldest lines are
- * dropped behind a "… N earlier calls …" header (which keeps a leading
- * icon, so the message stays a UI line that never enters the model
- * context).
+ * The turn's whole tool activity is posted by the writer's shared activity
+ * message (see ResponseWriter.appendActivityLines in bot/writer.ts): the
+ * first line posts it, every later round edits it in place — one new
+ * message per turn (one edit per round), no matter how many calls run (the
+ * channel stays quiet). The lines are interleaved with the thinking
+ * terminal lines in the order they happened, and when the message would
+ * outgrow Discord's 2000-char limit the oldest lines are dropped behind a
+ * header (which keeps a leading icon, so the message stays a UI line that
+ * never enters the model context).
  */
-export class ToolActivityPoster {
-  private readonly channel: GuildTextBasedChannel;
-  private lines: string[] = [];
-  private dropped = 0;
-  private message: Message | null = null;
-
-  constructor(channel: GuildTextBasedChannel) {
-    this.channel = channel;
-  }
-
-  /**
-   * Record one round's tool calls (they all arrive at once, so they cost
-   * one Discord operation): post the shared activity message when there is
-   * none yet, edit it in place otherwise — the lines accumulate across the
-   * turn. The args may carry a stray mention, so pings are suppressed (see
-   * SAFE_MENTIONS). A failed post is retried by the next round (the retry
-   * carries every line so far); a failed edit keeps the last good content.
-   */
-  async addCalls(calls: ToolCall[]): Promise<void> {
-    if (calls.length === 0) return;
-    for (const call of calls) this.lines.push(formatToolCall(call));
-    while (this.lines.length > 1 && this.render().length > DISCORD_MAX_MESSAGE_CHARS) {
-      this.dropped += 1;
-      this.lines.shift();
-    }
-    const content = this.render();
-    try {
-      if (this.message) {
-        await this.message.edit({ content, allowedMentions: SAFE_MENTIONS });
-      } else {
-        this.message = await this.channel.send({ content, allowedMentions: SAFE_MENTIONS });
-      }
-    } catch (err) {
-      log.warn(`failed to post tool activity: ${errMsg(err)}`);
-    }
-  }
-
-  /** The kept lines, the dropped ones summarized in the header. */
-  private render(): string {
-    if (this.dropped > 0) {
-      const header = `🔧 *… ${this.dropped} earlier call${this.dropped === 1 ? "" : "s"} …*`;
-      return [header, ...this.lines].join("\n");
-    }
-    return this.lines.join("\n");
-  }
-}

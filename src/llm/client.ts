@@ -194,8 +194,11 @@ function isAbortError(err: unknown): boolean {
  * interruption (index.ts): the channel changed (a new message, an edit, a
  * typing indicator) while the prompt was being processed, so the in-flight
  * request is cancelled on purpose. Distinct from the request's own timeout
- * (which reports "timed out"): the turn catches it, waits for the channel to
- * go quiet, and retries with the updated context.
+ * (which reports "timed out"): the turn catches it and waits for the
+ * channel to go quiet, then discards the turn when a newer turn supersedes
+ * it (the newer turn responds to the newest information) or retries it with
+ * the updated context (an edit or a typing indicator interrupted the
+ * attempt, so nothing else will answer).
  */
 export class InterruptedError extends Error {
   constructor() {
