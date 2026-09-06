@@ -326,8 +326,9 @@ export interface PostedReply {
  *    growing last slice is edited (throttled to `throttleMs`, serialized);
  *  - on completion the final text is chunked (code-fence aware); each live
  *    message settles in place to its final chunk and any remaining chunks
- *    are posted fresh. Reasoning never lands in the final messages or the
- *    history (only the reply's message ids are reported);
+ *    are posted fresh. Reasoning never lands in the final messages or in
+ *    the writer's report (the caller records the rounds' reasoning from the
+ *    model results, not from the writer);
  *  - `finish()`/`reportError()` return the ids and text of whatever was
  *    actually posted, so the caller can record the reply in the channel
  *    history (making it editable/deletable like any other message).
@@ -438,10 +439,13 @@ export class ResponseWriter {
    * tool-activity lines), and its thinking is completed into its terminal
    * line (persisted in the channel), so every round's reasoning and text
    * show up above the next round. The next round streams its own fresh live
-   * messages below. No-op when the turn finished.
+   * messages below. Resolves with what the round's text settled to (the
+   * message ids + text, like finish) so the caller can record the round in
+   * the channel history (its message ids keep edits and deletes in sync),
+   * or null when the turn already finished.
    */
-  discard(): void {
-    if (this.finished) return;
+  async discard(): Promise<PostedReply | null> {
+    if (this.finished) return null;
     // Captured before the state below is cleared: the terminal line, the
     // round's full text (the live preview may lag behind the buffer — edits
     // are throttled — so the settle completes the live messages to the full
@@ -466,6 +470,7 @@ export class ResponseWriter {
     this.reasoningStartedAt = null;
     this.lastThinkingEditAt = 0;
     this.lastReplyEditAt = 0;
+    let settled: PostedReply | null = null;
     // The messages are handled when the step runs, not now: a pending
     // updateLive from this round (e.g. an initial send still in flight) is
     // queued before the step, so the messages it creates are settled too,
@@ -490,11 +495,14 @@ export class ResponseWriter {
       // its boundary is posted fresh). A live message with no chunk left
       // (defensive — the round streamed no text, so normally none exist)
       // is deleted.
-      await this.settle(splitForDiscord(replyText));
+      const landed = await this.settle(splitForDiscord(replyText));
       // A new round starts: reset the settled flag so the next round's
       // thinking is tracked fresh.
       this.thinkingSettled = false;
+      settled = this.reported(landed, replyText);
     });
+    await this.chain;
+    return settled;
   }
 
   /**

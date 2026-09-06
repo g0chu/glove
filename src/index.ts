@@ -1,12 +1,13 @@
 import type { GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, type ContextOptions } from "./bot/context.js";
+import { buildChannelContext, chimeTranscript, endWithTrigger, prefixEndIndex, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
 import { decideChime, formatChimeNo } from "./bot/chime.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, stripMention } from "./bot/router.js";
-import { ResponseWriter, SAFE_MENTIONS } from "./bot/writer.js";
+import { ResponseWriter, SAFE_MENTIONS, type PostedReply } from "./bot/writer.js";
 import { LlmClient } from "./llm/client.js";
+import { ChatPersistence } from "./llm/persist.js";
 import {
   ChannelContextStore,
   contextWindowFromOverflowError,
@@ -18,7 +19,7 @@ import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
 import { ToolActivityPoster } from "./tools/activity.js";
 import { buildTools } from "./tools/index.js";
-import { runToolTurn, type ToolTurnOutcome } from "./tools/loop.js";
+import { runToolTurn, type ToolRound, type ToolTurnOutcome } from "./tools/loop.js";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -32,6 +33,7 @@ async function main(): Promise<void> {
     `files=${cfg.model.enableFileContents}`,
     `window=${cfg.model.contextMaxMessages}`,
     `compaction=on (budget ${cfg.model.compactionAuto ? `auto, fallback ${cfg.model.compactionMaxTokens}` : cfg.model.compactionMaxTokens} tokens, keep ${cfg.model.compactionKeepMessages})`,
+    `store=${cfg.model.chatsFile}`,
     `metrics=${cfg.model.metricsEnabled ? cfg.model.metricsUrl : "off"}`,
     `stable=${cfg.discord.messageStableMs}ms`,
     `chime=${cfg.discord.chimeEnabled ? "on" : "off"}`,
@@ -45,7 +47,17 @@ async function main(): Promise<void> {
     stream: cfg.model.stream,
     timeoutMs: cfg.model.timeoutMs,
   });
-  const contexts = new ChannelContextStore();
+  // The per-channel contexts are persisted to disk after every change (see
+  // ChatPersistence): the full history — every message, the model's replies,
+  // its reasoning, its tool calls and the tool results — so a restart
+  // resumes each conversation exactly where it left off instead of
+  // re-seeding the channel's last-N text (which would lose the reasoning
+  // and tool activity). A channel with a persisted context never re-seeds.
+  const persistence = new ChatPersistence(cfg.model.chatsFile);
+  const contexts = new ChannelContextStore((channelId, context) => persistence.save(channelId, context));
+  for (const [channelId, data] of persistence.load()) {
+    contexts.restore(channelId, data);
+  }
   // The llama-server's own metric endpoint (GET /slots): the model side's
   // ground truth for its context window and current use. Best-effort —
   // every probe failure resolves to null and never touches a turn.
@@ -182,6 +194,13 @@ async function main(): Promise<void> {
         ),
     );
     const plainChat: ChatFn = tokens.track((msgs, cbs, tools) => llm.chat(msgs, cbs, tools));
+    // The turn's conversation, recorded when the turn ends: each executed
+    // round (the model's text, its reasoning, its calls, the results, and
+    // the ids its narration settled to) plus the final reply (its chunk
+    // ids). Recorded once — success or failure — so the model's history
+    // carries the full turn, not just the final reply.
+    const rounds: ToolRound[] = [];
+    const roundSettled: Array<PostedReply | null> = [];
     try {
       // Build the context before the typing indicator starts: it is a
       // channel fetch (+ image downloads, + one summarization call when the
@@ -194,8 +213,10 @@ async function main(): Promise<void> {
       // With tools enabled, the model may answer in several rounds: a round
       // that ends in tool calls streams its narration (settled in place via
       // onToolRound, so it stays above the tool-activity lines), the tools
-      // run, and the next round continues with the results in context. Only
-      // the final reply is recorded in the channel context.
+      // run, and the next round continues with the results in context. The
+      // whole turn (every round's text, reasoning, calls and results, plus
+      // the final reply) is recorded in the channel context when the turn
+      // ends, so the model's history is the full conversation at all times.
       // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
       // note (listing only the enabled families) is added when any are
       // registered.
@@ -227,12 +248,20 @@ async function main(): Promise<void> {
       if (turn.chime) {
         // A chime turn: the model decides whether to respond at all, by
         // calling the chime tool (respond + reason) in one small call over
-        // the transcript (the reply's system prompt is not part of it; the
-        // transcript ends with the triggering message). NO posts the
+        // the transcript (the reply's system prompt is not part of it). The
+        // transcript is cut at the triggering message: another message may
+        // have committed while the context was being built (it queued its
+        // own turn), and "the newest message below" in the decision prompt
+        // must be the trigger itself, not a newer message. NO posts the
         // decision + reason as a one-line UI message (never tracked); null
         // (a failed or broken decision) stays silent: no typing indicator,
         // no message, nothing recorded.
-        const transcript = systemPrompt.trim().length > 0 ? messages.slice(1) : messages;
+        const cut = prefixEndIndex(context, ctxOpts, turn.id);
+        const prefix = cut !== null ? messages.slice(0, cut) : messages;
+        // The decision sees the conversation only: no tool results, no tool
+        // calls, no reasoning (a past turn's tooling is not what the
+        // decision is about, and it keeps the call small).
+        const transcript = chimeTranscript(systemPrompt.trim().length > 0 ? prefix.slice(1) : prefix);
         const decision = await decideChime((msgs, tools) => plainChat(msgs, undefined, tools), transcript);
         if (decision === null) {
           log.info(`channel ${channelId}: chime decision failed or was unusable for message ${turn.id}; staying silent`);
@@ -254,20 +283,28 @@ async function main(): Promise<void> {
           chat: replyChat,
           registry: tools.registry,
           maxRounds: cfg.tools.maxRounds,
-          onToolRound: () => writer.discard(),
+          onToolRound: async () => {
+            roundSettled.push(await writer.discard());
+          },
           onToolCalls: async (calls) => {
             if (!cfg.discord.showToolActivity) return;
             // Every call of the turn lands in the one shared activity message
-            // (the first round posts it, later rounds edit it in place). Bot
-            // messages never enter the channel context (isTrackable), so the
-            // model's context is untouched — the results, which stay internal,
-            // are what matter.
+            // (the first round posts it, later rounds edit it in place). The
+            // calls and results are recorded in the channel context when the
+            // turn ends (onRoundComplete), so the model's history keeps them.
             await activity.addCalls(calls);
+          },
+          onRoundComplete: (round) => {
+            rounds.push(round);
           },
         });
       let outcome: ToolTurnOutcome;
       try {
-        outcome = await runModel(messages);
+        // The reply request ends with the trigger's user message (moved to
+        // the end when the context outgrew it — a request ending with the
+        // bot's own reply would be prefilled/echoed or rejected by
+        // prefill-assistant endpoints; see endWithTrigger).
+        outcome = await runModel(endWithTrigger(context, ctxOpts, messages, turn.id));
       } catch (err) {
         // The request did not fit the model's context: the endpoint rejected
         // it before generating. A summarizer run on the overfilled context
@@ -297,12 +334,20 @@ async function main(): Promise<void> {
         log.warn(
           `turn in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the turn once`,
         );
+        // The retry starts from the rebuilt (shrunk) context: the rounds the
+        // failed attempt already ran are not part of its message array, so
+        // they are not part of the conversation the model completed — drop
+        // them from the turn's record (their narration stays in the channel
+        // as posted; the model's history keeps the conversation it actually
+        // saw).
+        rounds.length = 0;
+        roundSettled.length = 0;
         const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
         if (rebuilt === null) {
           log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
           return;
         }
-        outcome = await runModel(rebuilt);
+        outcome = await runModel(endWithTrigger(context, ctxOpts, rebuilt, turn.id));
       }
       if (outcome.toolRounds > 0) {
         log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);
@@ -312,19 +357,52 @@ async function main(): Promise<void> {
           ? "*(stopped: the model kept requesting tools past the round limit)*"
           : outcome.content;
       const posted = await writer.finish(finalText);
-      if (posted) recordReply(channelId, posted);
+      recordTurn(channelId, context, rounds, roundSettled, posted, outcome.reasoning);
     } catch (err) {
       log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
       const posted = await writer.reportError(err);
-      if (posted) recordReply(channelId, posted);
+      recordTurn(channelId, context, rounds, roundSettled, posted, undefined);
     } finally {
       await reportTurnTokens(channelId, context, tokens);
     }
   };
 
-  /** Record the bot's posted reply in the channel's conversation store. */
-  const recordReply = (channelId: string, posted: { text: string; messageIds: string[]; chunks?: string[] }): void => {
-    contexts.get(channelId).pushAssistant(posted.text, posted.messageIds, posted.chunks);
+  /**
+   * Record a completed turn in the channel's conversation store: each
+   * executed round (the model's text — or what of it settled in the channel
+   * — its reasoning, the calls it requested, the results) and the final
+   * reply (the canonical posted text, with the chunk ids so edits and
+   * deletes of the posted messages keep syncing the context). When nothing
+   * was posted (every send failed), the final reply is still recorded with
+   * no backing message ids: the model's history keeps what the model said.
+   */
+  const recordTurn = (
+    channelId: string,
+    context: ChannelContext,
+    rounds: ToolRound[],
+    roundSettled: Array<PostedReply | null>,
+    posted: PostedReply | null,
+    finalReasoning?: string,
+  ): void => {
+    context.appendTurn(
+      rounds.map((r, i) => {
+        const settled = roundSettled[i];
+        return {
+          content: settled?.text ?? r.content,
+          reasoning: r.reasoning,
+          calls: r.calls,
+          results: r.results,
+          ids: settled?.messageIds ?? [],
+          chunks: settled?.chunks,
+        };
+      }),
+      {
+        content: posted?.text ?? "",
+        reasoning: finalReasoning,
+        ids: posted?.messageIds ?? [],
+        chunks: posted?.chunks,
+      },
+    );
   };
 
   /** The channel's context store, if the channel is tracked at all. */
@@ -489,13 +567,13 @@ async function main(): Promise<void> {
 
   // Edits: a message still in its stability window refreshes the gate (the
   // commit will carry the final state) — this is how other bots' streamed
-  // replies complete. An already-committed message syncs the context instead.
-  // Single-message entries (a human or other bot's message, or a short bot
-  // reply) take the new content as-is; chunked bot replies rebuild their
-  // visible text from the stored chunks. The bot's own final post of a chunk
-  // matches the stored chunk, so it is a no-op — only real edits (by anyone)
-  // change anything. Note: an edit that *adds* a mention does not queue a
-  // turn; only fresh (stabilizing) messages do.
+  // replies complete. An already-committed message syncs the context instead
+  // (see syncMessageUpdate: single-message entries take the mention-stripped
+  // content; chunked bot replies take the RAW chunk content, so the bot's
+  // own final settle edit — which Discord echoes back as a messageUpdate —
+  // is a no-op and only real edits change anything). Note: an edit that
+  // *adds* a mention does not queue a turn; only fresh (stabilizing)
+  // messages do.
   client.on("messageUpdate", (_oldMessage, message) => {
     const botId = client.user?.id;
     if (!botId) return;
@@ -507,17 +585,7 @@ async function main(): Promise<void> {
     }
     const conv = conversationFor(channelId);
     if (!conv) return; // the channel has no context yet
-    const entry = conv.find(message.id);
-    if (!entry) return; // not in this channel's context
-    const newContent = stripMention(message, botId);
-    if (entry.ids.length === 1) {
-      if (newContent !== entry.content) conv.updateContent(message.id, newContent);
-    } else if (entry.chunks) {
-      const i = entry.ids.indexOf(message.id);
-      if (i !== -1 && entry.chunks[i] !== newContent) {
-        conv.updateChunk(message.id, newContent);
-      }
-    }
+    syncMessageUpdate(conv, message, botId);
   });
 
   // Deletions: drop the still-pending message (it never committed, so there
@@ -539,9 +607,11 @@ async function main(): Promise<void> {
     }
   });
 
-  // A deleted channel's context and pending messages are gone; forget them.
+  // A deleted channel's context and pending messages are gone; forget them
+  // (in memory and in the persistence file).
   client.on("channelDelete", (channel) => {
     contexts.clear(channel.id);
+    persistence.remove(channel.id);
     gate.clearChannel(channel.id);
   });
 
@@ -552,7 +622,20 @@ async function main(): Promise<void> {
     llm.abort();
     for (const c of tools.clients) c.abort();
     client.destroy();
-    process.exit(0);
+    // The contexts are the source of truth for the next start: the in-flight
+    // turns just aborted take their error path (which records the turn in
+    // the context, scheduling a persistence write) — give them a bounded
+    // moment to do so, then flush until the disk is up to date before the
+    // exit.
+    const deadline = Date.now() + 500;
+    const settle = async (): Promise<void> => {
+      do {
+        await persistence.flush();
+        await new Promise((r) => setTimeout(r, 50));
+      } while (Date.now() < deadline);
+      await persistence.flush();
+    };
+    void settle().finally(() => process.exit(0));
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
   process.once("SIGTERM", () => shutdown("SIGTERM"));

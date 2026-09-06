@@ -48,6 +48,13 @@ export interface ChatMessage {
   content: string | ContentPart[];
   /** assistant only: tool calls the model requested. */
   toolCalls?: ToolCall[];
+  /**
+   * assistant only: the model's reasoning/thinking for this message, sent
+   * back to the endpoint as `reasoning_content` so a reasoning model
+   * continues from its own thinking (endpoints without reasoning support
+   * ignore the field).
+   */
+  reasoningContent?: string;
   /** tool only: id of the call this message answers. */
   toolCallId?: string;
   /** tool only: name of the tool this message answers. */
@@ -68,6 +75,8 @@ export interface ChatResult {
   toolCalls: ToolCall[];
   /** The endpoint's token count for this request, when it reports one. */
   usage?: TokenUsage;
+  /** The model's reasoning/thinking for this response, when the endpoint sent it. */
+  reasoning?: string;
 }
 
 /** OpenAI-compatible function spec (the `function` object of a `tools` entry). */
@@ -201,10 +210,13 @@ function toWireMessage(m: ChatMessage): Record<string, unknown> {
   if (m.role === "tool") {
     return { role: "tool", tool_call_id: m.toolCallId, name: m.name, content: m.content };
   }
+  const reasoning = m.reasoningContent !== undefined && m.reasoningContent.length > 0 ? m.reasoningContent : undefined;
+  const withReasoning = reasoning !== undefined ? { reasoning_content: reasoning } : {};
   if (m.role === "assistant" && m.toolCalls) {
     return {
       role: "assistant",
       content: m.content,
+      ...withReasoning,
       tool_calls: m.toolCalls.map((tc) => ({
         id: tc.id,
         type: "function",
@@ -212,7 +224,7 @@ function toWireMessage(m: ChatMessage): Record<string, unknown> {
       })),
     };
   }
-  return { role: m.role, content: m.content };
+  return { role: m.role, content: m.content, ...withReasoning };
 }
 
 /**
@@ -336,6 +348,7 @@ export class LlmClient {
       content: typeof message.content === "string" ? message.content : "",
       toolCalls: (message.tool_calls ?? []).map(normalizeToolCall).filter((c): c is ToolCall => c !== null),
     };
+    if (reasoning.length > 0) result.reasoning = reasoning;
     const usage = parseUsage(data);
     if (usage) result.usage = usage;
     return result;
@@ -348,6 +361,10 @@ export class LlmClient {
     const decoder = new TextDecoder();
     let buffer = "";
     let full = "";
+    // The model's thinking, accumulated from the streamed reasoning deltas
+    // (the callback shows it live; the result keeps the whole thing for the
+    // history).
+    let fullReasoning = "";
     // Streamed tool calls arrive as fragments keyed by index; reassemble them.
     const calls = new Map<number, ToolCall>();
     // The endpoint's token count, when a chunk reports it (the final chunk
@@ -356,6 +373,7 @@ export class LlmClient {
     const finish = (): ChatResult => {
       const result: ChatResult = { content: full, toolCalls: [...calls.values()] };
       if (usage) result.usage = usage;
+      if (fullReasoning.length > 0) result.reasoning = fullReasoning;
       return result;
     };
     for (;;) {
@@ -396,6 +414,7 @@ export class LlmClient {
           const reasoning = reasoningOf(delta);
           if (reasoning.length > 0) {
             callbacks.onReasoning?.(reasoning);
+            fullReasoning += reasoning;
           }
           for (const tc of delta.tool_calls ?? []) {
             // Fragments arrive incrementally: the first usually carries

@@ -4,5 +4,7 @@ dist/
 *.log
 # Bot file workspace (lives on the host; accessed directly by the bot process)
 workspace/
+# persisted per-channel conversation contexts (the CHATS_FILE default)
+data/
 # obsolete Python venv from the removed sidecar (safe to delete from disk)
 .venv/

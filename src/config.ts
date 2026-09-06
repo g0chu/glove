@@ -73,6 +73,13 @@ export interface ModelConfig {
   /** Per-metrics-request timeout (ms). */
   metricsTimeoutMs: number;
   timeoutMs: number;
+  /**
+   * The JSON file the per-channel conversation contexts are persisted to
+   * (the full history — text, reasoning, tool calls, results — so a restart
+   * resumes where the conversation left off instead of re-seeding the
+   * channel's last-N text).
+   */
+  chatsFile: string;
 }
 
 /** Web tool family (in-process: the bot does the search/fetch itself, no sidecar). */
@@ -246,6 +253,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       metricsUrl: optional("MODEL_METRICS_URL", ""),
       metricsTimeoutMs: intEnv("MODEL_METRICS_TIMEOUT_MS", 5000, 100),
       timeoutMs: intEnv("MODEL_TIMEOUT_S", 120, 1) * 1000,
+      chatsFile: optional("CHATS_FILE", "./data/chats.json"),
     },
     tools: {
       // Off by default: not every Chat Completions endpoint supports
