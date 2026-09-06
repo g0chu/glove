@@ -1,12 +1,13 @@
-import type { GuildTextBasedChannel } from "discord.js";
+import { ChannelType, type GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, chimeTranscript, endWithTrigger, prefixEndIndex, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
 import { decideChime, formatChimeNo } from "./bot/chime.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
+import { ChannelActivity } from "./bot/quiet.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, stripMention } from "./bot/router.js";
 import { ResponseWriter, SAFE_MENTIONS, type PostedReply } from "./bot/writer.js";
-import { LlmClient } from "./llm/client.js";
+import { LlmClient, isInterruptedError } from "./llm/client.js";
 import { ChatPersistence } from "./llm/persist.js";
 import {
   ChannelContextStore,
@@ -128,6 +129,14 @@ async function main(): Promise<void> {
     }
   };
 
+  // The per-channel chat-activity tracker: a running turn's in-flight model
+  // request is aborted on any change in the channel (a new message, an edit,
+  // a typing indicator), and after the interruption the turn waits for the
+  // channel to go quiet (no activity for DISCORD_MESSAGE_STABLE_MS) before
+  // retrying with the updated context (see runTurn). A chime turn also waits
+  // for that stillness before deciding at all (see runTurn).
+  const channelActivity = new ChannelActivity();
+
   /**
    * One full turn for a queued turn request (a mention — which always
    * responds — or a chime, where the model first decides whether to respond
@@ -136,6 +145,25 @@ async function main(): Promise<void> {
    * compacted when it fills the token budget). The triggering message is
    * part of the context, so edits that happened while the turn was queued
    * are picked up automatically.
+   *
+   * The turn runs in attempts. While an attempt is running, any change in
+   * the channel (a new message, an edit, a typing indicator — the bot's own
+   * posts and typing never count) interrupts it: the attempt's in-flight
+   * model request is aborted (its partial reply is withdrawn, its thinking
+   * line kept), the turn then waits for the channel to go quiet (no
+   * activity for DISCORD_MESSAGE_STABLE_MS), and retries with a freshly
+   * built context — which carries everything that arrived or changed while
+   * it waited, so the new prompt is sent with the new information. An
+   * interrupted attempt records nothing: the channel context (and the
+   * model's history) keep only the attempt that completes.
+   *
+   * A chime turn decides over a still conversation: before the decision it
+   * waits for complete stillness (no activity for DISCORD_MESSAGE_STABLE_MS,
+   * the window restarting on every new change — any activity cancels the
+   * pending decision and the wait starts over), and a message that commits
+   * while it waited supersedes it: its own turn (queued behind this one)
+   * decides over the still conversation, so a burst of messages settles
+   * into one decision (the newest turn's) over what was actually said.
    */
   const runTurn = async (channelId: string, turn: TurnRequest): Promise<void> => {
     const context = contexts.get(channelId);
@@ -164,204 +192,282 @@ async function main(): Promise<void> {
     }
     const textChannel = channel;
 
-    const writer = new ResponseWriter({
-      channel,
-      typingIntervalMs: cfg.discord.typingIntervalMs,
-      throttleMs: cfg.discord.streamUpdateThrottleMs,
-    });
-    // All of the turn's tool calls share one activity message (the first
-    // round posts it, later rounds edit it in place) instead of one new
-    // message per call — the channel stays quiet even when the model runs
-    // many rounds.
-    const activity = new ToolActivityPoster(textChannel);
-    // Every model call of the turn goes through a tracked wrapper so the
-    // endpoint's reported usage (input/output per call, largest prompt) is
-    // accumulated: the turn's cost is reported at the end, and the largest
-    // prompt becomes the channel's measured context size for the next
-    // compaction check. The reply rounds stream into the writer; the
-    // compaction summarizer and the chime decision use a plain wrapper on
-    // the same account (their text is never posted).
+    // One token account for the whole turn: interrupted attempts consumed
+    // real tokens too, so their model calls count in the turn's report.
     const tokens = new TurnTokens();
-    const replyChat: ChatFn = tokens.track(
-      (msgs, _cbs, t) =>
-        llm.chat(
-          msgs,
-          {
-            onDelta: (d) => writer.chunk(d),
-            onReasoning: cfg.discord.showReasoning ? (d) => writer.reason(d) : undefined,
-          },
-          t,
-        ),
-    );
-    const plainChat: ChatFn = tokens.track((msgs, cbs, tools) => llm.chat(msgs, cbs, tools));
-    // The turn's conversation, recorded when the turn ends: each executed
-    // round (the model's text, its reasoning, its calls, the results, and
-    // the ids its narration settled to) plus the final reply (its chunk
-    // ids). Recorded once — success or failure — so the model's history
-    // carries the full turn, not just the final reply.
-    const rounds: ToolRound[] = [];
-    const roundSettled: Array<PostedReply | null> = [];
+
     try {
-      // Build the context before the typing indicator starts: it is a
-      // channel fetch (+ image downloads, + one summarization call when the
-      // context compacts), not the reply generation itself.
-      const botId = client.user?.id;
-      if (!botId) {
-        log.error(`turn in ${channelId}: bot user not available; skipping turn`);
-        return;
-      }
-      // With tools enabled, the model may answer in several rounds: a round
-      // that ends in tool calls streams its narration (settled in place via
-      // onToolRound, so it stays above the tool-activity lines), the tools
-      // run, and the next round continues with the results in context. The
-      // whole turn (every round's text, reasoning, calls and results, plus
-      // the final reply) is recorded in the channel context when the turn
-      // ends, so the model's history is the full conversation at all times.
-      // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
-      // note (listing only the enabled families) is added when any are
-      // registered.
-      const systemPrompt = [cfg.model.systemPrompt, tools.systemNote]
-        .filter((p): p is string => p !== null && p.trim().length > 0)
-        .join("\n\n");
-      // Shared by the first build and (after an overflow) the rebuild: same
-      // window, budget, and summarizer.
-      const ctxOpts: ContextOptions = {
-        botId,
-        systemPrompt,
-        maxMessages: cfg.model.contextMaxMessages,
-        enableImages: cfg.model.enableImages,
-        imagesMaxBytes: cfg.model.imagesMaxBytes,
-        enableFileContents: cfg.model.enableFileContents,
-        fileContentsMaxBytes: cfg.model.fileContentsMaxBytes,
-        maxTokens: compactionBudget,
-        keepMessages: cfg.model.compactionKeepMessages,
-        // The summarizer is the same endpoint as the replies: one
-        // plain (tool-less) chat call over the old transcript.
-        summarize: async (msgs) => (await plainChat(msgs)).content,
-      };
-      const messages = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
-      if (messages === null) {
-        // Deleted while queued.
-        log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
-        return;
-      }
-      if (turn.chime) {
-        // A chime turn: the model decides whether to respond at all, by
-        // calling the chime tool (respond + reason) in one small call over
-        // the transcript (the reply's system prompt is not part of it). The
-        // transcript is cut at the triggering message: another message may
-        // have committed while the context was being built (it queued its
-        // own turn), and "the newest message below" in the decision prompt
-        // must be the trigger itself, not a newer message. NO posts the
-        // decision + reason as a one-line UI message (never tracked); null
-        // (a failed or broken decision) stays silent: no typing indicator,
-        // no message, nothing recorded.
-        const cut = prefixEndIndex(context, ctxOpts, turn.id);
-        const prefix = cut !== null ? messages.slice(0, cut) : messages;
-        // The decision sees the conversation only: no tool results, no tool
-        // calls, no reasoning (a past turn's tooling is not what the
-        // decision is about, and it keeps the call small).
-        const transcript = chimeTranscript(systemPrompt.trim().length > 0 ? prefix.slice(1) : prefix);
-        const decision = await decideChime((msgs, tools) => plainChat(msgs, undefined, tools), transcript);
-        if (decision === null) {
-          log.info(`channel ${channelId}: chime decision failed or was unusable for message ${turn.id}; staying silent`);
-          return;
-        }
-        if (!decision.respond) {
-          log.info(
-            `channel ${channelId}: chime decision NO for message ${turn.id}: ${decision.reason || "(no reason given)"}`,
-          );
-          await textChannel.send({ content: formatChimeNo(decision.reason), allowedMentions: SAFE_MENTIONS }).catch((err) => {
-            log.warn(`failed to post the chime decision: ${errMsg(err)}`);
-          });
-          return;
-        }
-      }
-      writer.start();
-      const runModel = (msgs: Parameters<typeof runToolTurn>[0]): Promise<ToolTurnOutcome> =>
-        runToolTurn(msgs, {
-          chat: replyChat,
-          registry: tools.registry,
-          maxRounds: cfg.tools.maxRounds,
-          onToolRound: async () => {
-            roundSettled.push(await writer.discard());
-          },
-          onToolCalls: async (calls) => {
-            if (!cfg.discord.showToolActivity) return;
-            // Every call of the turn lands in the one shared activity message
-            // (the first round posts it, later rounds edit it in place). The
-            // calls and results are recorded in the channel context when the
-            // turn ends (onRoundComplete), so the model's history keeps them.
-            await activity.addCalls(calls);
-          },
-          onRoundComplete: (round) => {
-            rounds.push(round);
-          },
+      for (let attempt = 0; ; attempt++) {
+        // Per-attempt state: a fresh writer (a previous attempt's partial
+        // reply has been withdrawn), a fresh activity poster, a fresh round
+        // record, and a fresh abort controller — any channel activity while
+        // the attempt is running aborts its in-flight model request.
+        const writer = new ResponseWriter({
+          channel,
+          typingIntervalMs: cfg.discord.typingIntervalMs,
+          throttleMs: cfg.discord.streamUpdateThrottleMs,
         });
-      let outcome: ToolTurnOutcome;
-      try {
-        // The reply request ends with the trigger's user message (moved to
-        // the end when the context outgrew it — a request ending with the
-        // bot's own reply would be prefilled/echoed or rejected by
-        // prefill-assistant endpoints; see endWithTrigger).
-        outcome = await runModel(endWithTrigger(context, ctxOpts, messages, turn.id));
-      } catch (err) {
-        // The request did not fit the model's context: the endpoint rejected
-        // it before generating. A summarizer run on the overfilled context
-        // would not fit either, so the only way to make room is dropping
-        // entries — shrink hard (the mention protected, the running summary
-        // as a last resort), rebuild the turn, and retry once. A second
-        // overflow (e.g. the mention alone is too big) falls through to the
-        // error path below.
-        if (!isContextOverflowError(err)) throw err;
-        const window = contextWindowFromOverflowError(err);
-        // The estimate must fit the smaller of the compaction budget and the
-        // window minus the completion headroom — the budget alone may sit
-        // at or above the window (a manual value, or the fallback before the
-        // automatic budget was derived).
-        const target =
-          window !== null
-            ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
-            : compactionBudget;
-        context.setMeasuredTokens(null); // it described the overfilled context
-        context.emergencyShrink(
-          turn.id,
-          target,
-          systemPrompt,
-          cfg.model.contextMaxMessages,
-          cfg.model.enableFileContents ? cfg.model.fileContentsMaxBytes : undefined,
+        // All of the attempt's tool calls share one activity message (the
+        // first round posts it, later rounds edit it in place) instead of
+        // one new message per call — the channel stays quiet even when the
+        // model runs many rounds.
+        const activity = new ToolActivityPoster(textChannel);
+        const attemptController = new AbortController();
+        const unwatch = channelActivity.watch(channelId, () => attemptController.abort());
+        // Every model call of the attempt goes through a tracked wrapper so
+        // the endpoint's reported usage (input/output per call, largest
+        // prompt) is accumulated: the turn's cost is reported at the end,
+        // and the largest prompt becomes the channel's measured context
+        // size for the next compaction check. The reply rounds stream into
+        // the writer; the compaction summarizer and the chime decision use
+        // a plain wrapper on the same account (their text is never posted).
+        // The attempt's abort signal rides along: channel activity aborts
+        // the in-flight call (and dooms the next one). The compaction
+        // summarizer is the exception — it takes no signal (it is context
+        // maintenance, not the prompt being answered, and an aborted
+        // summarization must not fall into the emergency-trim path).
+        const replyChat: ChatFn = tokens.track(
+          (msgs, _cbs, t, signal) =>
+            llm.chat(
+              msgs,
+              {
+                onDelta: (d) => writer.chunk(d),
+                onReasoning: cfg.discord.showReasoning ? (d) => writer.reason(d) : undefined,
+              },
+              t,
+              signal,
+            ),
         );
-        log.warn(
-          `turn in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the turn once`,
-        );
-        // The retry starts from the rebuilt (shrunk) context: the rounds the
-        // failed attempt already ran are not part of its message array, so
-        // they are not part of the conversation the model completed — drop
-        // them from the turn's record (their narration stays in the channel
-        // as posted; the model's history keeps the conversation it actually
-        // saw).
-        rounds.length = 0;
-        roundSettled.length = 0;
-        const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
-        if (rebuilt === null) {
-          log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
-          return;
+        const plainChat: ChatFn = tokens.track((msgs, cbs, tools, signal) => llm.chat(msgs, cbs, tools, signal));
+        // The attempt's conversation, recorded when the attempt completes:
+        // each executed round (the model's text, its reasoning, its calls,
+        // the results, and the ids its narration settled to) plus the final
+        // reply (its chunk ids). Recorded once — success or failure — so
+        // the model's history carries the full turn, not just the final
+        // reply; an interrupted attempt records nothing at all.
+        const rounds: ToolRound[] = [];
+        const roundSettled: Array<PostedReply | null> = [];
+        try {
+          if (turn.chime) {
+            // A chime turn decides over a still conversation: before
+            // deciding, it waits for complete stillness — no activity in
+            // the channel for the stability window, the window restarting
+            // on every new change (a new message, an edit, a typing
+            // indicator). Any activity cancels the pending decision and the
+            // wait starts over, so a burst of messages settles into one
+            // decision over what was actually said, not one decision per
+            // partial message. The attempt's watch is already armed:
+            // activity during the wait aborts the not-yet-started attempt,
+            // and the interrupt path below retries the decision from the
+            // still state (a fresh attempt, a fresh context).
+            await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
+          }
+          // Build the context before the typing indicator starts: it is a
+          // channel fetch (+ image downloads, + one summarization call when the
+          // context compacts), not the reply generation itself.
+          const botId = client.user?.id;
+          if (!botId) {
+            log.error(`turn in ${channelId}: bot user not available; skipping turn`);
+            return;
+          }
+          // With tools enabled, the model may answer in several rounds: a round
+          // that ends in tool calls streams its narration (settled in place via
+          // onToolRound, so it stays above the tool-activity lines), the tools
+          // run, and the next round continues with the results in context. The
+          // whole turn (every round's text, reasoning, calls and results, plus
+          // the final reply) is recorded in the channel context when the turn
+          // ends, so the model's history is the full conversation at all times.
+          // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
+          // note (listing only the enabled families) is added when any are
+          // registered.
+          const systemPrompt = [cfg.model.systemPrompt, tools.systemNote]
+            .filter((p): p is string => p !== null && p.trim().length > 0)
+            .join("\n\n");
+          // Shared by the first build and (after an overflow) the rebuild: same
+          // window, budget, and summarizer.
+          const ctxOpts: ContextOptions = {
+            botId,
+            systemPrompt,
+            maxMessages: cfg.model.contextMaxMessages,
+            enableImages: cfg.model.enableImages,
+            imagesMaxBytes: cfg.model.imagesMaxBytes,
+            enableFileContents: cfg.model.enableFileContents,
+            fileContentsMaxBytes: cfg.model.fileContentsMaxBytes,
+            maxTokens: compactionBudget,
+            keepMessages: cfg.model.compactionKeepMessages,
+            // The summarizer is the same endpoint as the replies: one
+            // plain (tool-less) chat call over the old transcript.
+            summarize: async (msgs) => (await plainChat(msgs)).content,
+          };
+          const messages = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
+          if (messages === null) {
+            // Deleted while queued.
+            log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
+            return;
+          }
+          if (turn.chime) {
+            // A message that committed while the turn waited for stillness
+            // (or while the context was being built) supersedes this chime:
+            // its own turn is queued behind this one and decides over the
+            // still conversation, so this decision is cancelled — no call,
+            // no typing indicator, nothing recorded.
+            const newer = context.newestUserEntryAfter(turn.id);
+            if (newer !== null) {
+              log.info(
+                `channel ${channelId}: chime decision for message ${turn.id} cancelled — a newer message (${newer}) committed while the channel went still; its turn decides`,
+              );
+              return;
+            }
+            // A chime turn: the model decides whether to respond at all, by
+            // calling the chime tool (respond + reason) in one small call over
+            // the transcript (the reply's system prompt is not part of it).
+            // The trigger is the newest user message (the supersede check
+            // above), but a previous turn's reply can sit after it in the
+            // context — the cut keeps the transcript ending at the trigger,
+            // so "the newest message below" in the decision prompt is the
+            // trigger itself. NO posts the decision + reason as a one-line
+            // UI message (never tracked); null (a failed or broken decision)
+            // stays silent: no typing indicator, no message, nothing
+            // recorded.
+            const cut = prefixEndIndex(context, ctxOpts, turn.id);
+            const prefix = cut !== null ? messages.slice(0, cut) : messages;
+            // The decision sees the conversation only: no tool results, no tool
+            // calls, no reasoning (a past turn's tooling is not what the
+            // decision is about, and it keeps the call small).
+            const transcript = chimeTranscript(systemPrompt.trim().length > 0 ? prefix.slice(1) : prefix);
+            const decision = await decideChime(
+              (msgs, tools, signal) => plainChat(msgs, undefined, tools, signal),
+              transcript,
+              attemptController.signal,
+            );
+            if (decision === null) {
+              log.info(`channel ${channelId}: chime decision failed or was unusable for message ${turn.id}; staying silent`);
+              return;
+            }
+            if (!decision.respond) {
+              log.info(
+                `channel ${channelId}: chime decision NO for message ${turn.id}: ${decision.reason || "(no reason given)"}`,
+              );
+              await textChannel.send({ content: formatChimeNo(decision.reason), allowedMentions: SAFE_MENTIONS }).catch((err) => {
+                log.warn(`failed to post the chime decision: ${errMsg(err)}`);
+              });
+              return;
+            }
+          }
+          writer.start();
+          const runModel = (msgs: Parameters<typeof runToolTurn>[0]): Promise<ToolTurnOutcome> =>
+            runToolTurn(msgs, {
+              chat: replyChat,
+              registry: tools.registry,
+              maxRounds: cfg.tools.maxRounds,
+              signal: attemptController.signal,
+              onToolRound: async () => {
+                roundSettled.push(await writer.discard());
+              },
+              onToolCalls: async (calls) => {
+                if (!cfg.discord.showToolActivity) return;
+                // Every call of the turn lands in the one shared activity message
+                // (the first round posts it, later rounds edit it in place). The
+                // calls and results are recorded in the channel context when the
+                // turn ends (onRoundComplete), so the model's history keeps them.
+                await activity.addCalls(calls);
+              },
+              onRoundComplete: (round) => {
+                rounds.push(round);
+              },
+            });
+          let outcome: ToolTurnOutcome;
+          try {
+            // The reply request ends with the trigger's user message (moved to
+            // the end when the context outgrew it — a request ending with the
+            // bot's own reply would be prefilled/echoed or rejected by
+            // prefill-assistant endpoints; see endWithTrigger).
+            outcome = await runModel(endWithTrigger(context, ctxOpts, messages, turn.id));
+          } catch (err) {
+            // The request did not fit the model's context: the endpoint rejected
+            // it before generating. A summarizer run on the overfilled context
+            // would not fit either, so the only way to make room is dropping
+            // entries — shrink hard (the mention protected, the running summary
+            // as a last resort), rebuild the turn, and retry once. A second
+            // overflow (e.g. the mention alone is too big) falls through to the
+            // error path below.
+            if (!isContextOverflowError(err)) throw err;
+            const window = contextWindowFromOverflowError(err);
+            // The estimate must fit the smaller of the compaction budget and the
+            // window minus the completion headroom — the budget alone may sit
+            // at or above the window (a manual value, or the fallback before the
+            // automatic budget was derived).
+            const target =
+              window !== null
+                ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
+                : compactionBudget;
+            context.setMeasuredTokens(null); // it described the overfilled context
+            context.emergencyShrink(
+              turn.id,
+              target,
+              systemPrompt,
+              cfg.model.contextMaxMessages,
+              cfg.model.enableFileContents ? cfg.model.fileContentsMaxBytes : undefined,
+            );
+            log.warn(
+              `turn in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the turn once`,
+            );
+            // The retry starts from the rebuilt (shrunk) context: the rounds the
+            // failed attempt already ran are not part of its message array, so
+            // they are not part of the conversation the model completed — drop
+            // them from the turn's record (their narration stays in the channel
+            // as posted; the model's history keeps the conversation it actually
+            // saw).
+            rounds.length = 0;
+            roundSettled.length = 0;
+            const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
+            if (rebuilt === null) {
+              log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
+              return;
+            }
+            outcome = await runModel(endWithTrigger(context, ctxOpts, rebuilt, turn.id));
+          }
+          if (outcome.toolRounds > 0) {
+            log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);
+          }
+          const finalText =
+            outcome.exhausted && outcome.content.trim() === ""
+              ? "*(stopped: the model kept requesting tools past the round limit)*"
+              : outcome.content;
+          const posted = await writer.finish(finalText);
+          recordTurn(channelId, context, rounds, roundSettled, posted, outcome.reasoning);
+          break; // the attempt completed: the turn is done
+        } catch (err) {
+          if (isInterruptedError(err)) {
+            // The channel changed while the prompt was being processed:
+            // the abort already happened (this error is its trace), so
+            // withdraw the partial reply (the thinking line is kept in the
+            // channel, like a finished round's) and wait for the channel to
+            // go quiet — no activity for the stability window, the window
+            // restarting on every new change. The next attempt's freshly
+            // built context carries everything that arrived or changed
+            // while we waited.
+            log.info(
+              `turn in ${channelId}: interrupted by channel activity (attempt ${attempt + 1}); waiting for the channel to go quiet (${cfg.discord.messageStableMs}ms) before retrying with the new information`,
+            );
+            await writer.interrupt();
+            await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
+            if (!context.has(turn.id)) {
+              log.info(
+                `trigger ${turn.id} in ${channelId} left the channel context while the turn waited for the channel to go quiet; skipping turn`,
+              );
+              break;
+            }
+            continue; // next attempt: a fresh context, a fresh prompt
+          }
+          log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
+          const posted = await writer.reportError(err);
+          recordTurn(channelId, context, rounds, roundSettled, posted, undefined);
+          break;
+        } finally {
+          unwatch();
         }
-        outcome = await runModel(endWithTrigger(context, ctxOpts, rebuilt, turn.id));
       }
-      if (outcome.toolRounds > 0) {
-        log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);
-      }
-      const finalText =
-        outcome.exhausted && outcome.content.trim() === ""
-          ? "*(stopped: the model kept requesting tools past the round limit)*"
-          : outcome.content;
-      const posted = await writer.finish(finalText);
-      recordTurn(channelId, context, rounds, roundSettled, posted, outcome.reasoning);
-    } catch (err) {
-      log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
-      const posted = await writer.reportError(err);
-      recordTurn(channelId, context, rounds, roundSettled, posted, undefined);
     } finally {
       await reportTurnTokens(channelId, context, tokens);
     }
@@ -478,8 +584,10 @@ async function main(): Promise<void> {
     // A mention from any author (human or another bot) queues a turn that
     // always responds. With chime enabled, any other trackable message
     // (a human's or another bot's, without a mention) queues a chime turn
-    // instead: the model decides whether to respond at all (NO posts the
-    // decision + reason; a broken decision stays silent).
+    // instead: the model waits for the channel to go still, then decides
+    // whether to respond at all — a newer message supersedes and cancels
+    // an older decision (the burst's newest turn decides), NO posts the
+    // decision + reason, and a broken decision stays silent.
     if (isMentionOf(message, botId)) {
       queues.get(channelId).push({ id: message.id, chime: false });
     } else if (cfg.discord.chimeEnabled) {
@@ -563,6 +671,11 @@ async function main(): Promise<void> {
     if (!botId) return;
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
     gate.arrive(message);
+    // A new message is a change in the channel: it interrupts a running
+    // turn's prompt processing and restarts its quiet wait (see
+    // ChannelActivity).
+    const channelId = message.channel?.id;
+    if (channelId) channelActivity.note(channelId);
   });
 
   // Edits: a message still in its stability window refreshes the gate (the
@@ -581,11 +694,32 @@ async function main(): Promise<void> {
     if (!channelId) return;
     if (gate.isPending(message.id)) {
       gate.arrive(message);
-      return;
+    } else {
+      const conv = conversationFor(channelId);
+      if (conv) syncMessageUpdate(conv, message, botId);
     }
-    const conv = conversationFor(channelId);
-    if (!conv) return; // the channel has no context yet
-    syncMessageUpdate(conv, message, botId);
+    // An edit is a change in the channel: it interrupts a running turn's
+    // prompt processing and restarts its quiet wait (see ChannelActivity).
+    // The note comes after the gate refresh, so a still-pending message
+    // commits a hair before the quiet wait can resolve — the retry's
+    // context carries it.
+    if (isTrackable(message, botId, cfg.discord.guildId)) channelActivity.note(channelId);
+  });
+
+  // A typing indicator is a change in the channel too: someone is about to
+  // say something, so a running turn's prompt is stale before it is sent —
+  // interrupt it. The turn then waits for the channel to go quiet, which
+  // keeps resetting while the typing goes on (the bot's own typing never
+  // counts: the gateway does not report it, and it is filtered anyway).
+  client.on("typingStart", (typing) => {
+    const botId = client.user?.id;
+    if (!botId) return;
+    const user = typing.user;
+    if (!user || user.id === botId) return;
+    const channel = typing.channel;
+    if (channel.type !== ChannelType.GuildText) return; // text channels only, DMs never
+    if (cfg.discord.guildId !== "" && channel.guild?.id !== cfg.discord.guildId) return;
+    channelActivity.note(channel.id);
   });
 
   // Deletions: drop the still-pending message (it never committed, so there
@@ -613,12 +747,14 @@ async function main(): Promise<void> {
     contexts.clear(channel.id);
     persistence.remove(channel.id);
     gate.clearChannel(channel.id);
+    channelActivity.clearChannel(channel.id);
   });
 
   // Lifecycle: cancel in-flight generation, destroy the client, exit cleanly.
   const shutdown = (signal: string): void => {
     log.info(`${signal} received, shutting down`);
     gate.clear();
+    channelActivity.clear();
     llm.abort();
     for (const c of tools.clients) c.abort();
     client.destroy();

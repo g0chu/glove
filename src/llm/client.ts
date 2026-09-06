@@ -189,6 +189,26 @@ function isAbortError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
 }
 
+/**
+ * A model request aborted by the caller's signal — the channel-activity
+ * interruption (index.ts): the channel changed (a new message, an edit, a
+ * typing indicator) while the prompt was being processed, so the in-flight
+ * request is cancelled on purpose. Distinct from the request's own timeout
+ * (which reports "timed out"): the turn catches it, waits for the channel to
+ * go quiet, and retries with the updated context.
+ */
+export class InterruptedError extends Error {
+  constructor() {
+    super("model request interrupted (the channel changed while the prompt was being processed)");
+    this.name = "InterruptedError";
+  }
+}
+
+/** True when the error is a caller-initiated interruption (see InterruptedError). */
+export function isInterruptedError(err: unknown): boolean {
+  return err instanceof InterruptedError;
+}
+
 /** Normalize one complete tool_call object (non-stream mode) into a ToolCall. */
 function normalizeToolCall(tc: SseToolCallDelta | undefined): ToolCall | null {
   if (!tc || typeof tc !== "object") return null;
@@ -259,13 +279,30 @@ export class LlmClient {
    * (and, when the endpoint sends it, reasoning) deltas are handed to the
    * callbacks as they arrive. When `tools` is provided (and non-empty), it
    * is sent with `tool_choice: "auto"` and the result may carry `toolCalls`
-   * instead of (or alongside) content.
+   * instead of (or alongside) content. When `signal` is provided, aborting
+   * it cancels the request (the channel-activity interruption, see
+   * InterruptedError) — reported as an InterruptedError, not a timeout.
    */
-  async chat(messages: ChatMessage[], callbacks?: StreamCallbacks, tools?: ToolSpec[]): Promise<ChatResult> {
+  async chat(
+    messages: ChatMessage[],
+    callbacks?: StreamCallbacks,
+    tools?: ToolSpec[],
+    signal?: AbortSignal,
+  ): Promise<ChatResult> {
+    if (signal?.aborted) {
+      // The caller already aborted (the channel changed before this call
+      // started): fail at once — no request goes out.
+      throw new InterruptedError();
+    }
     const cbs = callbacks ?? {};
     const controller = new AbortController();
     this.active.add(controller);
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
+    // The caller's signal aborts the request in flight (the
+    // channel-activity interruption): the fetch/stream cancels at once
+    // instead of running to the timeout.
+    const onCallerAbort = (): void => controller.abort();
+    signal?.addEventListener("abort", onCallerAbort, { once: true });
     try {
       const res = await this.request(messages, tools, controller);
       if (this.opts.stream) {
@@ -273,12 +310,19 @@ export class LlmClient {
       }
       return await this.readJson(res, cbs);
     } catch (err) {
+      if (signal?.aborted) {
+        // The caller's signal fired (the channel-activity interruption):
+        // the request was cancelled on purpose, whatever the underlying
+        // abort error is.
+        throw new InterruptedError();
+      }
       if (isAbortError(err)) {
         throw new Error(`model request timed out after ${Math.round(this.opts.timeoutMs / 1000)}s`);
       }
       throw err;
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onCallerAbort);
       this.active.delete(controller);
     }
   }

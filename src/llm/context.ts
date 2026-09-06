@@ -261,6 +261,28 @@ export class ChannelContext {
     return this.find(messageId) !== undefined;
   }
 
+  /**
+   * The id of the newest user entry (a trackable message) that sits in the
+   * context after the entry carrying `messageId` — i.e., a message that
+   * committed after it (entries sit in commit order, which is the arrival
+   * order of live messages). The chime uses it to cancel a decision a newer
+   * message has superseded: the newer message's own turn (queued behind
+   * this one) decides over the still conversation, so a burst of messages
+   * settles into one decision. Assistant and tool entries do not count —
+   * they are the bot's own words, not new activity. Null when the trigger
+   * is no longer in the context or nothing newer follows it.
+   */
+  newestUserEntryAfter(messageId: string): string | null {
+    const idx = this.entries.findIndex((e) => e.ids.includes(messageId));
+    if (idx === -1) return null;
+    let id: string | null = null;
+    for (let i = idx + 1; i < this.entries.length; i++) {
+      const e = this.entries[i];
+      if (e.role === "user" && e.ids.length > 0) id = e.ids[0];
+    }
+    return id;
+  }
+
   /** Replace an entry's stored content (position in the context is kept). */
   updateContent(messageId: string, content: string): void {
     const entry = this.find(messageId);

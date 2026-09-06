@@ -5,6 +5,8 @@ export type ChatFn = (
   messages: ChatMessage[],
   callbacks?: StreamCallbacks,
   tools?: ToolSpec[],
+  /** Optional: the caller's abort signal (the channel-activity interruption, see LlmClient.chat). */
+  signal?: AbortSignal,
 ) => Promise<ChatResult>;
 
 /**
@@ -28,8 +30,8 @@ export class TurnTokens {
 
   /** Wrap a chat function so every call it makes reports its usage here. */
   track(chat: ChatFn): ChatFn {
-    return async (messages, callbacks, tools) => {
-      const res = await chat(messages, callbacks, tools);
+    return async (messages, callbacks, tools, signal) => {
+      const res = await chat(messages, callbacks, tools, signal);
       if (res.usage) {
         this.input += res.usage.input;
         this.output += res.usage.output;

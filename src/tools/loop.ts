@@ -33,12 +33,29 @@ export interface ToolTurnDeps {
   /**
    * One model request. `tools` is the registry's spec list (or undefined
    * when no tool is registered). The stream callbacks, if any, belong to
-   * the caller (e.g. the live writer).
+   * the caller (e.g. the live writer). `signal`, when the turn has one
+   * (see `signal` below), is the turn's abort signal.
    */
-  chat: (messages: ChatMessage[], callbacks?: StreamCallbacks, tools?: ToolSpec[]) => Promise<ChatResult>;
+  chat: (
+    messages: ChatMessage[],
+    callbacks?: StreamCallbacks,
+    tools?: ToolSpec[],
+    signal?: AbortSignal,
+  ) => Promise<ChatResult>;
   registry: ToolRegistry;
   /** Max number of tool-execution rounds before the turn is cut off. */
   maxRounds: number;
+  /**
+   * When provided, it is passed to every model call of the turn, so the
+   * caller can abort the in-flight request mid-turn (the channel-activity
+   * interruption, see index.ts: the channel changed while the prompt was
+   * being processed). An already-aborted signal makes the next call fail
+   * with the client's interruption error, which the caller turns into a
+   * quiet-wait and a retry. Tool calls that are already executing run to
+   * completion (they have their own deadlines); only model calls are
+   * aborted.
+   */
+  signal?: AbortSignal;
   /**
    * Called right after a response that contains tool calls is fully
    * received (and before the next round starts) — never for the cutoff
@@ -82,7 +99,7 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
   const tools = deps.registry.specs();
   let toolRounds = 0;
   for (;;) {
-    const res = await deps.chat(messages, undefined, tools.length > 0 ? tools : undefined);
+    const res = await deps.chat(messages, undefined, tools.length > 0 ? tools : undefined, deps.signal);
     if (res.toolCalls.length === 0) {
       const out: ToolTurnOutcome = { content: res.content, toolRounds, exhausted: false };
       if (res.reasoning) out.reasoning = res.reasoning;
