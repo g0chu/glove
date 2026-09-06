@@ -5,7 +5,7 @@ import { decideChime, formatChimeNo } from "./bot/chime.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { ChannelActivity } from "./bot/quiet.js";
-import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, stripMention } from "./bot/router.js";
+import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMention } from "./bot/router.js";
 import { ResponseWriter, SAFE_MENTIONS, type PostedReply } from "./bot/writer.js";
 import { LlmClient, isInterruptedError } from "./llm/client.js";
 import { ChatPersistence } from "./llm/persist.js";
@@ -267,11 +267,12 @@ async function main(): Promise<void> {
           // Build the context before the typing indicator starts: it is a
           // channel fetch (+ image downloads, + one summarization call when the
           // context compacts), not the reply generation itself.
-          const botId = client.user?.id;
-          if (!botId) {
+          const botUser = client.user;
+          if (!botUser) {
             log.error(`turn in ${channelId}: bot user not available; skipping turn`);
             return;
           }
+          const botId = botUser.id;
           // With tools enabled, the model may answer in several rounds: a round
           // that ends in tool calls streams its narration (settled in place via
           // onToolRound, so it stays above the tool-activity lines), the tools
@@ -289,6 +290,7 @@ async function main(): Promise<void> {
           // window, budget, and summarizer.
           const ctxOpts: ContextOptions = {
             botId,
+            botName: botUser.username,
             systemPrompt,
             maxMessages: cfg.model.contextMaxMessages,
             enableImages: cfg.model.enableImages,
@@ -566,8 +568,9 @@ async function main(): Promise<void> {
    * stabilization queues the turn; one that removes it does not.
    */
   const commitArrival = (message: GateMessage): void => {
-    const botId = client.user?.id;
-    if (!botId) return;
+    const botUser = client.user;
+    if (!botUser) return;
+    const botId = botUser.id;
     const channelId = message.channel?.id;
     if (!channelId) return; // the channel vanished while the message was pending
     if (!message.author) return;
@@ -592,7 +595,9 @@ async function main(): Promise<void> {
     // the image parts are downloaded from at turn time. The bot flag marks
     // other bots' messages ("(bot)" label in the context).
     const name = message.member?.displayName ?? message.author.username;
-    const content = stripMention(message, botId);
+    // The model's view of the message: a mention of the bot is its Discord
+    // name (a mention stripped to nothing would be invisible to the model).
+    const content = replaceMention(message, botId, botUser.username);
     const ctx = contexts.get(channelId);
     if (ctx.has(message.id)) {
       // The startup seed raced the stabilization: the message is already in
@@ -714,22 +719,24 @@ async function main(): Promise<void> {
   // Edits: a message still in its stability window refreshes the gate (the
   // commit will carry the final state) — this is how other bots' streamed
   // replies complete. An already-committed message syncs the context instead
-  // (see syncMessageUpdate: single-message entries take the mention-stripped
-  // content; chunked bot replies take the RAW chunk content, so the bot's
+  // (see syncMessageUpdate: single-message entries take the content with the
+  // bot's mention rendered as its Discord name; chunked bot replies take the
+  // RAW chunk content, so the bot's
   // own final settle edit — which Discord echoes back as a messageUpdate —
   // is a no-op and only real edits change anything). Note: an edit that
   // *adds* a mention does not queue a turn; only fresh (stabilizing)
   // messages do.
   client.on("messageUpdate", (_oldMessage, message) => {
-    const botId = client.user?.id;
-    if (!botId) return;
+    const botUser = client.user;
+    const botId = botUser?.id;
+    if (!botId || !botUser) return;
     const channelId = message.channel?.id;
     if (!channelId) return;
     if (gate.isPending(message.id)) {
       gate.arrive(message);
     } else {
       const conv = conversationFor(channelId);
-      if (conv) syncMessageUpdate(conv, message, botId);
+      if (conv) syncMessageUpdate(conv, message, botId, botUser.username);
     }
     // An edit is a change in the channel: it interrupts a running turn's
     // prompt processing and restarts its quiet wait (see ChannelActivity).

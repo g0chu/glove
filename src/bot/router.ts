@@ -37,13 +37,25 @@ export function isMentionOf(message: Message, botId: string): boolean {
 
 /**
  * The text to forward to the model: the message content with every mention
- * of the bot stripped out (`<@id>` / `<@!id>`).
+ * of the bot (`<@id>` / `<@!id>`) replaced by the bot's Discord name
+ * (`@Name` — the form Discord renders a mention in). A mention stripped to
+ * nothing would be invisible to the model: it could not tell it was
+ * mentioned, only see the rest of the message.
  */
-export function stripMention(message: Message, botId: string): string {
-  return stripMentionText(message.content, botId);
+export function replaceMention(message: Message, botId: string, botName: string): string {
+  return replaceMentionText(message.content, botId, botName);
 }
 
-/** The stripMention transform on a bare content string (fetched messages, tests). */
+/** The replaceMention transform on a bare content string (fetched messages, tests). */
+export function replaceMentionText(text: string, botId: string, botName: string): string {
+  return text.replace(new RegExp(`<@!?${botId}>`, "g"), `@${botName}`).trim();
+}
+
+/**
+ * Strip every bot mention from a bare content string (replacing it with
+ * nothing): used only by the clear-command detection, where `<@bot> !clear`
+ * must still read as the bare command.
+ */
 export function stripMentionText(text: string, botId: string): string {
   return text.replace(new RegExp(`<@!?${botId}>`, "g"), "").trim();
 }
