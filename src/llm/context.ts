@@ -36,7 +36,7 @@ export function speakerLabel(name: string, isBot: boolean): string {
  */
 export interface ContextEntry {
   role: Role;
-  /** The text as the model sees it (mentions of the bot already stripped). */
+  /** The text as the model sees it (mentions of the bot already replaced by its Discord name). */
   content: string;
   /** The Discord message id(s) backing the entry (one per chunk for a chunked reply; [] when there is no Discord message). */
   ids: string[];

@@ -15,7 +15,7 @@ import {
   type ImageFetch,
   type MessageAttachmentLike,
 } from "./images.js";
-import { stripMentionText } from "./router.js";
+import { replaceMentionText } from "./router.js";
 
 /** Discord's hard cap on `messages.fetch` `limit`. */
 const DISCORD_FETCH_LIMIT = 100;
@@ -50,6 +50,12 @@ function toMessageLike(m: Message): MessageLike {
 export interface ContextOptions {
   /** The bot's own user id (its non-reply lines are never context). */
   botId: string;
+  /**
+   * The bot's Discord name: a mention of the bot in a user message is
+   * rendered as this name (`@Name`) in the model's view — never stripped to
+   * nothing, or the model could not tell it was mentioned.
+   */
+  botName: string;
   systemPrompt: string;
   /**
    * The channel's last N Discord messages: the startup seed size, and the
@@ -127,7 +133,7 @@ export async function buildChannelContext(
       const clearedAt = context.getClearedAt();
       context.seedFrom(
         seed
-          .map((m) => toSeedEntry(m, opts.botId))
+          .map((m) => toSeedEntry(m, opts.botId, opts.botName))
           .filter((e): e is SeedEntry => e !== null)
           .filter((e) => clearedAt === null || e.ts > clearedAt),
       );
@@ -166,7 +172,8 @@ export async function buildChannelContext(
  * Sync an already-committed message's new state into the channel context
  * (a messageUpdate that arrives after the stability commit). A
  * single-message entry takes the new content with the bot's mentions
- * stripped (the model's view of non-bot messages); a chunked bot reply's
+ * replaced by its Discord name (the model's view of non-bot messages); a
+ * chunked bot reply's
  * chunk takes the RAW new content — the stored chunks are the raw posted
  * text, so the bot's own final settle edit (which Discord echoes back as a
  * messageUpdate) is a no-op only against the raw content, and a real edit
@@ -179,11 +186,12 @@ export function syncMessageUpdate(
   context: ChannelContext,
   message: { id: string; content: string; attachments: { values(): Iterable<MessageAttachmentLike> } },
   botId: string,
+  botName: string,
 ): void {
   const entry = context.find(message.id);
   if (!entry) return; // not in this channel's context
   if (entry.ids.length === 1) {
-    const newContent = stripMentionText(message.content, botId);
+    const newContent = replaceMentionText(message.content, botId, botName);
     if (newContent !== entry.content) context.updateContent(message.id, newContent);
     context.updateAttachments(
       message.id,
@@ -304,13 +312,13 @@ async function seedMessages(channel: GuildTextBasedChannel, limit: number): Prom
 }
 
 /** A fetched message as a seed entry (our UI lines — tool activity, thinking — are never context). */
-function toSeedEntry(m: MessageLike, botId: string): SeedEntry | null {
+function toSeedEntry(m: MessageLike, botId: string, botName: string): SeedEntry | null {
   if (m.author.id === botId && BOT_UI_RE.test(m.content)) return null;
   const entry: SeedEntry = {
     id: m.id,
     ts: m.createdTimestamp,
     role: m.author.id === botId ? "assistant" : "user",
-    content: stripMentionText(m.content, botId),
+    content: replaceMentionText(m.content, botId, botName),
     attachments: [...m.attachments.values()],
   };
   if (m.author.id !== botId) {

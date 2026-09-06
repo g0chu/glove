@@ -20,7 +20,7 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
-import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable } from "../src/bot/router.js";
+import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMentionText } from "../src/bot/router.js";
 import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError, type ContextEntry } from "../src/llm/context.js";
 import { ChatPersistence } from "../src/llm/persist.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
@@ -331,6 +331,17 @@ const ok = (name: string): void => {
   assert.equal(isMentionOf(withMentions(true, true), botId), true, "another bot's mention queues a turn too");
   assert.equal(isMentionOf(withMentions(true, false), botId), false, "no mention, no turn");
   ok("router: isMentionOf works for any author (humans and other bots alike)");
+
+  // The model's view of a mention of the bot: the mention is replaced by
+  // the bot's Discord name (an empty replacement would make the mention
+  // invisible to the model — it could not tell it was mentioned).
+  assert.equal(replaceMentionText("<@bot1> hello", "bot1", "Glove"), "@Glove hello");
+  assert.equal(replaceMentionText("hi <@!bot1>", "bot1", "Glove"), "hi @Glove");
+  assert.equal(replaceMentionText("  <@bot1>  ", "bot1", "Glove"), "@Glove", "a bare mention leaves just the name (trimmed)");
+  assert.equal(replaceMentionText("<@bot1> and <@bot1> again", "bot1", "Glove"), "@Glove and @Glove again", "every mention is replaced");
+  assert.equal(replaceMentionText("<@user1> hello", "bot1", "Glove"), "<@user1> hello", "other users' mentions are untouched");
+  assert.equal(replaceMentionText("hello", "bot1", "Glove"), "hello", "no mention: unchanged (still trimmed)");
+  ok("router: replaceMentionText replaces the bot's mention with its Discord name (@Name)");
 }
 
 // ----------------------------------------------------------------- gate --
@@ -1091,6 +1102,7 @@ const ok = (name: string): void => {
   capStore.pushUser("Alice", "the mention", "sc2", 60, []);
   const capRes = await buildChannelContext(seedChan, capStore, "sc2", {
     botId: "bot1",
+    botName: "Glove",
     systemPrompt: "",
     maxMessages: 150,
     enableImages: false,
@@ -1109,6 +1121,44 @@ const ok = (name: string): void => {
   );
   ok("compaction: a window over Discord's 100-fetch cap still seeds (capped, UI lines skipped, burst ordered by id)");
 
+  // A mention of the bot in a fetched (seeded) message is replaced by the
+  // bot's Discord name, not stripped to nothing: the model must be able to
+  // tell it was mentioned.
+  {
+    const nmChan = {
+      messages: {
+        fetch: async () => ({
+          values: () =>
+            [
+              { id: "nm1", content: "<@bot1> ping", createdTimestamp: 1, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+              { id: "nm2", content: "ping <@!bot1> back", createdTimestamp: 2, author: { id: "bob", bot: false, username: "Bob" }, attachments: [] },
+            ].values(),
+        }),
+      },
+    } as unknown as GuildTextBasedChannel;
+    const nmStore = new ChannelContext();
+    nmStore.pushUser("Alice", "@Glove ping", "nm1", 1, []); // the live commit stored the name-replaced content
+    const nmRes = await buildChannelContext(nmChan, nmStore, "nm1", {
+      botId: "bot1",
+      botName: "Glove",
+      systemPrompt: "",
+      maxMessages: 20,
+      enableImages: false,
+      imagesMaxBytes: 1024,
+      enableFileContents: false,
+      fileContentsMaxBytes: 1024,
+      maxTokens: 100_000,
+      keepMessages: 10,
+      summarize: async () => "never",
+    });
+    assert.deepEqual(
+      nmRes!.map((x) => String(x.content)),
+      ["Alice: @Glove ping", "Bob: ping @Glove back"],
+      "the tracked entry keeps its content; the fetched mention becomes the bot's Discord name",
+    );
+    ok("seed: a mention of the bot is replaced by its Discord name (never stripped to nothing)");
+  }
+
   // A !clear committed while the startup seed fetch is still in flight wins:
   // its reset() marks the seed as taken, so the late fetch must not undo the
   // clear by re-seeding the channel's last-N messages.
@@ -1126,6 +1176,7 @@ const ok = (name: string): void => {
     rstore.pushUser("Alice", "the mention", "r-mention", 1, []);
     const rBuild = buildChannelContext(rChan, rstore, "r-mention", {
       botId: "bot1",
+      botName: "Glove",
       systemPrompt: "",
       maxMessages: 20,
       enableImages: false,
@@ -1151,7 +1202,8 @@ const ok = (name: string): void => {
   // no-op against it — a strip/trim comparison would rewrite the stored
   // reply on every chunked turn); a real edit stores what the channel shows
   // and re-derives the entry's content. Single-message entries take the
-  // mention-stripped content, and their attachment metadata follows the edit.
+  // content with the bot's mention rendered as its Discord name, and their
+  // attachment metadata follows the edit.
   {
     const sstore = new ChannelContext();
     sstore.pushAssistant("first chunk\n - list line\nthird", ["s-c1", "s-c2", "s-c3"], ["first chunk", " - list line", "third"]);
@@ -1159,23 +1211,24 @@ const ok = (name: string): void => {
     // The bot's own settle edit of the list chunk: the raw content matches
     // the stored chunk (leading space included) -> no-op, the canonical text
     // is kept exactly.
-    syncMessageUpdate(sstore, { id: "s-c2", content: " - list line", attachments: atts() }, "bot-1");
+    syncMessageUpdate(sstore, { id: "s-c2", content: " - list line", attachments: atts() }, "bot-1", "Glove");
     assert.equal(sstore.find("s-c2")!.content, "first chunk\n - list line\nthird", "the bot's own settle edit is a no-op (raw match, no trim)");
     // A real edit (by anyone): the raw new content is stored and the entry's
     // content is re-derived from the chunks.
-    syncMessageUpdate(sstore, { id: "s-c2", content: "- edited list line", attachments: atts() }, "bot-1");
+    syncMessageUpdate(sstore, { id: "s-c2", content: "- edited list line", attachments: atts() }, "bot-1", "Glove");
     assert.equal(sstore.find("s-c2")!.chunks![1], "- edited list line", "the raw edit is stored");
     assert.equal(sstore.find("s-c2")!.content, "first chunk\n- edited list line\nthird", "the content is re-derived from the chunks");
-    // A single-message entry takes the mention-stripped content...
-    sstore.pushUser("Alice", "hello <@bot-1>", "s-u1", 1, []);
-    syncMessageUpdate(sstore, { id: "s-u1", content: "hello again <@bot-1>!", attachments: atts() }, "bot-1");
-    assert.equal(sstore.find("s-u1")!.content, "hello again !", "the mention is stripped (trim only at the ends, like the commit path)");
+    // A single-message entry takes the name-replaced content (what the
+    // commit path stored)...
+    sstore.pushUser("Alice", "hello @Glove", "s-u1", 1, []);
+    syncMessageUpdate(sstore, { id: "s-u1", content: "hello again <@bot-1>!", attachments: atts() }, "bot-1", "Glove");
+    assert.equal(sstore.find("s-u1")!.content, "hello again @Glove!", "the mention is the bot's Discord name (trim only at the ends, like the commit path)");
     // ...and its attachment metadata follows the edit (the pipelines
     // download from the stored metadata at turn time).
     const swapped = { url: "https://cdn.discordapp.com/a/2.png", name: "2.png", size: 5, contentType: "image/png" };
-    syncMessageUpdate(sstore, { id: "s-u1", content: "hello again!", attachments: { values: () => [swapped] } }, "bot-1");
+    syncMessageUpdate(sstore, { id: "s-u1", content: "hello again!", attachments: { values: () => [swapped] } }, "bot-1", "Glove");
     assert.deepEqual(sstore.find("s-u1")!.attachments, [swapped], "the attachment metadata follows the edit");
-    ok("context sync: chunk edits store raw content (the bot's settle is a no-op), single entries strip mentions, metadata follows the edit");
+    ok("context sync: chunk edits store raw content (the bot's settle is a no-op), single entries render the bot's mention as its name, metadata follows the edit");
   }
 
   // prefixEndIndex: the chime transcript cut at the trigger. A message that
@@ -1351,6 +1404,7 @@ const ok = (name: string): void => {
   };
   const cOpts = {
     botId: "bot1",
+    botName: "Glove",
     systemPrompt: "sys",
     maxMessages: 20,
     enableImages: false,
@@ -1632,6 +1686,7 @@ const ok = (name: string): void => {
   kstore.pushUser("Alice", "fresh start", "k3", 300, []);
   const kOpts = {
     botId: "bot1",
+    botName: "Glove",
     systemPrompt: "",
     maxMessages: 20,
     enableImages: false,
@@ -1923,6 +1978,7 @@ const ok = (name: string): void => {
       }) as unknown as GuildTextBasedChannel;
     const seedOpts = (botId: string): Parameters<typeof buildChannelContext>[3] => ({
       botId,
+      botName: "Glove",
       systemPrompt: "",
       maxMessages: 20,
       enableImages: false,
