@@ -21,7 +21,8 @@ import type { AddressInfo } from "node:net";
 import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable } from "../src/bot/router.js";
-import { ChannelContext, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError } from "../src/llm/context.js";
+import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError, type ContextEntry } from "../src/llm/context.js";
+import { ChatPersistence } from "../src/llm/persist.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
 import { LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
@@ -31,7 +32,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, contextToMessages, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, chimeTranscript, contextToMessages, endWithTrigger, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { formatToolCall, ToolActivityPoster } from "../src/tools/activity.js";
@@ -956,6 +957,8 @@ const ok = (name: string): void => {
   let seedLimit: number | undefined;
   const seedMsgs = [
     { id: "sc2", content: "the mention", createdTimestamp: 60, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
+    { id: "sc-chime", content: "🔕 *chime: no — not for me*", createdTimestamp: 59, author: { id: "bot1", bot: true, username: "Glove" }, attachments: [] },
+    { id: "sc-clear", content: "🧹 *cleared the channel's conversation history*", createdTimestamp: 57, author: { id: "bot1", bot: true, username: "Glove" }, attachments: [] },
     { id: "sc0", content: "🤔 *thought for 3s*", createdTimestamp: 58, author: { id: "bot1", bot: true, username: "Glove" }, attachments: [] },
     { id: "1000000000000000005", content: "burst three", createdTimestamp: 55, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
     { id: "1000000000000000003", content: "burst two", createdTimestamp: 55, author: { id: "alice", bot: false, username: "Alice" }, attachments: [] },
@@ -991,6 +994,179 @@ const ok = (name: string): void => {
     ["Alice: pre-startup", "Alice: burst one", "Alice: burst two", "Alice: burst three", "Alice: the mention"],
   );
   ok("compaction: a window over Discord's 100-fetch cap still seeds (capped, UI lines skipped, burst ordered by id)");
+
+  // A !clear committed while the startup seed fetch is still in flight wins:
+  // its reset() marks the seed as taken, so the late fetch must not undo the
+  // clear by re-seeding the channel's last-N messages.
+  {
+    let releaseSeed: (col: { values(): Iterable<MessageLike> }) => void = () => {};
+    const rChan = {
+      messages: {
+        fetch: (): Promise<{ values(): Iterable<MessageLike> }> =>
+          new Promise((resolve) => {
+            releaseSeed = (col) => resolve(col);
+          }),
+      },
+    } as unknown as GuildTextBasedChannel;
+    const rstore = new ChannelContext();
+    rstore.pushUser("Alice", "the mention", "r-mention", 1, []);
+    const rBuild = buildChannelContext(rChan, rstore, "r-mention", {
+      botId: "bot1",
+      systemPrompt: "",
+      maxMessages: 20,
+      enableImages: false,
+      imagesMaxBytes: 1024,
+      enableFileContents: false,
+      fileContentsMaxBytes: 1024,
+      maxTokens: 100_000,
+      keepMessages: 10,
+      summarize: async () => "never",
+    });
+    rstore.reset(); // the !clear commits while the fetch is in flight
+    releaseSeed({ values: () => [] });
+    const rRes = await rBuild;
+    assert.equal(rstore.length, 0, "the late seed did not undo the clear");
+    assert.equal(rstore.seeded, true);
+    assert.ok(rRes !== null && rRes.length === 0, "no seeded entries reach the request");
+    ok("seed: a !clear committed while the seed fetch is in flight wins (no late re-seed)");
+  }
+
+  // syncMessageUpdate: the context sync for an edit of an already-committed
+  // message. Chunked bot replies store the RAW chunk content (the bot's own
+  // final settle edit, which Discord echoes back as a messageUpdate, is a
+  // no-op against it — a strip/trim comparison would rewrite the stored
+  // reply on every chunked turn); a real edit stores what the channel shows
+  // and re-derives the entry's content. Single-message entries take the
+  // mention-stripped content, and their attachment metadata follows the edit.
+  {
+    const sstore = new ChannelContext();
+    sstore.pushAssistant("first chunk\n - list line\nthird", ["s-c1", "s-c2", "s-c3"], ["first chunk", " - list line", "third"]);
+    const atts = () => ({ values: () => [] });
+    // The bot's own settle edit of the list chunk: the raw content matches
+    // the stored chunk (leading space included) -> no-op, the canonical text
+    // is kept exactly.
+    syncMessageUpdate(sstore, { id: "s-c2", content: " - list line", attachments: atts() }, "bot-1");
+    assert.equal(sstore.find("s-c2")!.content, "first chunk\n - list line\nthird", "the bot's own settle edit is a no-op (raw match, no trim)");
+    // A real edit (by anyone): the raw new content is stored and the entry's
+    // content is re-derived from the chunks.
+    syncMessageUpdate(sstore, { id: "s-c2", content: "- edited list line", attachments: atts() }, "bot-1");
+    assert.equal(sstore.find("s-c2")!.chunks![1], "- edited list line", "the raw edit is stored");
+    assert.equal(sstore.find("s-c2")!.content, "first chunk\n- edited list line\nthird", "the content is re-derived from the chunks");
+    // A single-message entry takes the mention-stripped content...
+    sstore.pushUser("Alice", "hello <@bot-1>", "s-u1", 1, []);
+    syncMessageUpdate(sstore, { id: "s-u1", content: "hello again <@bot-1>!", attachments: atts() }, "bot-1");
+    assert.equal(sstore.find("s-u1")!.content, "hello again !", "the mention is stripped (trim only at the ends, like the commit path)");
+    // ...and its attachment metadata follows the edit (the pipelines
+    // download from the stored metadata at turn time).
+    const swapped = { url: "https://cdn.discordapp.com/a/2.png", name: "2.png", size: 5, contentType: "image/png" };
+    syncMessageUpdate(sstore, { id: "s-u1", content: "hello again!", attachments: { values: () => [swapped] } }, "bot-1");
+    assert.deepEqual(sstore.find("s-u1")!.attachments, [swapped], "the attachment metadata follows the edit");
+    ok("context sync: chunk edits store raw content (the bot's settle is a no-op), single entries strip mentions, metadata follows the edit");
+  }
+
+  // prefixEndIndex: the chime transcript cut at the trigger. A message that
+  // commits while the trigger's turn is building the context queues its own
+  // turn — it must not shift the decision target ("the newest message below"
+  // in the chime prompt must be the trigger itself). The cut is the prefix
+  // of contextToMessages's output ending at the trigger's entry (system
+  // prompt + summary + rendered entries up to and including it).
+  {
+    const ptstore = new ChannelContext();
+    ptstore.pushUser("Alice", "old one", "ct-old1", 1, []);
+    ptstore.pushAssistant("an old reply", ["ct-a1"]);
+    ptstore.pushUser("Bob", "the trigger", "ct-trig", 3, []);
+    ptstore.pushUser("Carol", "committed while the turn built", "ct-later", 4, []);
+    const popts = {
+      systemPrompt: "you are helpful",
+      maxMessages: 10,
+      enableImages: false,
+      imagesMaxBytes: 1024,
+      enableFileContents: false,
+      fileContentsMaxBytes: 1024,
+    };
+    const pmsgs = await contextToMessages(ptstore, popts);
+    assert.equal(pmsgs.length, 5, "system + four entries");
+    const pcut = prefixEndIndex(ptstore, popts, "ct-trig");
+    assert.equal(pcut, 4, "system + the two older entries + the trigger");
+    assert.equal(String(pmsgs[pcut! - 1].content), "Bob: the trigger", "the cut ends at the trigger's message");
+    assert.equal(String(pmsgs[pcut!].content), "Carol: committed while the turn built", "the newer entry sits right after the cut");
+    const ptranscript = pmsgs.slice(0, pcut!).slice(1); // the reply's system prompt is not part of it
+    assert.equal(ptranscript[ptranscript.length - 1].content, "Bob: the trigger", "the transcript ends with the trigger");
+    // With a summary: it rides ahead of the cut prefix.
+    await ptstore.compact(2, async () => "the summary", "ct-trig");
+    const pmsgs2 = await contextToMessages(ptstore, popts);
+    const pcut2 = prefixEndIndex(ptstore, popts, "ct-trig");
+    assert.equal(pcut2, 3, "system + summary + the trigger (the older entries are folded)");
+    assert.equal(String(pmsgs2[pcut2! - 1].content), "Bob: the trigger");
+    assert.ok(String(pmsgs2[1].content).startsWith("Summary of the earlier messages"), "the summary stays ahead of the cut prefix");
+    assert.equal(prefixEndIndex(ptstore, popts, "ct-missing"), null, "absent entry -> null (the caller falls back to the full transcript)");
+    ok("chime transcript: prefixEndIndex cuts the transcript at the trigger (summary kept, newer entries excluded)");
+  }
+
+  // endWithTrigger: the reply request must end with the trigger's user
+  // message. A message committed while the previous turn is still in
+  // flight lands in the context before that turn's reply, so the context
+  // can end with the bot's own reply — in that shape a prefill-assistant
+  // endpoint (llama-server's default) "continues" the trailing assistant
+  // message, echoing it back verbatim as the new reply (the duplicate
+  // post) or rejecting the request outright when two replies trail
+  // ("Cannot have 2 or more assistant messages at the end of the list").
+  // The trigger moves to the end; the rest keeps its order; a trigger that
+  // is already last is a no-op (same array back).
+  {
+    const etstore = new ChannelContext();
+    etstore.pushUser("Alice", "the trigger", "et-trig", 1, []);
+    etstore.pushUser("Bob", "committed while the turn built", "et-later", 2, []);
+    etstore.pushAssistant("the previous reply", ["et-a1"]);
+    const etopts: Parameters<typeof endWithTrigger>[1] = {
+      systemPrompt: "sys",
+      enableImages: false,
+      enableFileContents: false,
+    };
+    const etrender: Parameters<typeof contextToMessages>[1] = {
+      ...etopts,
+      maxMessages: 10,
+      imagesMaxBytes: 1024,
+      fileContentsMaxBytes: 1024,
+    };
+    const etmsgs = await contextToMessages(etstore, etrender);
+    assert.equal(String(etmsgs[etmsgs.length - 1].content), "the previous reply", "the context ends with the bot's reply");
+    const etmoved = endWithTrigger(etstore, etopts, etmsgs, "et-trig");
+    assert.deepEqual(
+      etmoved.map((m) => [m.role, String(m.content)]),
+      [
+        ["system", "sys"],
+        ["user", "Bob: committed while the turn built"],
+        ["assistant", "the previous reply"],
+        ["user", "Alice: the trigger"],
+      ],
+      "the trigger moves to the end, the rest keeps its order",
+    );
+    assert.equal(etmoved[etmoved.length - 1].role, "user", "the request ends with the trigger's user message");
+    assert.notEqual(etmoved, etmsgs, "a new array is returned (the original is untouched)");
+    assert.equal(String(etmsgs[etmsgs.length - 1].content), "the previous reply", "the original array keeps its shape");
+    // Two trailing replies (the [A, A] shape the server rejects): the move
+    // fixes it the same way — the request ends with the trigger.
+    const et2store = new ChannelContext();
+    et2store.pushUser("Alice", "the trigger", "et2-trig", 1, []);
+    et2store.pushAssistant("first reply", ["et2-a1"]);
+    et2store.pushAssistant("second reply", ["et2-a2"]);
+    const et2msgs = await contextToMessages(et2store, etrender);
+    assert.equal(String(et2msgs[et2msgs.length - 2].content), "first reply", "two trailing assistants");
+    assert.equal(String(et2msgs[et2msgs.length - 1].content), "second reply");
+    const et2moved = endWithTrigger(et2store, etopts, et2msgs, "et2-trig");
+    assert.equal(et2moved[et2moved.length - 1].role, "user", "two trailing replies -> the request ends with the trigger");
+    assert.equal(String(et2moved[et2moved.length - 1].content), "Alice: the trigger");
+    // The usual case: the trigger is already the last entry — a no-op.
+    const et3store = new ChannelContext();
+    et3store.pushUser("Alice", "the trigger", "et3-trig", 1, []);
+    const et3msgs = await contextToMessages(et3store, etrender);
+    assert.equal(endWithTrigger(et3store, etopts, et3msgs, "et3-trig"), et3msgs, "trigger already last -> the same array back");
+    // A trigger that is no longer in the context: unchanged (the caller
+    // skips the turn).
+    assert.equal(endWithTrigger(et3store, etopts, et3msgs, "et3-gone"), et3msgs, "absent trigger -> unchanged");
+    ok("context: endWithTrigger moves the trigger to the end (no trailing assistant reply)");
+  }
 
   // A single tracked reply grouped with a tracked multi-chunk reply (the
   // seed): the chunk list must stay aligned with the id list — a
@@ -1362,6 +1538,384 @@ const ok = (name: string): void => {
   kcleared.reset();
   assert.equal(await buildChannelContext(noFetch, kcleared, "km", kOpts), null, "pre-clear mention -> null");
   ok("compaction: reset() drops entries + summary, suppresses the seed (pre-clear mention -> null)");
+
+  // The whole turn conversation: appendTurn records each executed round
+  // (the model's text + reasoning + the calls it requested, then the
+  // results in order) and the final reply; the request renders it in full
+  // (the assistant carries its tool calls and reasoning, the results are
+  // tool messages), so a restart resumes with the unbroken history.
+  const turnStore = new ChannelContext();
+  turnStore.pushUser("Alice", "check the file for me", "m1", 100, []);
+  turnStore.appendTurn(
+    [
+      {
+        content: "let me look",
+        reasoning: "first check the path",
+        calls: [{ id: "call_a", name: "file_read", arguments: '{"path":"a.txt"}' }],
+        results: [{ role: "tool", toolCallId: "call_a", name: "file_read", content: "file contents" }],
+        ids: ["n1"],
+      },
+      {
+        content: "", // a round that answered with calls only still renders (its calls carry it)
+        calls: [{ id: "call_b", name: "file_read", arguments: '{"path":"b.txt"}' }],
+        results: [{ role: "tool", toolCallId: "call_b", name: "file_read", content: "more contents" }],
+        ids: [],
+      },
+    ],
+    { content: "the answer is 42", reasoning: "wrapping up", ids: ["r1", "r2"], chunks: ["the answer is", "42"] },
+  );
+  const turnEntries = turnStore.snapshot();
+  assert.deepEqual(
+    turnEntries.map((e) => [e.role, e.content]),
+    [
+      ["user", "check the file for me"],
+      ["assistant", "let me look"],
+      ["tool", "file contents"],
+      ["assistant", ""],
+      ["tool", "more contents"],
+      ["assistant", "the answer is 42"],
+    ],
+    "rounds (text, calls, results) and the final reply in order",
+  );
+  assert.equal(turnEntries[1].toolCalls?.[0].id, "call_a");
+  assert.equal(turnEntries[1].reasoning, "first check the path");
+  assert.equal(turnEntries[3].toolCalls?.length, 1, "the calls-only round keeps its calls");
+  assert.equal(turnEntries[5].reasoning, "wrapping up", "the final reply keeps its reasoning");
+  assert.deepEqual(turnEntries[5].chunks, ["the answer is", "42"]);
+  const renderOpts: Parameters<typeof contextToMessages>[1] = {
+    systemPrompt: "sys",
+    maxMessages: 20,
+    enableImages: false,
+    imagesMaxBytes: 1024,
+    enableFileContents: false,
+    fileContentsMaxBytes: 1024,
+  };
+  const rendered = await contextToMessages(turnStore, renderOpts);
+  assert.deepEqual(
+    rendered.map((m) => [m.role, m.content]),
+    [
+      ["system", "sys"],
+      ["user", "Alice: check the file for me"],
+      ["assistant", "let me look"],
+      ["tool", "file contents"],
+      ["assistant", ""],
+      ["tool", "more contents"],
+      ["assistant", "the answer is 42"],
+    ],
+    "the request carries the full conversation in order",
+  );
+  assert.equal(rendered[3].toolCallId, "call_a");
+  assert.equal(rendered[3].name, "file_read");
+  assert.deepEqual(rendered[2].toolCalls, turnEntries[1].toolCalls);
+  assert.equal(rendered[2].reasoningContent, "first check the path", "assistant reasoning on the wire message");
+  assert.equal(rendered[6].reasoningContent, "wrapping up");
+  ok("context: appendTurn records the whole turn and the request renders it in full");
+
+  // Deleting the round's narration message drops the whole call/result
+  // group (a history with unanswered calls or orphaned results would be
+  // invalid for the endpoint); deleting the final reply drops only it.
+  assert.ok(turnStore.removeById("n1"), "the round narration id resolves the group");
+  assert.deepEqual(
+    turnStore.snapshot().map((e) => [e.role, e.content]),
+    [
+      ["user", "check the file for me"],
+      ["assistant", ""],
+      ["tool", "more contents"],
+      ["assistant", "the answer is 42"],
+    ],
+    "the calls-only round survived; the deleted round's calls and result are gone with it",
+  );
+  assert.ok(turnStore.removeById("r2"), "any chunk id of the final reply resolves it");
+  const afterDelete = turnStore.snapshot();
+  assert.deepEqual(
+    afterDelete.map((e) => [e.role, e.content]),
+    [
+      ["user", "check the file for me"],
+      ["assistant", ""],
+      ["tool", "more contents"],
+    ],
+    "deleting the final reply drops only the final entry",
+  );
+  ok("context: deleting a round's narration drops the whole call/result group");
+
+  // Trimming and compaction never split a tool-call group: an assistant's
+  // calls must not outlive their results (or vice versa) — a split group
+  // would be an invalid conversation for the endpoint.
+  const groupStore = new ChannelContext();
+  for (let i = 0; i < 6; i++) groupStore.pushUser("Alice", `old message ${i} ${"x".repeat(200)}`, `g${i}`, 100 + i, []);
+  groupStore.appendTurn(
+    [
+      {
+        content: "round narration",
+        calls: [{ id: "cg1", name: "file_read", arguments: "{}" }],
+        results: [{ role: "tool", toolCallId: "cg1", name: "file_read", content: "r1" }],
+        ids: ["gn"],
+      },
+    ],
+    { content: "final reply", ids: ["gf"] },
+  );
+  groupStore.pushUser("Alice", "the mention", "gm", 200, []);
+  groupStore.emergencyTrim("gm", 600, "sys", 20);
+  const trimmed = groupStore.snapshot();
+  const assertGroupIntact = (entries: typeof trimmed): void => {
+    for (let i = 0; i < entries.length - 1; i++) {
+      const calls = entries[i].toolCalls;
+      if (calls === undefined || calls.length === 0) continue;
+      const ids = new Set(calls.map((c) => c.id));
+      let j = i + 1;
+      while (j < entries.length && entries[j].role === "tool") j++;
+      const answered = new Set(entries.slice(i + 1, j).map((e) => e.toolCallId));
+      assert.ok([...ids].every((id) => answered.has(id)), "every call has its result in the entry right after");
+      // No orphaned result: a tool entry's call id must belong to the
+      // preceding assistant entry.
+      for (const t of entries.slice(i + 1, j)) assert.ok(ids.has(t.toolCallId ?? ""), "no orphaned tool result");
+    }
+  };
+  assertGroupIntact(trimmed);
+  assert.ok(groupStore.has("gm"), "the mention survived the trim");
+  // Compaction: a keep boundary that lands inside a group folds the whole
+  // group into the summary instead of leaving orphaned results behind.
+  const groupStore2 = new ChannelContext();
+  for (let i = 0; i < 4; i++) groupStore2.pushUser("Alice", `old ${i} ${"y".repeat(300)}`, `h${i}`, 100 + i, []);
+  groupStore2.appendTurn(
+    [
+      {
+        content: "narration",
+        calls: [{ id: "cg2", name: "file_read", arguments: "{}" }],
+        results: [{ role: "tool", toolCallId: "cg2", name: "file_read", content: "r2" }],
+        ids: ["hn"],
+      },
+    ],
+    { content: "final", ids: ["hf"] },
+  );
+  groupStore2.pushUser("Alice", "keep me 1", "hm1", 300, []);
+  groupStore2.pushUser("Alice", "keep me 2", "hm2", 301, []);
+  // keep=2: the newest two are the keep region; the boundary falls right
+  // before "keep me 1", so the group is fully foldable — but with keep=3
+  // the boundary falls INSIDE the group (between narration and result).
+  const res2 = await groupStore2.compact(3, async () => "folded");
+  assert.equal(res2.ok, true);
+  const kept = groupStore2.snapshot();
+  assertGroupIntact(kept);
+  assert.ok(kept.some((e) => e.ids.includes("hn")) === kept.some((e) => e.toolCallId === "cg2"), "the group moved whole (narration and result together)");
+  assert.ok(kept.some((e) => e.ids.includes("hm2")), "the newest message stayed verbatim");
+  assert.ok(groupStore2.getSummary() === "folded");
+  ok("context: trimming and compaction never split a tool-call group");
+
+  // Serialize/restore: the persisted file round-trips the full turn
+  // conversation (text, reasoning, calls, results, chunks, the summary,
+  // the seeded flag, the measured size), and a malformed entry is skipped
+  // rather than failing the whole channel's restore.
+  const roundTrip = new ChannelContext();
+  roundTrip.pushUser("Alice", "hello", "rt1", 10, []);
+  roundTrip.appendTurn(
+    [
+      {
+        content: "thinking out loud",
+        reasoning: "the plan",
+        calls: [{ id: "rtc", name: "file_read", arguments: "{}" }],
+        results: [{ role: "tool", toolCallId: "rtc", name: "file_read", content: "data" }],
+        ids: ["rtn"],
+      },
+    ],
+    { content: "final", reasoning: "done thinking", ids: ["rtf1", "rtf2"], chunks: ["fi", "nal"] },
+  );
+  roundTrip.setMeasuredTokens(1234);
+  const restored = ChannelContext.restore({
+    seeded: true,
+    summary: null,
+    measuredTokens: 1234,
+    entries: [
+      ...roundTrip.serialize().entries,
+      { role: "alien", content: "x", ids: ["bad"] } as unknown as ContextEntry, // unknown role -> skipped
+      { role: "user", content: 42, ids: ["bad2"] } as unknown as ContextEntry, // non-string content -> skipped
+      { role: "user", content: "survives", ids: "not-an-array" } as unknown as ContextEntry, // bad ids -> skipped
+      { role: "assistant", content: "kept calls only", ids: [], ts: 777, toolCalls: [{ id: "x", name: "y", arguments: "z" }, { id: "", name: "z" }] } as ContextEntry, // the good call is kept, the broken one dropped
+    ],
+  });
+  assert.equal(restored.seeded, true);
+  assert.equal(restored.getMeasuredTokens(), 1234);
+  assert.deepEqual(restored.snapshot(), [...roundTrip.snapshot(), { role: "assistant", content: "kept calls only", ids: [], ts: 777, attachments: [], toolCalls: [{ id: "x", name: "y", arguments: "z" }] }], "malformed entries skipped, the rest intact");
+  assert.equal(restored.snapshot().length, roundTrip.length + 1);
+  ok("context: serialize/restore round-trips the full turn conversation (malformed entries skipped)");
+
+  // File persistence: save writes atomically (tmp + rename, valid JSON),
+  // load restores every channel, remove forgets one, and a missing or
+  // corrupt file fails soft to an empty store (the old re-seed behavior).
+  const pdir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-persist-"));
+  try {
+    const pfile = path.join(pdir, "chats.json");
+    const p1 = new ChatPersistence(pfile);
+    const pc = new ChannelContext();
+    pc.pushUser("Alice", "persisted hello", "p1", 1, []);
+    pc.appendTurn(
+      [
+        {
+          content: "n",
+          reasoning: "r",
+          calls: [{ id: "pc", name: "file_read", arguments: "{}" }],
+          results: [{ role: "tool", toolCallId: "pc", name: "file_read", content: "d" }],
+          ids: [],
+        },
+      ],
+      { content: "f", ids: [] },
+    );
+    pc.reset(); // also prove reset persists (a cleared channel stays cleared across a restart)
+    pc.pushUser("Alice", "after clear", "p2", 2, []);
+    p1.save("chan1", pc);
+    await p1.flush();
+    assert.ok(fs.existsSync(pfile), "the file exists after the flush");
+    assert.ok(!fs.existsSync(`${pfile}.tmp`), "the temp file is renamed away");
+    const onDisk = JSON.parse(fs.readFileSync(pfile, "utf8")) as { version: number; channels: Record<string, unknown> };
+    assert.equal(onDisk.version, 1);
+    assert.equal(Object.keys(onDisk.channels).length, 1);
+    const p2 = new ChatPersistence(pfile);
+    const loaded = p2.load();
+    assert.deepEqual(loaded.get("chan1")?.entries.map((e) => e.content), ["after clear"], "the cleared context restored from disk");
+    p2.remove("chan1");
+    await p2.flush();
+    assert.equal((JSON.parse(fs.readFileSync(pfile, "utf8")) as { channels: Record<string, unknown> }).channels["chan1"], undefined, "remove forgets the channel");
+    fs.writeFileSync(pfile, '{"version": 1, "channels": {"c": '); // a truncated write (a crash mid-write)
+    assert.deepEqual([...new ChatPersistence(pfile).load().keys()], [], "a corrupt file fails soft to an empty store");
+    assert.deepEqual([...new ChatPersistence(path.join(pdir, "missing.json")).load().keys()], [], "a missing file is an empty store (first run)");
+    ok("persistence: save/load/remove round-trip the file (atomic), corrupt/missing files fail soft");
+
+    // The store wires every context change to the persistence hook and
+    // restore() puts a persisted context back (with the hook re-wired).
+    const saved: Array<[string, string[]]> = [];
+    const store = new ChannelContextStore((id, ctx) => saved.push([id, ctx.snapshot().map((e) => e.content)]));
+    const sc = store.get("s1");
+    sc.pushUser("Alice", "one", "s1a", 1, []);
+    sc.pushUser("Bob", "two", "s1b", 2, []);
+    assert.deepEqual(saved, [
+      ["s1", ["one"]],
+      ["s1", ["one", "two"]],
+    ], "every change saves the whole channel");
+    store.restore("s1", { seeded: true, summary: null, measuredTokens: null, clearedAt: null, entries: [{ role: "user", content: "restored", ids: ["sr"], ts: 3, attachments: [] }] });
+    assert.deepEqual(store.get("s1").snapshot().map((e) => e.content), ["restored"], "restore replaces the channel's context");
+    assert.equal(store.get("s1").seeded, false, "a restored conversation gets one catch-up seed at its first turn (offline messages)");
+    ok("store: every context change fires the persistence hook; restore puts a context back");
+
+    // The restart catch-up: a persisted conversation merges in what arrived
+    // in the channel while the bot was offline (already-tracked ids win),
+    // and a !clear's watermark keeps the restart from resurrecting the
+    // conversation that was cleared. An empty (cleared) context never
+    // re-seeds.
+    const makeFetchChan = (msgs: Array<{ id: string; content: string; createdTimestamp: number; author: { id: string; bot: boolean; username: string } }>): GuildTextBasedChannel =>
+      ({
+        messages: {
+          fetch: async () => ({ values: () => msgs.map((m) => ({ ...m, attachments: { values: () => [] as never[] } })).values() }),
+        },
+      }) as unknown as GuildTextBasedChannel;
+    const seedOpts = (botId: string): Parameters<typeof buildChannelContext>[3] => ({
+      botId,
+      systemPrompt: "",
+      maxMessages: 20,
+      enableImages: false,
+      imagesMaxBytes: 1024,
+      enableFileContents: false,
+      fileContentsMaxBytes: 1024,
+      maxTokens: 100_000,
+      keepMessages: 10,
+      summarize: async () => "never",
+    });
+
+    // offline catch-up: the persisted context has "old" (tracked); the
+    // channel now also holds "offline" (arrived while the bot was down) and
+    // "new" (already tracked, wins over the fetched copy).
+    const cuStore = new ChannelContext();
+    cuStore.pushUser("Alice", "old", "cu-old", 100, []);
+    cuStore.pushUser("Bob", "new", "cu-new", 300, []);
+    const cuRestored = ChannelContext.restore(cuStore.serialize());
+    cuRestored.seeded = false;
+    const cuChan = makeFetchChan([
+      { id: "cu-new", content: "new (edited while offline)", createdTimestamp: 300, author: { id: "bob", bot: false, username: "Bob" } },
+      { id: "cu-off1", content: "offline one", createdTimestamp: 200, author: { id: "alice", bot: false, username: "Alice" } },
+      { id: "cu-old", content: "old (edited while offline)", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" } },
+    ]);
+    const cuRes = await buildChannelContext(cuChan, cuRestored, "cu-new", seedOpts("bot1"));
+    assert.deepEqual(
+      cuRes!.map((x) => String(x.content)),
+      ["Alice: old", "Alice: offline one", "Bob: new"],
+      "offline messages merged in chronological order; tracked ids keep their (newer, live) content",
+    );
+    assert.equal(cuRestored.seeded, true, "the catch-up happened once");
+    ok("persistence: a restart catches up the channel's offline messages into the persisted context");
+
+    // the clear's watermark: messages older than the clear are not
+    // re-imported by the catch-up (a clear is a fresh chat, even across a
+    // restart); an empty (cleared) context never re-seeds at all.
+    const clStore = new ChannelContext();
+    clStore.pushUser("Alice", "after the clear", "cl-new", 500, []);
+    const clearTime = Date.now();
+    clStore.reset(); // the clear (drops the entry, sets the watermark)
+    clStore.pushUser("Alice", "after the clear", "cl-new", 500, []);
+    const clRestored = ChannelContext.restore(clStore.serialize());
+    assert.ok(clRestored.getClearedAt() !== null && clRestored.getClearedAt()! >= clearTime, "the watermark survived the round-trip");
+    clRestored.seeded = false;
+    const clChan = makeFetchChan([
+      { id: "cl-new", content: "after the clear", createdTimestamp: 500, author: { id: "alice", bot: false, username: "Alice" } },
+      { id: "cl-pre", content: "before the clear", createdTimestamp: 100, author: { id: "alice", bot: false, username: "Alice" } },
+    ]);
+    const clRes = await buildChannelContext(clChan, clRestored, "cl-new", seedOpts("bot1"));
+    assert.deepEqual(
+      clRes!.map((x) => String(x.content)),
+      ["Alice: after the clear"],
+      "the pre-clear message is not resurrected by the restart",
+    );
+    const clCleared = new ChannelContext();
+    clCleared.reset();
+    const clEmpty = ChannelContext.restore(clCleared.serialize());
+    clEmpty.seeded = clEmpty.length === 0; // what the store does on restore
+    assert.equal(clEmpty.seeded, true, "a cleared (empty) context never re-seeds");
+    ok("persistence: a !clear survives a restart (the catch-up honors the watermark; an empty context stays empty)");
+  } finally {
+    fs.rmSync(pdir, { recursive: true, force: true });
+  }
+
+  // The chime decision's transcript strips the model's internal machinery:
+  // no tool results, no tool calls, no reasoning, no calls-only assistant
+  // messages — the decision is about the conversation, not a past turn's
+  // tooling.
+  const chimeIn: ChatMessage[] = [
+    { role: "user", content: "Alice: what is in the file?" },
+    { role: "assistant", content: "let me check", reasoningContent: "checking", toolCalls: [{ id: "c", name: "file_read", arguments: "{}" }] },
+    { role: "tool", toolCallId: "c", name: "file_read", content: "secret" },
+    { role: "assistant", content: "it says 42", reasoningContent: "done" },
+    { role: "assistant", content: "" },
+    { role: "user", content: "Bob: nice" },
+  ];
+  assert.deepEqual(chimeTranscript(chimeIn), [
+    { role: "user", content: "Alice: what is in the file?" },
+    { role: "assistant", content: "let me check" },
+    { role: "assistant", content: "it says 42" },
+    { role: "user", content: "Bob: nice" },
+  ], "tool entries drop, calls and reasoning strip, calls-only assistants drop");
+  ok("chime: chimeTranscript strips the model's internal machinery from the decision transcript");
+
+  // prefixEndIndex counts tool entries the way contextToMessages renders
+  // them (a tool entry renders with its result text; a calls-only assistant
+  // renders with its calls) — the chime cut stays exact with turns in the
+  // history.
+  const cutStore = new ChannelContext();
+  cutStore.pushUser("Alice", "q", "cq", 1, []);
+  cutStore.appendTurn(
+    [
+      {
+        content: "n",
+        calls: [{ id: "cc", name: "file_read", arguments: "{}" }],
+        results: [{ role: "tool", toolCallId: "cc", name: "file_read", content: "d" }],
+        ids: ["cn"],
+      },
+    ],
+    { content: "f", ids: ["cf"] },
+  );
+  cutStore.pushUser("Bob", "the trigger", "ct", 2, []);
+  const cutOpts: Parameters<typeof prefixEndIndex>[1] = { systemPrompt: "sys", enableImages: false, enableFileContents: false };
+  assert.equal(prefixEndIndex(cutStore, cutOpts, "ct"), 6, "system + user + narration + tool + final + trigger");
+  assert.equal(prefixEndIndex(cutStore, cutOpts, "cf"), 5, "the cut at the final reply includes the round's calls and result");
+  assert.equal(prefixEndIndex(cutStore, cutOpts, "missing"), null);
+  ok("context: prefixEndIndex counts tool entries (the cut stays exact with turns in the history)");
 }
 
 // ----------------------------------------------------------------- queue --
@@ -1661,6 +2215,46 @@ const ok = (name: string): void => {
   assert.equal(p5!.text, "Final answer!");
   assert.deepEqual(p5!.messageIds, [msgs[1].id], "only the final reply is recorded");
   ok("writer: discard() settles the round's text in place, next round is fresh");
+
+  // discard() resolves with what the round's text settled to (the message
+  // ids + text, like finish) so the caller can record the round in the
+  // channel history (its message ids keep edits and deletes in sync);
+  // a round with no text settles to null.
+  const rMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const rChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `r${String(rMsgs.length)}`, content: data.content, deleted: false };
+      rMsgs.push(m);
+      return {
+        id: m.id,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const wR = new ResponseWriter({
+    channel: rChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 2000,
+  });
+  wR.start();
+  wR.chunk("round one narration");
+  await ticks(2);
+  const d1 = await wR.discard();
+  assert.equal(d1?.text, "round one narration", "the settled round's text is reported");
+  assert.deepEqual(d1?.messageIds, [rMsgs[0].id], "the settled round's message id is reported");
+  wR.chunk(""); // a calls-only round: nothing streams
+  const d2 = await wR.discard();
+  assert.equal(d2, null, "a textless round settles to null (the caller records the model's text instead)");
+  await wR.finish("done");
+  ok("writer: discard() resolves with the settled round (ids + text), null for a textless round");
 
   // Multi-round turn (the reported bug): with many tool calls in one turn the
   // text between the rounds used to be deleted — every round's narration
@@ -2164,6 +2758,58 @@ const ok = (name: string): void => {
   assert.deepEqual(prev.toolCalls, script[0].toolCalls);
   assert.deepEqual(callsSeen, [script[0].toolCalls], "onToolCalls fires once with the round's calls");
   ok("loop: tool round executed, results appended, final answer returned");
+
+  // Reasoning + rounds: each executed round's reasoning travels with the
+  // next request (sent back so a reasoning model continues its own
+  // thinking) and is reported to onRoundComplete (the caller records the
+  // whole turn in the channel history); the final round's reasoning is on
+  // the outcome.
+  const scriptR: ChatResult[] = [
+    { content: "checking the units", reasoning: "unit analysis first", toolCalls: [{ id: "t1", name: "echo", arguments: "{}" }] },
+    { content: "final with thinking", reasoning: "wrapping up", toolCalls: [] },
+  ];
+  let iR = 0;
+  const roundsSeen: Array<Record<string, unknown>> = [];
+  const roundSignals: number[] = [];
+  const msgsR: ChatMessage[] = [{ role: "user", content: "go" }];
+  const outR = await runToolTurn(msgsR, {
+    chat: async (msgs) => {
+      const n = iR;
+      if (n === 1) {
+        // The second request must carry the first round's full conversation:
+        // the assistant's text + reasoning + calls, then the tool result.
+        const a = msgs[1];
+        const t = msgs[2];
+        assert.equal(a.role, "assistant");
+        assert.equal(a.content, "checking the units");
+        assert.equal(a.reasoningContent, "unit analysis first", "the round's reasoning travels with the next request");
+        assert.deepEqual(a.toolCalls, scriptR[0].toolCalls);
+        assert.equal(t.role, "tool");
+        assert.equal(t.toolCallId, "t1");
+        assert.equal(t.content, "echo:{}");
+        roundSignals.push(msgs.length);
+      }
+      return scriptR[iR++];
+    },
+    registry,
+    maxRounds: 3,
+    onToolRound: async () => {
+      roundSignals.push(-1);
+    },
+    onRoundComplete: (r) => {
+      roundsSeen.push(r as unknown as Record<string, unknown>);
+    },
+  });
+  assert.equal(outR.content, "final with thinking");
+  assert.equal(outR.toolRounds, 1);
+  assert.equal(outR.reasoning, "wrapping up", "the final round's reasoning is on the outcome");
+  assert.deepEqual(roundSignals, [-1, 3], "onToolRound settles before the tools run, the request carries text+assistant+tool");
+  assert.equal(roundsSeen.length, 1, "onRoundComplete fires once per executed round");
+  assert.equal(roundsSeen[0].content, "checking the units");
+  assert.equal(roundsSeen[0].reasoning, "unit analysis first");
+  assert.deepEqual(roundsSeen[0].calls, scriptR[0].toolCalls);
+  assert.deepEqual(roundsSeen[0].results, [{ role: "tool", toolCallId: "t1", name: "echo", content: "echo:{}" }]);
+  ok("loop: round reasoning travels with the next request and is reported to onRoundComplete");
 
   // budget exhausted: the model keeps requesting tools
   let toolRoundSignals = 0;
@@ -3180,7 +3826,8 @@ const ok = (name: string): void => {
   assert.deepEqual(rRes.toolCalls, []);
   assert.deepEqual(rContent, ["42"], "content deltas untouched");
   assert.deepEqual(rDeltas, ["Let me ", "think."], "reasoning and reasoning_content both picked up");
-  ok("llm: streamed reasoning reaches onReasoning only");
+  assert.equal(rRes.reasoning, "Let me think.", "the accumulated reasoning is on the result");
+  ok("llm: streamed reasoning reaches onReasoning and the result");
 
   // non-stream: the reasoning blob is handed over whole
   const rDeltasNs: string[] = [];
@@ -3193,7 +3840,8 @@ const ok = (name: string): void => {
   }).chat([{ role: "user", content: "?" }], { onReasoning: (d) => rDeltasNs.push(d) });
   assert.equal(rNs.content, "the answer");
   assert.deepEqual(rDeltasNs, ["the thinking"], "non-stream reasoning handed over whole");
-  ok("llm: non-stream reasoning handed to onReasoning");
+  assert.equal(rNs.reasoning, "the thinking", "the reasoning is on the result");
+  ok("llm: non-stream reasoning handed to onReasoning and the result");
 
   const r0 = seenRequests[0];
   assert.equal(r0.auth, "Bearer none");
@@ -3362,6 +4010,25 @@ const ok = (name: string): void => {
   const mmBody = seenRequests.at(-1)!.body as Record<string, unknown>;
   assert.deepEqual(mmBody.messages, [{ role: "user", content: mmParts }], "parts sent as-is");
   ok("llm: multimodal content parts pass through to the wire");
+
+  // Reasoning round-trip: an assistant message's stored reasoning is sent
+  // back to the endpoint as reasoning_content (both plain and with tool
+  // calls) so a reasoning model continues from its own thinking; messages
+  // without reasoning carry no such field.
+  await nsClient.chat([
+    { role: "user", content: "go" },
+    { role: "assistant", content: "thinking out loud", reasoningContent: "step one" },
+    { role: "assistant", content: "", toolCalls: [{ id: "c1", name: "echo", arguments: "{}" }], reasoningContent: "step two" },
+    { role: "tool", toolCallId: "c1", name: "echo", content: "ok" },
+    { role: "assistant", content: "no reasoning here" },
+  ]);
+  const rtWire = (seenRequests.at(-1)!.body as Record<string, unknown>).messages as Array<Record<string, unknown>>;
+  assert.equal(rtWire[1].reasoning_content, "step one", "plain assistant reasoning sent back");
+  assert.equal(rtWire[2].reasoning_content, "step two", "a tool-calling assistant's reasoning sent back");
+  assert.equal((rtWire[2].tool_calls as unknown[]).length, 1, "tool calls alongside the reasoning");
+  assert.equal("reasoning_content" in rtWire[4], false, "no field without reasoning");
+  assert.equal("reasoning_content" in rtWire[3], false, "tool messages never carry it");
+  ok("llm: assistant reasoning round-trips as reasoning_content on the wire");
 
   server.close();
 }

@@ -1,5 +1,22 @@
 import type { ChatMessage, ChatResult, StreamCallbacks, ToolCall, ToolSpec } from "../llm/client.js";
-import { executeToolCalls, ToolRegistry } from "./executor.js";
+import { executeToolCalls, ToolRegistry, type ToolResultMessage } from "./executor.js";
+
+/**
+ * One executed tool round of a turn: the model's answer for the round (its
+ * text and reasoning) plus the calls it requested and their results — the
+ * whole conversation fragment the model will see in the next round, and
+ * what the caller records in the channel history.
+ */
+export interface ToolRound {
+  /** The round's assistant text ("" when the model only called tools). */
+  content: string;
+  /** The round's reasoning, when the endpoint sent it. */
+  reasoning?: string;
+  /** The tool calls the model requested. */
+  calls: ToolCall[];
+  /** The executed results, one per call, in call order. */
+  results: ToolResultMessage[];
+}
 
 /**
  * One full "tool turn": keep calling the model until it answers with plain
@@ -7,9 +24,10 @@ import { executeToolCalls, ToolRegistry } from "./executor.js";
  *
  * Kept pure (all I/O via `deps.chat`) so the loop is unit-testable without
  * a model, the network, or Discord. The intermediate assistant/tool messages
- * live only in this function's `messages` array — the channel history only
- * ever sees the final posted reply, so the sliding-window semantics are
- * untouched.
+ * are appended to the caller's `messages` array (the next round continues
+ * with them — including each round's reasoning, sent back as
+ * `reasoning_content`), and reported to the caller via `onRoundComplete` so
+ * the whole turn can be recorded in the channel history.
  */
 export interface ToolTurnDeps {
   /**
@@ -29,9 +47,10 @@ export interface ToolTurnDeps {
    * place (the round's narration stays in the channel between the
    * tool-activity lines) and to complete the round's thinking into a
    * terminal line so the reasoning shows up between the tool-activity
-   * messages.
+   * messages. Awaited: the caller settles the round's messages (and learns
+   * their ids) before the tool activity is posted.
    */
-  onToolRound?: () => void;
+  onToolRound?: () => void | Promise<void>;
   /**
    * Called with the calls about to execute, right before execution starts
    * (awaited, so any posted activity messages land first). The caller uses
@@ -39,6 +58,13 @@ export interface ToolTurnDeps {
    * call; the results themselves stay internal (they only reach the model).
    */
   onToolCalls?: (calls: ToolCall[]) => void | Promise<void>;
+  /**
+   * Called once per executed round, after the results are in (and appended
+   * to `messages`): the caller records the round in the channel history
+   * (text, reasoning, calls and results — the turn's conversation is
+   * preserved in full, not just the final reply).
+   */
+  onRoundComplete?: (round: ToolRound) => void;
 }
 
 export interface ToolTurnOutcome {
@@ -48,6 +74,8 @@ export interface ToolTurnOutcome {
   toolRounds: number;
   /** True when the turn was cut off at maxRounds while the model still wanted tools. */
   exhausted: boolean;
+  /** The final round's reasoning, when the endpoint sent it. */
+  reasoning?: string;
 }
 
 export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): Promise<ToolTurnOutcome> {
@@ -56,7 +84,9 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
   for (;;) {
     const res = await deps.chat(messages, undefined, tools.length > 0 ? tools : undefined);
     if (res.toolCalls.length === 0) {
-      return { content: res.content, toolRounds, exhausted: false };
+      const out: ToolTurnOutcome = { content: res.content, toolRounds, exhausted: false };
+      if (res.reasoning) out.reasoning = res.reasoning;
+      return out;
     }
     if (toolRounds >= deps.maxRounds) {
       // The model still wants tools but the budget is spent: stop and let
@@ -64,16 +94,26 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
       // is the turn's last — its text is the final reply (posted and
       // recorded by the caller's `finish()`, which also completes the
       // round's thinking line), so no onToolRound: the text is not
-      // transient here.
-      return { content: res.content, toolRounds, exhausted: true };
+      // transient here. Its (unexecuted) tool calls are not recorded either:
+      // they were never run, so a history carrying them would be invalid
+      // (an assistant's calls must be answered by tool results).
+      const out: ToolTurnOutcome = { content: res.content, toolRounds, exhausted: true };
+      if (res.reasoning) out.reasoning = res.reasoning;
+      return out;
     }
-    deps.onToolRound?.();
+    await deps.onToolRound?.();
     await deps.onToolCalls?.(res.toolCalls);
     const results = await executeToolCalls(deps.registry, res.toolCalls);
-    messages.push({ role: "assistant", content: res.content, toolCalls: res.toolCalls });
-    for (const r of results) {
-      messages.push({ role: "tool", toolCallId: r.toolCallId, name: r.name, content: r.content });
-    }
+    const round: ToolRound = { content: res.content, calls: res.toolCalls, results };
+    if (res.reasoning) round.reasoning = res.reasoning;
+    // The next round continues with the round's full conversation: text,
+    // reasoning (sent back so a reasoning model continues its own thinking)
+    // and the tool results.
+    const assistant: ChatMessage = { role: "assistant", content: res.content, toolCalls: res.toolCalls };
+    if (res.reasoning) assistant.reasoningContent = res.reasoning;
+    messages.push(assistant);
+    for (const r of results) messages.push(r);
+    deps.onRoundComplete?.(round);
     toolRounds++;
   }
 }
