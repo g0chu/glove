@@ -1,13 +1,13 @@
 import { ChannelType, type GuildTextBasedChannel } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, chimeTranscript, endWithTrigger, prefixEndIndex, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
-import { decideChime, formatChimeNo } from "./bot/chime.js";
+import { decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { ChannelActivity } from "./bot/quiet.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMention } from "./bot/router.js";
 import { ResponseWriter, SAFE_MENTIONS, type PostedReply } from "./bot/writer.js";
-import { LlmClient, isInterruptedError } from "./llm/client.js";
+import { LlmClient, isInterruptedError, type ChatMessage } from "./llm/client.js";
 import { ChatPersistence } from "./llm/persist.js";
 import {
   ChannelContextStore,
@@ -67,9 +67,11 @@ async function main(): Promise<void> {
     : null;
   // The effective compaction budget: the configured value, or — when
   // CONTEXT_COMPACTION_MAX_TOKENS is empty (compactionAuto) — derived from
-  // the llama-server's context window once a probe succeeds (window minus
-  // the completion headroom). The configured value stays the fallback until
-  // the derivation happens; a too-small window gives up after one warning.
+  // the llama-server's per-slot context window once a probe succeeds
+  // (per-slot window minus the completion headroom; llama-server splits -c
+  // across its -np slots, so a request gets one slot's window). The
+  // configured value stays the fallback until the derivation happens; a
+  // too-small window gives up after one warning.
   let compactionBudget = cfg.model.compactionMaxTokens;
   let compactionBudgetDerived = false;
   let compactionBudgetExhausted = false;
@@ -79,14 +81,14 @@ async function main(): Promise<void> {
     if (b === null) {
       compactionBudgetExhausted = true;
       log.warn(
-        `cannot derive the compaction budget from a context window of ${ctxSize} tokens (window minus ${COMPACT_OUTPUT_RESERVE_TOKENS} completion headroom is too small); keeping the fallback budget ${compactionBudget}`,
+        `cannot derive the compaction budget from a per-slot context window of ${ctxSize} tokens (window minus ${COMPACT_OUTPUT_RESERVE_TOKENS} completion headroom is too small); keeping the fallback budget ${compactionBudget}`,
       );
       return;
     }
     compactionBudget = b;
     compactionBudgetDerived = true;
     log.info(
-      `compaction budget set automatically: ${b} tokens (context window ${ctxSize} minus ${COMPACT_OUTPUT_RESERVE_TOKENS} completion headroom)`,
+      `compaction budget set automatically: ${b} tokens (per-slot context window ${ctxSize} minus ${COMPACT_OUTPUT_RESERVE_TOKENS} completion headroom)`,
     );
   };
   const tools = buildTools(cfg);
@@ -131,10 +133,14 @@ async function main(): Promise<void> {
 
   // The per-channel chat-activity tracker: a running turn's in-flight model
   // request is aborted on any change in the channel (a new message, an edit,
-  // a typing indicator), and after the interruption the turn waits for the
-  // channel to go quiet (no activity for DISCORD_MESSAGE_STABLE_MS) before
-  // retrying with the updated context (see runTurn). A chime turn also waits
-  // for that stillness before deciding at all (see runTurn).
+  // a typing indicator) while its PROMPT is still being processed — once the
+  // model's first token has arrived (reasoning, a tool call, or the
+  // response), the generation runs to completion and the interruption only
+  // dooms the next model call, before its prompt is sent — and after the
+  // interruption the turn waits for the channel to go quiet (no activity
+  // for DISCORD_MESSAGE_STABLE_MS) before retrying with the updated context
+  // (see runTurn). A chime turn also waits for that stillness before
+  // deciding at all (see runTurn).
   const channelActivity = new ChannelActivity();
 
   /**
@@ -149,20 +155,24 @@ async function main(): Promise<void> {
    * The turn runs in attempts. While an attempt is running, any change in
    * the channel (a new message, an edit, a typing indicator — the bot's own
    * posts and typing never count) interrupts it: the attempt's in-flight
-   * model request is aborted (its partial reply is withdrawn, its thinking
-   * line kept), the turn then waits for the channel to go quiet (no
-   * activity for DISCORD_MESSAGE_STABLE_MS), and the interrupted turn is
-   * judged: superseded (a newer turn will answer the channel — any newer
-   * committed message for a chime decision, a newer pending mention turn
-   * for a mention) it is DISCARDED — never completed later, nothing
-   * recorded — so the model responds to the newest information through the
-   * newer turn's own reply; not superseded (an edit or a typing indicator
-   * interrupted the attempt, so nothing else will answer) it retries with
-   * a freshly built context, which carries everything that arrived or
-   * changed while it waited, so the new prompt is sent with the new
-   * information. An interrupted attempt records nothing either way: the
-   * channel context (and the model's history) keep only the attempt that
-   * completes.
+   * model request is aborted while its prompt is still being processed
+   * (before the model's first token — reasoning, tool calls and response
+   * generation are never cut off mid-flight, so an activity during a tool
+   * execution or a running generation interrupts the NEXT model call,
+   * before its prompt is sent; the partial reply of a pre-first-token
+   * interruption is withdrawn, its thinking line kept), the turn then waits
+   * for the channel to go quiet (no activity for DISCORD_MESSAGE_STABLE_MS),
+   * and the interrupted turn is judged: superseded (a newer turn will answer
+   * the channel — any newer committed message for a chime decision, a newer
+   * pending mention turn for a mention) it is DISCARDED — never completed
+   * later, nothing recorded — so the model responds to the newest
+   * information through the newer turn's own reply; not superseded (an edit
+   * or a typing indicator interrupted the attempt, so nothing else will
+   * answer) it retries with a freshly built context, which carries
+   * everything that arrived or changed while it waited, so the new prompt is
+   * sent with the new information. An interrupted attempt records nothing
+   * either way before tools execute. Once tools have executed, a failed
+   * continuation stops and records their results instead of retrying.
    *
    * A chime turn decides over a still conversation: before the decision it
    * waits for complete stillness (no activity for DISCORD_MESSAGE_STABLE_MS,
@@ -224,7 +234,9 @@ async function main(): Promise<void> {
         // the writer; the compaction summarizer and the chime decision use
         // a plain wrapper on the same account (their text is never posted).
         // The attempt's abort signal rides along: channel activity aborts
-        // the in-flight call (and dooms the next one). The compaction
+        // the in-flight call while its prompt is still being processed
+        // (after the first token the call runs to completion) and dooms the
+        // next one (it fails at once at the entry check). The compaction
         // summarizer is the exception — it takes no signal (it is context
         // maintenance, not the prompt being answered, and an aborted
         // summarization must not fall into the emergency-trim path).
@@ -240,13 +252,13 @@ async function main(): Promise<void> {
               signal,
             ),
         );
-        const plainChat: ChatFn = tokens.track((msgs, cbs, tools, signal) => llm.chat(msgs, cbs, tools, signal));
+        const plainChat: ChatFn = tokens.track((msgs, cbs, tools, signal, options) => llm.chat(msgs, cbs, tools, signal, options));
         // The attempt's conversation, recorded when the attempt completes:
         // each executed round (the model's text, its reasoning, its calls,
         // the results, and the ids its narration settled to) plus the final
         // reply (its chunk ids). Recorded once — success or failure — so
         // the model's history carries the full turn, not just the final
-        // reply; an interrupted attempt records nothing at all.
+        // reply; a pre-tool interrupted attempt records nothing.
         const rounds: ToolRound[] = [];
         const roundSettled: Array<PostedReply | null> = [];
         try {
@@ -331,19 +343,80 @@ async function main(): Promise<void> {
             // so "the newest message below" in the decision prompt is the
             // trigger itself. NO posts the decision + reason as a one-line
             // UI message (never tracked); null (a failed or broken decision)
-            // stays silent: no typing indicator, no message, nothing
-            // recorded.
-            const cut = prefixEndIndex(context, ctxOpts, turn.id);
-            const prefix = cut !== null ? messages.slice(0, cut) : messages;
+            // posts no message and records nothing. Typing is refreshed
+            // only while the decision call is running.
             // The decision sees the conversation only: no tool results, no tool
             // calls, no reasoning (a past turn's tooling is not what the
-            // decision is about, and it keeps the call small).
-            const transcript = chimeTranscript(systemPrompt.trim().length > 0 ? prefix.slice(1) : prefix);
-            const decision = await decideChime(
-              (msgs, tools, signal) => plainChat(msgs, undefined, tools, signal),
-              transcript,
-              attemptController.signal,
-            );
+            // decision is about, and it keeps the call small). The cut keeps
+            // the transcript ending at the trigger, so "the newest message
+            // below" in the decision prompt is the trigger itself.
+            const decisionOver = async (msgs: ChatMessage[]): Promise<ChimeDecision | null> => {
+              const cut = prefixEndIndex(context, ctxOpts, turn.id);
+              const prefix = cut !== null ? msgs.slice(0, cut) : msgs;
+              return decideChime(
+                (m, tools, signal, options) => plainChat(m, undefined, tools, signal, options),
+                chimeTranscript(systemPrompt.trim().length > 0 ? prefix.slice(1) : prefix),
+                attemptController.signal,
+                { sendTyping: () => textChannel.sendTyping(), intervalMs: cfg.discord.typingIntervalMs },
+              );
+            };
+            let decision: ChimeDecision | null;
+            try {
+              decision = await decisionOver(messages);
+            } catch (err) {
+              if (isInterruptedError(err)) throw err; // the turn handles the quiet-wait + retry
+              if (!isContextOverflowError(err)) throw err; // defensive: decideChime re-throws overflows only
+              // The transcript did not fit the model's context (the channel
+              // outgrew the window since the last measurement): the endpoint
+              // rejected it before generating. A decision over a shrunk
+              // context still decides over the newest message, so shrink
+              // hard (the trigger protected — it sits at the end, never
+              // among the oldest), rebuild the transcript, and retry the
+              // decision once; a second overflow falls through to the
+              // silent path below.
+              const window = contextWindowFromOverflowError(err);
+              // The estimate must fit the smaller of the compaction budget
+              // and the window minus the completion headroom (the budget
+              // alone may sit at or above the window).
+              const target =
+                window !== null
+                  ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
+                  : compactionBudget;
+              context.setMeasuredTokens(null); // it described the overfilled context
+              context.emergencyShrink(
+                turn.id,
+                target,
+                systemPrompt,
+                cfg.model.contextMaxMessages,
+                cfg.model.enableFileContents ? cfg.model.fileContentsMaxBytes : undefined,
+              );
+              log.warn(
+                `chime decision in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the decision once`,
+              );
+              const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
+              if (rebuilt === null) {
+                log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
+                return;
+              }
+              // A message that committed while the decision was in flight
+              // supersedes this one (its own turn decides over the still
+              // conversation) — re-check after the rebuild, like after the
+              // first build.
+              const newerAfter = context.newestUserEntryAfter(turn.id);
+              if (newerAfter !== null) {
+                log.info(
+                  `channel ${channelId}: chime decision for message ${turn.id} cancelled — a newer message (${newerAfter}) committed while the decision was in flight; its turn decides`,
+                );
+                return;
+              }
+              try {
+                decision = await decisionOver(rebuilt);
+              } catch (err2) {
+                if (isInterruptedError(err2)) throw err2;
+                log.warn(`chime decision in ${channelId} still overfilled after the shrink (${errMsg(err2)}); staying silent`);
+                decision = null;
+              }
+            }
             if (decision === null) {
               log.info(`channel ${channelId}: chime decision failed or was unusable for message ${turn.id}; staying silent`);
               return;
@@ -418,14 +491,8 @@ async function main(): Promise<void> {
             log.warn(
               `turn in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the turn once`,
             );
-            // The retry starts from the rebuilt (shrunk) context: the rounds the
-            // failed attempt already ran are not part of its message array, so
-            // they are not part of the conversation the model completed — drop
-            // them from the turn's record (their narration stays in the channel
-            // as posted; the model's history keeps the conversation it actually
-            // saw).
-            rounds.length = 0;
-            roundSettled.length = 0;
+            // No tools executed: runToolTurn converts continuation failures
+            // after execution into ordinary errors to prevent replay.
             const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
             if (rebuilt === null) {
               log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
@@ -441,12 +508,15 @@ async function main(): Promise<void> {
               ? "*(stopped: the model kept requesting tools past the round limit)*"
               : outcome.content;
           const posted = await writer.finish(finalText);
-          recordTurn(channelId, context, rounds, roundSettled, posted, outcome.reasoning);
+          if (context.has(turn.id)) recordTurn(channelId, context, rounds, roundSettled, posted, outcome.reasoning);
           break; // the attempt completed: the turn is done
         } catch (err) {
           if (isInterruptedError(err)) {
-            // The channel changed while the prompt was being processed
-            // (a new message, an edit, a typing indicator): the abort
+            // The channel changed (a new message, an edit, a typing
+            // indicator) while the attempt's prompt was still being
+            // processed — the interruption lands before the model's first
+            // token (a running generation is never aborted, so this path is
+            // only reached for a pre-first-token interruption): the abort
             // already happened (this error is its trace). Withdraw the
             // partial reply (the thinking line is kept in the channel, like
             // a finished round's) and wait for the channel to go quiet — no
@@ -497,7 +567,7 @@ async function main(): Promise<void> {
           }
           log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
           const posted = await writer.reportError(err);
-          recordTurn(channelId, context, rounds, roundSettled, posted, undefined);
+          if (context.has(turn.id)) recordTurn(channelId, context, rounds, roundSettled, posted, undefined);
           break;
         } finally {
           unwatch();
@@ -666,10 +736,12 @@ async function main(): Promise<void> {
       );
     }
     // Metrics on: check the llama-server is reachable, derive the automatic
-    // compaction budget from its context window, and check the budget is not
-    // at or above the window (requests would overflow the model's context
-    // before compaction could trigger — the overflow recovery would still
-    // save the turn, but avoiding it is better).
+    // compaction budget from its per-slot context window (llama-server
+    // splits -c across its -np slots — a request gets one slot's window),
+    // and check the budget is not at or above that window (requests would
+    // overflow the model's context before compaction could trigger — the
+    // overflow recovery would still save the turn, but avoiding it is
+    // better).
     if (metrics) {
       const s = await metrics.snapshot();
       if (s === null) {
@@ -681,13 +753,13 @@ async function main(): Promise<void> {
         );
       } else {
         log.info(
-          `llama-server: context window ${s.ctxSize} tokens` +
-            (s.lastRequestTokens !== null ? `, last request ${s.lastRequestTokens} tokens` : ""),
+          `llama-server: ${s.slots.length} slot(s), context window ${s.ctxSize} tokens per slot` +
+            (s.lastRequestTokens !== null ? `, largest recent request ${s.lastRequestTokens} tokens` : ""),
         );
         setAutoCompactionBudget(s.ctxSize);
         if (s.ctxSize > 0 && compactionBudget >= s.ctxSize) {
           log.warn(
-            `compaction budget ${compactionBudget} is not below the server context window ${s.ctxSize}; compaction would trigger too late`,
+            `compaction budget ${compactionBudget} is not below the per-slot context window ${s.ctxSize} (llama-server splits -c across its -np slots; a request gets one slot's window); compaction would trigger too late`,
           );
         }
       }

@@ -53,7 +53,12 @@ interface HopResult {
 /** GET one resolved URL (no redirect handling) with a capped body. */
 function oneHop(resolved: ResolvedUrl, maxBytes: number, signal: AbortSignal): Promise<HopResult> {
   return new Promise<HopResult>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
     const base: Record<string, unknown> = {
+      signal,
       port: resolved.port,
       path: resolved.path,
       method: "GET",
@@ -111,8 +116,22 @@ function oneHop(resolved: ResolvedUrl, maxBytes: number, signal: AbortSignal): P
       res.on("error", fail);
     });
     request.on("error", fail);
-    signal.addEventListener("abort", () => request.destroy(new Error("aborted")), { once: true });
     request.end();
+  });
+}
+
+/** Bound DNS waiting as well as sockets; late DNS results never start a request. */
+function abortableResolution(url: string, opts: ResolveOptions, signal: AbortSignal): Promise<ResolvedUrl> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    const onAbort = (): void => reject(new Error("aborted"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    void resolveUrl(url, opts).then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", onAbort);
+    });
   });
 }
 
@@ -135,12 +154,11 @@ export async function pinnedFetch(url: string, opts: PinnedFetchOptions): Promis
   let current = url;
   try {
     for (let hop = 0; hop <= maxRedirects; hop++) {
-      const resolved = await resolveUrl(current, {
-        allowPrivate: opts.allowPrivate,
-        resolver: opts.resolver,
-      });
       let result: HopResult;
       try {
+        controller.signal.throwIfAborted();
+        const resolved = await abortableResolution(current, opts, controller.signal);
+        controller.signal.throwIfAborted();
         result = await oneHop(resolved, opts.maxBytes, controller.signal);
       } catch (err) {
         if (controller.signal.aborted) break;

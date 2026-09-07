@@ -67,6 +67,8 @@ export interface TokenUsage {
   input: number;
   /** Generated (completion) tokens. */
   output: number;
+  /** Prompt tokens reused from the endpoint cache, when reported. */
+  cachedInput?: number;
 }
 
 /** What the model answered: text, tool calls, or both. */
@@ -84,6 +86,11 @@ export interface ToolSpec {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
+}
+
+/** Per-call controls; ordinary replies retain the endpoint defaults. */
+export interface ChatRequestOptions {
+  toolChoice?: "auto" | "required";
 }
 
 export interface LlmClientOptions {
@@ -162,7 +169,14 @@ function parseUsage(body: UsageCarrier): TokenUsage | undefined {
     const u = usage as Record<string, unknown>;
     const input = asNonNegInt(u.prompt_tokens);
     const output = asNonNegInt(u.completion_tokens);
-    if (input !== null || output !== null) return { input: input ?? 0, output: output ?? 0 };
+    if (input !== null || output !== null) {
+      const result: TokenUsage = { input: input ?? 0, output: output ?? 0 };
+      const details = u.prompt_tokens_details;
+      const cached = details && typeof details === "object"
+        ? asNonNegInt((details as Record<string, unknown>).cached_tokens) : null;
+      if (cached !== null) result.cachedInput = Math.min(cached, result.input);
+      return result;
+    }
   }
   const input = asNonNegInt(body.prompt_tokens);
   const output = asNonNegInt(body.completion_tokens);
@@ -172,7 +186,10 @@ function parseUsage(body: UsageCarrier): TokenUsage | undefined {
     const t = timings as Record<string, unknown>;
     const predicted = asNonNegInt(t.predicted_n);
     if (predicted !== null) {
-      return { input: (asNonNegInt(t.prompt_n) ?? 0) + (asNonNegInt(t.cache_n) ?? 0), output: predicted };
+      const result: TokenUsage = { input: (asNonNegInt(t.prompt_n) ?? 0) + (asNonNegInt(t.cache_n) ?? 0), output: predicted };
+      const cached = asNonNegInt(t.cache_n);
+      if (cached !== null) result.cachedInput = cached;
+      return result;
     }
   }
   return undefined;
@@ -283,40 +300,58 @@ export class LlmClient {
    * callbacks as they arrive. When `tools` is provided (and non-empty), it
    * is sent with `tool_choice: "auto"` and the result may carry `toolCalls`
    * instead of (or alongside) content. When `signal` is provided, aborting
-   * it cancels the request (the channel-activity interruption, see
-   * InterruptedError) — reported as an InterruptedError, not a timeout.
+   * it cancels the request while the PROMPT is still being processed (before
+   * the model's first token) — the channel-activity interruption (see
+   * InterruptedError), reported as an InterruptedError, never a timeout.
+   * Once generation has started (for a streamed request, the first
+   * content/reasoning/tool-call delta), the request runs to completion
+   * regardless of the signal: reasoning, tool calls and the response are
+   * never cut off mid-flight.
    */
   async chat(
     messages: ChatMessage[],
     callbacks?: StreamCallbacks,
     tools?: ToolSpec[],
     signal?: AbortSignal,
+    options?: ChatRequestOptions,
   ): Promise<ChatResult> {
     if (signal?.aborted) {
       // The caller already aborted (the channel changed before this call
-      // started): fail at once — no request goes out.
+      // started): the prompt has not been processed yet, so fail at once —
+      // no request goes out.
       throw new InterruptedError();
     }
     const cbs = callbacks ?? {};
     const controller = new AbortController();
     this.active.add(controller);
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
-    // The caller's signal aborts the request in flight (the
-    // channel-activity interruption): the fetch/stream cancels at once
-    // instead of running to the timeout.
-    const onCallerAbort = (): void => controller.abort();
+    // The caller's signal aborts the request while the prompt is still being
+    // processed (the channel-activity interruption): the fetch/stream
+    // cancels at once instead of running to the timeout. Once the model has
+    // started generating (phase.generating, set by readSse on the first
+    // token), the signal is ignored — the generation runs to completion.
+    // Non-stream requests stay interruptable throughout: their single
+    // response IS the generation, and it has only happened once the body
+    // arrives, which the client cannot observe in advance.
+    const phase = { generating: false };
+    let callerAborted = false;
+    const onCallerAbort = (): void => {
+      if (phase.generating) return;
+      callerAborted = true;
+      controller.abort();
+    };
     signal?.addEventListener("abort", onCallerAbort, { once: true });
     try {
-      const res = await this.request(messages, tools, controller);
+      const res = await this.request(messages, tools, controller, options);
       if (this.opts.stream) {
-        return await this.readSse(res, cbs);
+        return await this.readSse(res, cbs, phase);
       }
       return await this.readJson(res, cbs);
     } catch (err) {
-      if (signal?.aborted) {
-        // The caller's signal fired (the channel-activity interruption):
-        // the request was cancelled on purpose, whatever the underlying
-        // abort error is.
+      if (callerAborted) {
+        // The caller's signal fired while the prompt was still being
+        // processed (the channel-activity interruption): the request was
+        // cancelled on purpose, whatever the underlying abort error is.
         throw new InterruptedError();
       }
       if (isAbortError(err)) {
@@ -334,6 +369,7 @@ export class LlmClient {
     messages: ChatMessage[],
     tools: ToolSpec[] | undefined,
     controller: AbortController,
+    options?: ChatRequestOptions,
   ): Promise<Response> {
     let res: Response;
     const body: Record<string, unknown> = {
@@ -346,7 +382,7 @@ export class LlmClient {
         type: "function",
         function: { name: t.name, description: t.description, parameters: t.parameters },
       }));
-      body.tool_choice = "auto";
+      body.tool_choice = options?.toolChoice ?? "auto";
     }
     try {
       res = await fetch(this.opts.apiUrl, {
@@ -401,7 +437,7 @@ export class LlmClient {
     return result;
   }
 
-  private async readSse(res: Response, callbacks: StreamCallbacks): Promise<ChatResult> {
+  private async readSse(res: Response, callbacks: StreamCallbacks, phase: { generating: boolean }): Promise<ChatResult> {
     const body = res.body;
     if (!body) throw new Error("malformed model response: empty body");
     const reader = body.getReader();
@@ -455,11 +491,13 @@ export class LlmClient {
         if (delta && typeof delta === "object") {
           const content = delta.content;
           if (typeof content === "string" && content.length > 0) {
+            phase.generating = true; // first token: the request is no longer interruptible
             full += content;
             callbacks.onDelta?.(content);
           }
           const reasoning = reasoningOf(delta);
           if (reasoning.length > 0) {
+            phase.generating = true; // first token: the request is no longer interruptible
             callbacks.onReasoning?.(reasoning);
             fullReasoning += reasoning;
           }
@@ -480,6 +518,7 @@ export class LlmClient {
                 acc.arguments += JSON.stringify(fn.arguments);
               }
             }
+            phase.generating = true; // first token: the request is no longer interruptible
             calls.set(idx, acc);
           }
         }

@@ -5,14 +5,17 @@
  * per-channel context: seed, growth, compaction, emergency trim) and the
  * !clear command (fresh-chat reset), queue semantics, response writer
  * behavior (incl. multi-message streaming of long replies), the tool
- * executor and tool loop, the in-process web/file/shell/zim tools (against
- * a synthetic ZIM file built in a temp dir), the LLM client (stream +
+ * executor and tool loop, the in-process web/file/shell/zim/vault tools
+ * (against a synthetic ZIM file and a synthetic notes vault built in temp
+ * dirs), the LLM client (stream +
  * non-stream + tool calls + token usage + errors + multimodal wire shape)
  * against a local mock OpenAI-compatible server, and the llama-server
  * metrics (the /slots probe and per-turn token accounting). Run with:
  * npm test
  */
 import assert from "node:assert/strict";
+import { mock } from "node:test";
+import { pinnedFetch } from "../src/tools/web/fetcher.js";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -26,7 +29,7 @@ import { ChatPersistence } from "../src/llm/persist.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
 import { CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
-import { InterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
+import { InterruptedError, isInterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
@@ -47,6 +50,8 @@ import * as fileOps from "../src/tools/file/ops.js";
 import { ShellTools } from "../src/tools/shelltools.js";
 import { ZimReader } from "../src/tools/zim/reader.js";
 import { ZimTools, registerZimTools } from "../src/tools/zimtools.js";
+import { VaultTools, registerVaultTools, VAULT_SEARCH_SPEC } from "../src/tools/vaulttools.js";
+import { jsScan, scanBody, type BodyScanOutcome } from "../src/tools/vault/body.js";
 import { zstdCompressSync } from "node:zlib";
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
@@ -620,6 +625,64 @@ const ok = (name: string): void => {
   assert.equal(await decideChime(textChat("", true), transcript), null, "a failed call stays silent");
   ok("chime: the chime tool decides (respond + reason); plain text falls back; garbage/empty/failed stay silent");
 
+  for (const answer of [
+    '{"respond":true,"reason":"direct question"}',
+    '```json\n{"respond":true,"reason":"direct question"}\n```',
+    "**YES** — direct question", "*YES*: direct question", "`YES`: direct question",
+  ]) {
+    assert.deepEqual(await decideChime(textChat(answer), transcript), { respond: true, reason: "direct question" });
+  }
+  assert.deepEqual(await decideChime(textChat('```json\n{"respond":false,"reason":"chatter"}\n```'), transcript),
+    { respond: false, reason: "chatter" });
+  for (const answer of ["yesterday was good", "not sure", "nobody asked", "I think YES", '{"reason":"YES"}']) {
+    assert.equal(await decideChime(textChat(answer), transcript), null, "ambiguous answers never become decisions");
+  }
+  assert.equal(await decideChime(async () => ({ content: "", reasoning: "YES, perhaps", toolCalls: [] }), transcript), null);
+  assert.equal(await decideChime(async () => ({ content: "", toolCalls: [{ id: "t", name: "other", arguments: '{"respond":true}' }] }), transcript), null);
+  assert.deepEqual(await decideChime(async () => ({ content: "NO — chatter", toolCalls: [{ id: "t", name: "chime", arguments: "broken" }] }), transcript),
+    { respond: false, reason: "chatter" });
+  ok("chime: JSON and decorated decisions work; unrelated tools, reasoning and word prefixes never decide");
+
+  // Bounded compatibility recovery: required tool first, plain decision once.
+  for (const first of ["empty", "invalid", "unsupported", "multiple"] as const) {
+    const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string }> = [];
+    const recovered = await decideChime(async (messages, tools, signal, options) => {
+      requests.push({ messages, tools, choice: options?.toolChoice });
+      if (requests.length === 1) {
+        if (first === "unsupported") throw new Error("model endpoint returned HTTP 400: tool_choice is not supported");
+        if (first === "multiple") return { content: "", toolCalls: [
+          { id: "1", name: "chime", arguments: '{"respond":true}' },
+          { id: "2", name: "chime", arguments: '{"respond":false}' },
+        ] };
+        return { content: first === "empty" ? "" : "maybe", toolCalls: [] };
+      }
+      return { content: "NO — chatter", toolCalls: [] };
+    }, transcript);
+    assert.deepEqual(recovered, { respond: false, reason: "chatter" });
+    assert.equal(requests.length, 2);
+    assert.equal(requests[0].choice, "required");
+    assert.equal(requests[1].tools, undefined);
+    assert.equal(requests[1].choice, undefined);
+    assert.deepEqual(requests[1].messages.slice(0, -1), requests[0].messages, "repair preserves the message prefix");
+  }
+  let attempts = 0;
+  assert.equal(await decideChime(async () => { attempts++; return { content: "maybe", toolCalls: [] }; }, transcript), null);
+  assert.equal(attempts, 2, "unusable decisions stop after one repair");
+  for (const failure of [new Error("model endpoint returned HTTP 401: unauthorized"), new Error("model request timed out"), new Error("HTTP 500: unavailable")]) {
+    attempts = 0;
+    assert.equal(await decideChime(async () => { attempts++; throw failure; }, transcript), null);
+    assert.equal(attempts, 1, "outages and timeouts are not multiplied");
+  }
+  for (const failure of [new InterruptedError(), new Error("request (9000 tokens) exceeds the available context size (8000 tokens)")]) {
+    attempts = 0;
+    await assert.rejects(decideChime(async () => {
+      if (++attempts === 1) return { content: "maybe", toolCalls: [] };
+      throw failure;
+    }, transcript), err => err === failure);
+    assert.equal(attempts, 2, "repair propagates interruption/overflow to the turn runner");
+  }
+  ok("chime: required decisions repair once, reject conflicts, preserve the prefix and propagate cancellation/overflow");
+
   // The decision call is one request: system prompt first, then the
   // transcript (which ends with the message to decide about), and the chime
   // tool is on the wire.
@@ -664,6 +727,23 @@ const ok = (name: string): void => {
     assert.equal(seenSignal, ctrl.signal);
   }
   ok("chime: an interrupted decision is re-thrown (the turn retries); the signal rides along");
+
+  // A context-overflow rejection (the transcript outgrew the model's window
+  // since the last measurement — the endpoint's 400, llama.cpp's exact
+  // shape) is re-thrown like an interruption: the turn shrinks the context
+  // and retries the decision once. A non-overflow failure above stays null.
+  {
+    const overflowing: ChimeChat = async () => {
+      throw new Error(
+        'model endpoint returned HTTP 400 : {"error":{"code":400,"message":"request (51000 tokens) exceeds the available context size (48000 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":51000,"n_ctx":48000}}',
+      );
+    };
+    await assert.rejects(
+      decideChime(overflowing, transcript),
+      (err: unknown) => err instanceof Error && /exceeds the available context size/.test(err.message),
+    );
+  }
+  ok("chime: a context-overflow rejection is re-thrown (the turn shrinks and retries once)");
 }
 
 // ----------------------------------------------------------------- split --
@@ -789,6 +869,32 @@ const ok = (name: string): void => {
   assert.ok(secChunks[0].startsWith("# H") && secChunks[0].includes("x".repeat(60)), "heading keeps its paragraph");
   assert.equal(secChunks.join("\n").replace(/\n/g, ""), sec.replace(/\n/g, ""), "content preserved");
   ok("split: heading stays with its paragraph");
+
+  // firstMaxChars (the activity message's room): the FIRST chunk is capped
+  // to it — so a text streamed inside the message never pushes the message
+  // past 2000 — while every chunk after the first uses the normal limit.
+  const room = 1975;
+  const capChunks = splitForDiscord("a".repeat(2500), 2000, room);
+  assert.deepEqual(capChunks.map((c) => c.length), [room, 2500 - room], "first chunk capped to the room, the rest normal");
+  // A single line longer than the room but shorter than a full chunk is
+  // hard-split with the first piece under the cap.
+  const midLine = "b".repeat(1990);
+  const midChunks = splitForDiscord(midLine, 2000, room);
+  assert.deepEqual(midChunks.map((c) => c.length), [room, 1990 - room], "mid-length line honors the first cap");
+  // A fence that spans the first-chunk boundary: the closing token is still
+  // accounted for inside the capped first chunk.
+  const capFence = ["```ts", "c".repeat(room - 6), "d".repeat(300)].join("\n");
+  const capFenceChunks = splitForDiscord(capFence, 2000, room);
+  assert.ok(capFenceChunks.every((x) => x.length <= 2000), `no oversized chunk: ${capFenceChunks.map((x) => x.length).join(",")}`);
+  assert.ok(capFenceChunks[0].length <= room, "the capped first chunk keeps its cap across a fence boundary");
+  for (const c of capFenceChunks) {
+    const fenceLines = c.split("\n").filter((l) => /^\s*(`{3,}|~{3,})/.test(l)).length;
+    assert.equal(fenceLines % 2, 0, `unbalanced fences in chunk: ${JSON.stringify(c.slice(0, 40))}`);
+  }
+  // Text that fits the room is never split (even though it fits 2000).
+  assert.deepEqual(splitForDiscord("e".repeat(room), 2000, room), ["e".repeat(room)]);
+  assert.deepEqual(splitForDiscord("e".repeat(room + 1), 2000, room).map((c) => c.length), [room, 1]);
+  ok("split: firstMaxChars caps the first chunk (the activity message's room)");
 }
 
 // --------------------------------------------------------------- format --
@@ -1192,7 +1298,7 @@ const ok = (name: string): void => {
     const rRes = await rBuild;
     assert.equal(rstore.length, 0, "the late seed did not undo the clear");
     assert.equal(rstore.seeded, true);
-    assert.ok(rRes !== null && rRes.length === 0, "no seeded entries reach the request");
+    assert.equal(rRes, null, "the cleared trigger skips the request");
     ok("seed: a !clear committed while the seed fetch is in flight wins (no late re-seed)");
   }
 
@@ -2290,9 +2396,10 @@ const ok = (name: string): void => {
   ok("writer: error keeps partial text + note");
 
   // interrupt(): a prompt interrupted by channel activity withdraws the
-  // partial reply — the live (partial) messages are deleted, the thinking
-  // line completes in place (kept, like a finished round's), and the writer
-  // is done (a fresh attempt starts with a fresh writer).
+  // partial reply — the partial text is stripped out of the one activity
+  // message (it has no message of its own to delete), the thinking line
+  // completes in place (kept, like a finished round's), and the writer is
+  // done (a fresh attempt starts with a fresh writer).
   const i1 = makeChannel();
   const wi1 = new ResponseWriter({
     channel: i1.channel as unknown as GuildTextBasedChannel,
@@ -2304,14 +2411,14 @@ const ok = (name: string): void => {
   await ticks(2);
   wi1.chunk("partial");
   await ticks(2);
-  assert.equal(i1.sent.length, 2, "the thinking line + the live partial reply");
+  assert.equal(i1.sent.length, 1, "one activity message (the thinking + the live partial text)");
   assert.equal(i1.deleted.length, 0);
   await wi1.interrupt();
-  assert.deepEqual(i1.deleted, [i1.messages[1].id], "the partial reply is withdrawn");
-  assert.ok(i1.messages[0].content.startsWith("🤔"), "the thinking line completes in place");
+  assert.equal(i1.deleted.length, 0, "the partial text is stripped in place, not deleted");
+  assert.match(i1.messages[0].content, /^🤔 \*thinking it through \(\d+s\)\*$/, "the thinking line completes in place, the partial text is gone");
   assert.equal(await wi1.interrupt(), undefined, "a second interrupt is a no-op");
   assert.equal(await wi1.finish("late"), null, "the interrupted writer posts nothing more");
-  ok("writer: interrupt() withdraws the partial reply, keeps the thinking line, and finishes");
+  ok("writer: interrupt() strips the partial reply in place, keeps the thinking line, and finishes");
 
   // Interrupted before any reply content streamed: the live thinking
   // message completes into its terminal line and nothing else is withdrawn.
@@ -2632,12 +2739,15 @@ const ok = (name: string): void => {
   assert.ok(thinkLive.endsWith("*"));
   w7.chunk("The answer is 42.");
   await ticks(2);
-  assert.equal(g.sent.length, 2, "reply streams in a fresh message");
-  assert.match(g.messages[0].content, /^🤔 \*Let me think step by step\. First, the units; xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\.\.\. \(\d+s\)\*$/, "thinking completes into first-line (truncated at the tool-line length) + seconds");
-  assert.equal(g.getLive()!.content, "The answer is 42.", "reply takes over in its own message");
+  assert.equal(g.sent.length, 1, "the reply settles inside the activity message");
+  assert.match(
+    g.messages[0].content,
+    /^🤔 \*Let me think step by step\. First, the units; xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\.\.\. \(\d+s\)\*\nThe answer is 42\.$/,
+    "thinking completes into first-line (truncated at the tool-line length) + seconds, the reply settles below it in the same message",
+  );
   const p7 = await w7.finish("The answer is 42.");
   assert.equal(p7!.text, "The answer is 42.", "reasoning is not posted or recorded");
-  assert.deepEqual(p7!.messageIds, [g.messages[1].id], "only the reply message is recorded");
+  assert.deepEqual(p7!.messageIds, [], "the reply settled inside the activity message (a UI line, recorded without a backing message)");
   ok("writer: reasoning preview live-capped, completes into a first-line + seconds line, never recorded");
 
   // long multi-line thinking: header + "N lines hidden" + the last 5 lines
@@ -2767,15 +2877,13 @@ const ok = (name: string): void => {
   await ticks(2);
   assert.match(
     tMsgs[0].content,
-    /^🤔 \*Round one: gather the data\. \(\d+s\)\*\n🤔 \*Round two: analyze it\. \(\d+s\)\*\n🤔 \*Round three: answer\. \(\d+s\)\*$/,
-    "round 3 thinking completes when the reply starts",
+    /^🤔 \*Round one: gather the data\. \(\d+s\)\*\n🤔 \*Round two: analyze it\. \(\d+s\)\*\n🤔 \*Round three: answer\. \(\d+s\)\*\nThe final answer\.$/,
+    "round 3 thinking completes when the reply starts, and the reply settles below it in the same message",
   );
-  assert.equal(tMsgs.length, 2, "the reply streams in a fresh message");
-  assert.equal(tMsgs[1].content, "The final answer.", "the reply is a fresh message");
   const pT = await wT.finish("The final answer.");
   assert.equal(pT!.text, "The final answer.");
-  assert.equal(tMsgs[1].content, "The final answer.", "the reply settles in place");
-  assert.deepEqual(tMsgs.map((m) => m.deleted), [false, false], "nothing is deleted");
+  assert.deepEqual(pT!.messageIds, [], "the reply settled inside the activity message (a UI line, recorded without a backing message)");
+  assert.deepEqual(tMsgs.map((m) => m.deleted), [false], "nothing is deleted");
   ok("writer: every round's reasoning persists as its own line in the one shared activity message");
   // A round that streams both reasoning and text: the thinking line completes
   // when the text takes over, and discard() settles the text in place (keeps
@@ -2810,18 +2918,77 @@ const ok = (name: string): void => {
   await ticks(2);
   wU.chunk("transient text");
   await ticks(2);
-  assert.equal(uMsgs.length, 2, "thinking line + text preview");
-  assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*$/, "thinking completes when the text starts");
+  assert.equal(uMsgs.length, 1, "one message: the thinking line + the round's text");
+  assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*\ntransient text$/, "the thinking completes when the text starts, and the text settles below it in the same message");
   assert.equal(uMsgs[0].deleted, false);
-  assert.equal(uMsgs[1].content, "transient text");
-  wU.discard();
+  const pU = await wU.discard();
   await ticks(3);
-  assert.equal(uMsgs.length, 2, "discard() posts no second terminal line");
-  assert.equal(uMsgs[1].deleted, false, "the round's text is settled in place (not deleted)");
-  assert.equal(uMsgs[1].content, "transient text", "settled to the round's full text");
-  assert.equal(uMsgs[0].deleted, false, "the thinking line is kept");
-  assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*$/, "the thinking line is unchanged");
+  assert.equal(uMsgs.length, 1, "discard() posts no second terminal line");
+  assert.equal(uMsgs[0].deleted, false, "nothing is deleted (the text is inside the message)");
+  assert.match(uMsgs[0].content, /^🤔 \*Thinking then text\. \(\d+s\)\*\ntransient text$/, "settled to the round's full text in place");
+  assert.deepEqual(pU!.messageIds, [], "the round's text settled inside the activity message (a UI line, recorded without a backing message)");
   ok("writer: a reasoning + text round posts exactly one terminal line and keeps the text");
+
+  // A round's text that outgrows the activity message's room demotes to its
+  // own message(s) BELOW it (the channel order keeps matching the order
+  // they happened): the first slice is budgeted to the room the settled
+  // lines leave, the record keeps the slices' ids, and the next round's
+  // lines open a FRESH activity message below the overflow.
+  const dmMsgs: Array<{ id: string; content: string; deleted: boolean }> = [];
+  const dmChan = {
+    sendTyping: async (): Promise<void> => {},
+    send: async (data: { content: string }) => {
+      const m = { id: `dm${String(dmMsgs.length)}`, content: data.content, deleted: false };
+      dmMsgs.push(m);
+      return {
+        id: m.id,
+        content: m.content,
+        edit: async (u: { content: string }) => {
+          m.content = u.content;
+          return { id: m.id };
+        },
+        delete: async () => {
+          m.deleted = true;
+          return true;
+        },
+      };
+    },
+  };
+  const wD = new ResponseWriter({
+    channel: dmChan as unknown as GuildTextBasedChannel,
+    typingIntervalMs: 3_600_000,
+    throttleMs: 0, // the test asserts the live edits, not their throttling
+  });
+  wD.start();
+  wD.reason("Thinking hard.");
+  await ticks(2);
+  const demotedText = "a".repeat(2500); // more than the room the line leaves
+  wD.chunk(demotedText);
+  await ticks(3);
+  assert.equal(dmMsgs.length, 3, "the activity message + the demoted slices");
+  assert.match(dmMsgs[0].content, /^🤔 \*Thinking hard\. \(\d+s\)\*$/, "the activity message goes back to its settled lines (the text demoted out)");
+  assert.equal(dmMsgs[0].content.length + 1 + dmMsgs[1].content.length, 2000, "the first slice is budgeted exactly to the room the line left (stable across the demotion)");
+  assert.ok(dmMsgs[1].content.length + dmMsgs[2].content.length === 2500, "the demoted slices hold the whole round text");
+  const pD = await wD.discard();
+  await ticks(3);
+  assert.deepEqual(pD!.messageIds, [dmMsgs[1].id, dmMsgs[2].id], "the demoted text is recorded with its message ids (edit/delete sync stays correct)");
+  assert.equal(pD!.text, demotedText);
+  // The next round's lines open a FRESH activity message below the overflow,
+  // and the next round's short reply settles inside it.
+  wD.reason("Next round.");
+  await ticks(2);
+  assert.equal(dmMsgs.length, 4, "the next round's line opens a fresh activity message below the overflow");
+  assert.match(dmMsgs[3].content, /^🤔 \*thinking: Next round\.\*$/, "the fresh message starts with the round's live preview");
+  wD.discard();
+  await ticks(3);
+  assert.match(dmMsgs[3].content, /^🤔 \*Next round\. \(\d+s\)\*$/, "the fresh message completes the round's line in place");
+  wD.chunk("Final.");
+  await ticks(2);
+  assert.equal(dmMsgs.length, 4, "the short final reply settles inside the fresh activity message");
+  assert.match(dmMsgs[3].content, /^🤔 \*Next round\. \(\d+s\)\*\nFinal\.$/, "line then reply, in order");
+  const pDF = await wD.finish("Final.");
+  assert.deepEqual(pDF!.messageIds, [], "the in-message reply is recorded without a backing message");
+  ok("writer: a round text that outgrows the room demotes below it; the next round's lines open fresh");
 
   // The whole turn's UI lines share ONE activity message, in the order they
   // happened: each round's thinking terminal line, then that round's
@@ -2874,15 +3041,15 @@ const ok = (name: string): void => {
   wIx.chunk("The answer.");
   await ticks(2);
   const pIx = await wIx.finish("The answer.");
-  assert.equal(ixMsgs.length, 2, "one activity message + the reply, no matter how many rounds");
+  assert.equal(ixMsgs.length, 1, "ONE message holds the whole turn, no matter how many rounds");
   assert.equal(ixMsgs[0].deleted, false, "the activity message stays in the channel");
   assert.match(
     ixMsgs[0].content,
-    /^🤔 \*Round one thinking \(\d+s\)\*\n🔎 \*web_search\(query="a"\)\*\n🤔 \*Round two thinking \(\d+s\)\*\n🐚 \*shell_exec\(command="ls"\)\*\n📁 \*file_read\(path="b"\)\*\n🤔 \*Round three thinking \(\d+s\)\*$/,
-    "thinking lines and call lines interleaved in the order they happened",
+    /^🤔 \*Round one thinking \(\d+s\)\*\n🔎 \*web_search\(query="a"\)\*\n🤔 \*Round two thinking \(\d+s\)\*\n🐚 \*shell_exec\(command="ls"\)\*\n📁 \*file_read\(path="b"\)\*\n🤔 \*Round three thinking \(\d+s\)\*\nThe answer\.$/,
+    "thinking lines, call lines and the reply interleaved in the order they happened",
   );
-  assert.equal(ixMsgs[1].content, "The answer.", "the reply is the only other message");
   assert.equal(pIx!.text, "The answer.");
+  assert.deepEqual(pIx!.messageIds, [], "the reply settled inside the activity message (a UI line, recorded without a backing message)");
   ok("writer: one shared activity message holds every round's lines, in order");
 
   // A `*` from the model's reasoning (a markdown bullet or bold) must not
@@ -2918,14 +3085,14 @@ const ok = (name: string): void => {
   await ticks(2);
   assert.match(sMsgs[0].content, /^🤔 \*thinking: User gochu asks to check the logs\.\*$/, "asterisks dropped from the live preview");
   const pS = await wS.finish("ok");
-  assert.match(sMsgs[0].content, /^🤔 \*User gochu asks to check the logs\. \(\d+s\)\*$/, "asterisks dropped from the terminal line");
+  assert.match(sMsgs[0].content, /^🤔 \*User gochu asks to check the logs\. \(\d+s\)\*\nok$/, "asterisks dropped from the terminal line; the reply settles below it in the same message");
   assert.ok(!sMsgs[0].content.includes("**"), "no broken markdown in the line");
   assert.equal(pS!.text, "ok");
   ok("writer: a * in the model's reasoning cannot break the line's italics");
 
   // non-stream mode: the whole reasoning arrives at once (one reason() call,
   // no chunks); on finish the thinking line completes in place and the
-  // reply posts as a fresh message below it
+  // reply settles below it in the same message
   const n = makeChannel();
   const w9 = new ResponseWriter({
     channel: n.channel as unknown as GuildTextBasedChannel,
@@ -2937,15 +3104,14 @@ const ok = (name: string): void => {
   await ticks(2);
   assert.equal(n.sent.length, 1, "thinking preview creates the live message");
   const p9 = await w9.finish("The answer is 7.");
-  assert.equal(n.sent.length, 2, "reply posts as a fresh message");
-  assert.match(n.messages[0].content, /^🤔 \*Let me check the units first\. \(\d+s\)\*$/, "thinking line completed on finish (first line, untruncated)");
-  assert.equal(n.getLive()!.content, "The answer is 7.");
+  assert.equal(n.sent.length, 1, "the reply settles inside the activity message");
+  assert.match(n.messages[0].content, /^🤔 \*Let me check the units first\. \(\d+s\)\*\nThe answer is 7\.$/, "thinking line completed on finish (first line, untruncated), the reply below it");
   assert.equal(p9!.text, "The answer is 7.");
-  assert.deepEqual(p9!.messageIds, [n.messages[1].id], "only the reply message is recorded");
-  ok("writer: non-stream reasoning completes into a line, reply posted fresh");
+  assert.deepEqual(p9!.messageIds, [], "recorded without a backing message (the activity message is a UI line)");
+  ok("writer: non-stream reasoning completes into a line, reply settles in the same message");
 
   // reasoning-only response (no content at all): the thinking line survives
-  // and the "no response" note posts below it
+  // and the "no response" note settles below it in the same message
   const o = makeChannel();
   const w10 = new ResponseWriter({
     channel: o.channel as unknown as GuildTextBasedChannel,
@@ -2956,10 +3122,9 @@ const ok = (name: string): void => {
   w10.reason("hmm, nothing to say…");
   await ticks(2);
   const p10 = await w10.finish("");
-  assert.equal(o.sent.length, 2, "thinking line + note");
-  assert.match(o.messages[0].content, /^🤔 \*hmm, nothing to say… \(\d+s\)\*$/, "thinking line completed (first line, untruncated)");
-  assert.match(o.messages[1].content, /no response/i, "note posts as its own message");
-  assert.equal(p10!.messageIds.length, 1, "only the note is recorded");
+  assert.equal(o.sent.length, 1, "thinking line + note in the one message");
+  assert.match(o.messages[0].content, /^🤔 \*hmm, nothing to say… \(\d+s\)\*\n\*\(the model returned no response\)\*$/, "thinking line completed (first line, untruncated), the note below it");
+  assert.deepEqual(p10!.messageIds, [], "the note settled inside the activity message (recorded without a backing message)");
   ok("writer: reasoning-only turn keeps the thinking line, note posted fresh");
 
   // discard() must settle even a live message whose initial send is still in
@@ -3259,7 +3424,20 @@ const ok = (name: string): void => {
   assert.ok(!zimOnly.systemNote?.includes("web_fetch"), "web tools not advertised");
   assert.ok(!zimOnly.systemNote?.includes("file_"), "file tools not advertised");
   assert.ok(!zimOnly.systemNote?.includes("shell_exec"), "shell tool not advertised");
+  assert.ok(!zimOnly.systemNote?.includes("vault_"), "vault tools not advertised");
   assert.ok(zimOnly.systemNote?.includes("Summarize tool results"), "the common rule stays");
+  const { config: vaultOnlyCfg, errors: vaultOnlyErrs } = parseConfig({
+    ...base,
+    VAULTTOOLS_ENABLED: "true",
+    VAULT_DIR: "/tmp/vault",
+  });
+  assert.deepEqual(vaultOnlyErrs, []);
+  const vaultOnly = buildTools(vaultOnlyCfg);
+  assert.equal(vaultOnly.registry.size, 3);
+  for (const name of ["vault_search", "vault_read", "vault_links"]) {
+    assert.ok(vaultOnly.systemNote?.includes(name), `the note advertises ${name}`);
+  }
+  assert.ok(!vaultOnly.systemNote?.includes("wikipedia_"), "zim tools not advertised");
   const { config: allCfg, errors: allErrs } = parseConfig({
     ...base,
     WEBTOOLS_ENABLED: "true",
@@ -3267,10 +3445,12 @@ const ok = (name: string): void => {
     SHELLTOOLS_ENABLED: "true",
     ZIMTOOLS_ENABLED: "true",
     ZIM_FILE: "/tmp/wiki.zim",
+    VAULTTOOLS_ENABLED: "true",
+    VAULT_DIR: "/tmp/vault",
   });
   assert.deepEqual(allErrs, []);
   const all = buildTools(allCfg);
-  assert.equal(all.registry.size, 8);
+  assert.equal(all.registry.size, 11);
   for (const name of [
     "web_search",
     "web_fetch",
@@ -3280,6 +3460,9 @@ const ok = (name: string): void => {
     "shell_exec",
     "wikipedia_search",
     "wikipedia_read",
+    "vault_search",
+    "vault_read",
+    "vault_links",
   ]) {
     assert.ok(all.systemNote?.includes(name), `the note advertises ${name}`);
   }
@@ -4044,6 +4227,215 @@ const ok = (name: string): void => {
   }
 }
 
+// ---------------------------------------------------------- vault tools --
+// The vault (offline Wikipedia notes) tools, exercised against a synthetic
+// vault built in a temp dir: an index.tsv with a title collision (the
+// deduplicated "(2)" file name), notes with frontmatter and wikilinks, a
+// long note (truncation), and a body-searchable note.
+{
+  const vaultDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "glove-vaulttest-")));
+  try {
+    const note = (name: string, title: string, body: string): void => {
+      fs.writeFileSync(
+        path.join(vaultDir, `${name}.md`),
+        `---\ntitle: "${title}"\npath: "${title.replace(/ /g, "_")}"\nsource: "Wikipedia (en, 2026-06, nopic)"\n---\n\n${body}\n`,
+      );
+    };
+    note("Albert Einstein", "Albert Einstein", "German physicist. See [[Nobel Prize]] and [[Relativity]].\n\n## Life\nBorn in Ulm.\n");
+    note("Aardvark", "Aardvark", "A large pig-like animal. It eats termites and ants.\n");
+    // One title, two file names (the build deduplicates FILE names, not
+    // titles), and the title is not itself a file name — the ambiguity
+    // path (a direct file name, e.g. "A-B", still reads straight).
+    note("A-B", "A B", "First of two colliding notes. Links to [[Albert Einstein]] and [[Nobel Prize]].\n");
+    note("A-B (2)", "A B", "Second of two colliding notes (deduplicated file name).\n");
+    note("Long Note", "Long Note", "para one. ".repeat(4000));
+    note("Quantum Zzz", "Quantum Zzz", "The word zeppelinite appears here for the body scan.\n");
+    // A title whose lowercase is length-changing (U+0130 -> "i" + combining
+    // dot): the prefilter copy must stay 1:1 aligned with the lines.
+    note("İzmir", "İzmir", "A city on the Aegean.\n");
+    fs.writeFileSync(
+      path.join(vaultDir, "index.tsv"),
+      [
+        "Albert Einstein\tAlbert Einstein",
+        "Aardvark\tAardvark",
+        "A B\tA-B",
+        "A B\tA-B (2)",
+        "Long Note\tLong Note",
+        "Quantum Zzz\tQuantum Zzz",
+        "İzmir\tİzmir",
+      ].join("\n") + "\n",
+    );
+
+    // Deterministic fake body scan (test-only escape hatch): only
+    // "zeppelinite" hits one note's body; "partial" is flagged time-limited.
+    const fakeBody = async (query: string): Promise<BodyScanOutcome> => {
+      if (query.toLowerCase() === "zeppelinite") return { files: ["Quantum Zzz"], partial: false, engine: "js" };
+      if (query.toLowerCase() === "partial") return { files: ["Aardvark"], partial: true, engine: "js" };
+      return { files: [], partial: false, engine: "js" };
+    };
+    const tools = new VaultTools({ dir: vaultDir, maxResults: 8, scanBudgetMs: 5000, maxTextChars: 2000, bodyScan: fakeBody });
+
+    // -- title search: exact (case- and space/underscore-insensitive), prefix, substring
+    const ein = await tools.search("EINSTEIN", 5);
+    assert.ok(ein.includes("Offline Wikipedia vault (7 notes)"), ein);
+    assert.ok(ein.includes("1. Albert Einstein"), ein);
+    assert.ok(!ein.includes("Bodies"), "a title-only match lists no bodies");
+    const ab = await tools.search("A_B", 5);
+    assert.ok(ab.includes("1. A B [file: A-B]"), ab);
+    assert.ok(ab.includes("2. A B [file: A-B (2)]"), ab);
+    assert.ok((await tools.search("Aardv", 5)).includes("1. Aardvark"), "prefix match");
+    assert.ok((await tools.search("zzz", 5)).includes("1. Quantum Zzz"), "substring match");
+    // length-changing lowercase (U+0130): ascii and dotted queries both hit,
+    // and the extracted line stays line-aligned (exactly one title line)
+    const izAscii = await tools.search("izmir", 5);
+    assert.ok(izAscii.includes("1. İzmir"), izAscii);
+    assert.equal(izAscii.split("\n").length, 4, "header + Titles: + one hit + footer");
+    assert.ok((await tools.search("İzmir", 5)).includes("1. İzmir"), "dotted query");
+    ok("vault: title search exact/prefix/substring, case- and space-insensitive");
+
+    // -- body search (fake), the partial flag, the no-match hint
+    const bodyHit = await tools.search("zeppelinite", 5);
+    assert.ok(bodyHit.includes("Bodies (notes containing the query):"), bodyHit);
+    assert.ok(bodyHit.includes("- Quantum Zzz"), bodyHit);
+    assert.ok(!bodyHit.includes("Titles:"), "a body-only match lists no titles");
+    const partial = await tools.search("partial", 5);
+    assert.ok(partial.includes("(scan was time-limited; refine the query for more)"), partial);
+    const miss = await tools.search("definitely absent", 5);
+    assert.ok(miss.startsWith("No note in the offline Wikipedia vault"), miss);
+    assert.ok(!miss.includes("web_search"), "no hint at a tool that is not registered");
+    const withWeb = new VaultTools({
+      dir: vaultDir,
+      maxResults: 8,
+      scanBudgetMs: 5000,
+      maxTextChars: 2000,
+      bodyScan: fakeBody,
+      webSearchAvailable: true,
+    });
+    assert.ok((await withWeb.search("definitely absent", 5)).includes("web_search"));
+    withWeb.abort();
+    ok("vault: body search hits, partial flag, no-match hint only when web_search is registered");
+
+    // -- read: by title, by file stem, ambiguity, missing, traversal
+    const einRead = await tools.read("Albert Einstein");
+    assert.ok(einRead.startsWith("Wikipedia vault: Albert Einstein (Albert Einstein.md"), einRead);
+    assert.ok(einRead.includes("German physicist"), einRead);
+    assert.ok(!einRead.includes('title: "Albert Einstein"'), "the frontmatter is dropped");
+    const einUnder = await tools.read("ALBERT_EINSTEIN");
+    assert.ok(einUnder.includes("German physicist"), "spaces and underscores are interchangeable");
+    const dedup = await tools.read("A-B (2)");
+    assert.ok(dedup.includes("Second of two colliding notes"), "the deduplicated file name reads directly");
+    const first = await tools.read("A-B");
+    assert.ok(first.includes("First of two colliding notes"), "a file name reads straight");
+    await assert.rejects(tools.read("A B"), /ambiguous note "A B"/, "one title, two file names, no direct file");
+    await assert.rejects(tools.read("Nope"), /no note matching "Nope"/);
+    await assert.rejects(tools.read("../etc/passwd"), /flat/, "path traversal refused");
+    await assert.rejects(tools.read("a/b"), /flat/, "no path separators");
+    ok("vault: read by title or file, ambiguity and traversal errors");
+
+    // -- truncation and abstract mode
+    const longRead = await tools.read("Long Note");
+    assert.ok(longRead.includes("[truncated]"), longRead);
+    const abs = await tools.read("Long Note", "abstract");
+    assert.ok(abs.includes("— abstract"), abs);
+    assert.ok(abs.includes("path: Long_Note"), "the frontmatter is rendered in abstract mode");
+    assert.ok(abs.includes("[abstract cut — use mode"), abs);
+    assert.ok(abs.length < 1500, `the abstract stays small (${abs.length} chars)`);
+    ok("vault: full read truncates, abstract mode is frontmatter + note start");
+
+    // -- links
+    const links = await tools.links("Albert Einstein");
+    assert.ok(links.includes("2 wikilink(s)"), links);
+    assert.ok(links.includes("1. Nobel Prize") && links.includes("2. Relativity"), links);
+    assert.ok(links.endsWith("Follow one with vault_read."), links);
+    assert.ok((await tools.links("Aardvark")).includes("no [[wikilinks]]"), "no links reported");
+    ok("vault: wikilinks listed in order, none reported when absent");
+
+    // -- registry + executor wiring (errors surface as tool results)
+    const registry = new ToolRegistry();
+    registerVaultTools(registry, tools);
+    assert.equal(registry.size, 3);
+    const res = await executeToolCalls(registry, [
+      { id: "v1", name: "vault_search", arguments: JSON.stringify({ query: "zeppelinite", max_results: 3 }) },
+      { id: "v2", name: "vault_read", arguments: JSON.stringify({ note: "A B", mode: "weird" }) },
+      { id: "v3", name: "vault_links", arguments: JSON.stringify({ note: "Aardvark" }) },
+    ]);
+    assert.ok(res[0].content.includes("- Quantum Zzz"), res[0].content);
+    assert.ok(res[1].content.startsWith("Error:") && res[1].content.includes('must be "full" or "abstract"'), res[1].content);
+    assert.ok(res[2].content.includes("no [[wikilinks]]"), res[2].content);
+    const broken = new VaultTools({ dir: "/nonexistent/vault-dir", maxResults: 8, scanBudgetMs: 5000, maxTextChars: 2000 });
+    const brokenReg = new ToolRegistry().register(VAULT_SEARCH_SPEC, (args) => broken.search(argString(args, "query"), 5));
+    const bres = await executeToolCalls(brokenReg, [{ id: "v4", name: "vault_search", arguments: '{"query":"x"}' }]);
+    assert.ok(bres[0].content.startsWith("Error:") && bres[0].content.includes("not found"), bres[0].content);
+    ok("vault tools: registry wiring, bad args and a broken dir surface as error results");
+    tools.abort();
+
+    // -- body scan engines: the js scan directly, rg via a fake ripgrep,
+    // missing rg falling back, and the deadline killing the rg child
+    assert.deepEqual(await jsScan(vaultDir, "zeppelinite", 5000, 5), { files: ["Quantum Zzz"], partial: false, engine: "js" });
+    assert.deepEqual(await jsScan(vaultDir, "absent word", 5000, 5), { files: [], partial: false, engine: "js" });
+    const rgScript = path.join(vaultDir, "fake-rg.sh");
+    fs.writeFileSync(
+      rgScript,
+      "#!/bin/sh\nq=\"$6\"; dir=\"$7\"\nfind \"$dir\" -name '*.md' -type f | while IFS= read -r f; do\n  grep -q -i -F -- \"$q\" \"$f\" 2>/dev/null && printf '%s\\n' \"$f\"\ndone\nexit 0\n",
+    );
+    fs.chmodSync(rgScript, 0o755);
+    assert.deepEqual(await scanBody(vaultDir, "zeppelinite", 5000, 5, { rgPath: rgScript }), {
+      files: ["Quantum Zzz"],
+      partial: false,
+      engine: "rg",
+    });
+    const fallback = await scanBody(vaultDir, "zeppelinite", 5000, 5, { rgPath: "/nonexistent/rg" });
+    assert.equal(fallback.engine, "js", "a missing ripgrep falls back to the js scan");
+    assert.deepEqual(fallback.files, ["Quantum Zzz"]);
+    const slowRg = path.join(vaultDir, "fake-rg-slow.sh");
+    fs.writeFileSync(slowRg, "#!/bin/sh\nsleep 2\nexit 0\n");
+    fs.chmodSync(slowRg, 0o755);
+    const slow = await scanBody(vaultDir, "zeppelinite", 200, 5, { rgPath: slowRg });
+    assert.equal(slow.engine, "rg");
+    assert.ok(slow.partial, "the deadline kills the ripgrep child and flags partial");
+    ok("body scan: js engine, rg engine, missing-rg fallback, deadline -> partial");
+
+    // -- config
+    const { config: vc, errors: ve } = parseConfig({
+      DISCORD_TOKEN: "t",
+      DISCORD_GUILD_ID: "g",
+      MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+      VAULTTOOLS_ENABLED: "true",
+      VAULT_DIR: "/tmp/vault",
+      VAULTTOOLS_SEARCH_MAX_RESULTS: "4",
+      VAULTTOOLS_SCAN_BUDGET_S: "3",
+      VAULTTOOLS_RG_PATH: "/usr/bin/rg",
+    });
+    assert.deepEqual(ve, []);
+    assert.equal(vc.tools.vault.enabled, true);
+    assert.equal(vc.tools.vault.dir, "/tmp/vault");
+    assert.equal(vc.tools.vault.searchMaxResults, 4);
+    assert.equal(vc.tools.vault.scanBudgetMs, 3000);
+    assert.equal(vc.tools.vault.rgPath, "/usr/bin/rg");
+    const { config: vdefault } = parseConfig({
+      DISCORD_TOKEN: "t",
+      DISCORD_GUILD_ID: "g",
+      MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    });
+    assert.equal(vdefault.tools.vault.rgPath, "rg", "rgPath defaults to rg on PATH");
+    const { errors: vbad } = parseConfig({
+      DISCORD_TOKEN: "t",
+      DISCORD_GUILD_ID: "g",
+      MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+      VAULTTOOLS_ENABLED: "true",
+    });
+    assert.ok(vbad.some((e) => e.includes("VAULT_DIR")), `got: ${vbad.join("; ")}`);
+    ok("config: vault tools env parsing and the VAULT_DIR requirement");
+
+    // -- activity icon
+    const vline = formatToolCall({ id: "v9", name: "vault_read", arguments: '{"note": "Zebra"}' });
+    assert.ok(vline.startsWith("🗃"), vline);
+    ok("activity: vault tools get the cabinet icon");
+  } finally {
+    fs.rmSync(vaultDir, { recursive: true, force: true });
+  }
+}
+
 // ------------------------------------------------------------------- llm --
 {
   const seenRequests: Array<{ auth: string | undefined; ct: string | undefined; body: unknown; url: string }> = [];
@@ -4054,6 +4446,18 @@ const ok = (name: string): void => {
     req.on("end", () => {
       const url = req.url ?? "";
       seenRequests.push({ auth: req.headers.authorization, ct: req.headers["content-type"], body: JSON.parse(body), url });
+      if (url.includes("chime-recovery")) {
+        const request = JSON.parse(body);
+        if (request.tools) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "tool_choice required is unsupported" } }));
+        } else {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "NO — this is chatter" } }] })}\n\n`);
+          res.end("data: [DONE]\n\n");
+        }
+        return;
+      }
       if (url.includes("slow")) {
         setTimeout(() => {
           res.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -4063,11 +4467,36 @@ const ok = (name: string): void => {
         }, 300);
         return;
       }
-      if (url.includes("hold")) {
+      if (url.includes("tokenhold")) {
+        // Prefill ends after ONE token: the content delta arrives, then the
+        // stream pauses (the generation an abort may not cut) and completes
+        // — an abort after the first token must be ignored, and the
+        // request resolves with what was generated.
         res.writeHead(200, { "Content-Type": "text/event-stream" });
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "start" } }] })}\n\n`);
-        // deliberately no [DONE] and no end(): the stream stays open until
-        // the client aborts it
+        setTimeout(() => {
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: " end" } }] })}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }, 200);
+        return;
+      }
+      if (url.includes("hold")) {
+        // Pure prefill hold: no token is ever sent — the request sits in
+        // prompt processing (interruptable) until the client aborts it.
+        // Deliberately no data, no [DONE] and no end(): the stream stays
+        // open until aborted.
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        return;
+      }
+      if (url.includes("slowjson")) {
+        // Non-stream with a delayed body: the single response has only
+        // happened once it arrives, which the client cannot observe in
+        // advance — the call stays interruptable throughout.
+        setTimeout(() => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ choices: [{ message: { content: "slow non-stream" } }] }));
+        }, 300);
         return;
       }
       if (url.includes("err500")) {
@@ -4142,7 +4571,7 @@ const ok = (name: string): void => {
         // Non-stream: an OpenAI-style usage block.
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
-          JSON.stringify({ choices: [{ message: { content: "done" } }], usage: { prompt_tokens: 123, completion_tokens: 45, total_tokens: 168 } }),
+          JSON.stringify({ choices: [{ message: { content: "done" } }], usage: { prompt_tokens: 123, completion_tokens: 45, total_tokens: 168, prompt_tokens_details: { cached_tokens: 100 } } }),
         );
         return;
       }
@@ -4294,7 +4723,7 @@ const ok = (name: string): void => {
     stream: false,
     timeoutMs: 5000,
   }).chat([]);
-  assert.deepEqual(uJson.usage, { input: 123, output: 45 });
+  assert.deepEqual(uJson.usage, { input: 123, output: 45, cachedInput: 100 });
   const uLegacy = await new LlmClient({
     apiUrl: `${base}/v1/usagelegacy`,
     apiKey: "none",
@@ -4304,7 +4733,7 @@ const ok = (name: string): void => {
   }).chat([]);
   assert.deepEqual(uLegacy.usage, { input: 77, output: 8 }, "legacy top-level counters");
   const uTimings = await new LlmClient({ apiUrl: `${base}/v1/usagetime`, apiKey: "none", model: "m", stream: true, timeoutMs: 5000 }).chat([]);
-  assert.deepEqual(uTimings.usage, { input: 59, output: 18 }, "timings: prompt_n + cache_n / predicted_n");
+  assert.deepEqual(uTimings.usage, { input: 59, output: 18, cachedInput: 55 }, "timings: prompt_n + cache_n / predicted_n");
   const uChunk = await new LlmClient({ apiUrl: `${base}/v1/usagechunk`, apiKey: "none", model: "m", stream: true, timeoutMs: 5000 }).chat([]);
   assert.deepEqual(uChunk.usage, { input: 9, output: 3 }, "the usage block beats timings");
   assert.equal(full.usage, undefined, "no usage fields anywhere -> no usage");
@@ -4343,9 +4772,12 @@ const ok = (name: string): void => {
   assert.match((r2.reason as Error).message, /timed out/);
   ok("llm: abort() cancels all in-flight requests, not just the latest");
 
-  // The caller's signal (the channel-activity interruption) interrupts an
-  // in-flight request: it is reported as an InterruptedError — not a
-  // timeout — and a pre-aborted signal fails the request at once.
+  // The caller's signal (the channel-activity interruption) interrupts a
+  // request while its PROMPT is still being processed (before the model's
+  // first token): it is reported as an InterruptedError — not a timeout —
+  // and a pre-aborted signal fails the request at once (no request goes
+  // out). (The /v1/hold route sends no token, so the request stays in
+  // prefill until aborted.)
   {
     const pre = new AbortController();
     pre.abort();
@@ -4363,7 +4795,52 @@ const ok = (name: string): void => {
     await assert.rejects(p, InterruptedError);
     assert.ok(Date.now() - t1 < 5000, "the signal cancels promptly, not at the timeout");
   }
-  ok("llm: the caller's signal interrupts in-flight requests (InterruptedError, not a timeout)");
+  ok("llm: the caller's signal interrupts prefill (InterruptedError, not a timeout)");
+
+  // Once generation has started (the first token arrived), the signal is
+  // ignored: reasoning, tool calls and the response run to completion and
+  // the request RESOLVES with what was generated.
+  {
+    const tokenClient = new LlmClient({
+      apiUrl: `${base}/v1/tokenhold`,
+      apiKey: "none",
+      model: "local",
+      stream: true,
+      timeoutMs: 5000,
+    });
+    const gen = new AbortController();
+    let resolveDelta: () => void = () => {};
+    const deltaArrived = new Promise<void>((r) => (resolveDelta = r));
+    const p = tokenClient.chat(
+      [{ role: "user", content: "gen" }],
+      { onDelta: () => resolveDelta() },
+      undefined,
+      gen.signal,
+    );
+    await deltaArrived;
+    gen.abort(); // the first token has arrived: this must be ignored
+    const res = await p;
+    assert.equal(res.content, "start end", "the generation ran to completion despite the abort");
+  }
+  ok("llm: an abort after the first token is ignored (the generation runs to completion)");
+
+  // Non-stream calls stay interruptable throughout: their single response
+  // has only happened once the body arrives, which the client cannot
+  // observe in advance — a mid-flight abort still reports InterruptedError.
+  {
+    const ns = new AbortController();
+    const p = new LlmClient({
+      apiUrl: `${base}/v1/slowjson`,
+      apiKey: "none",
+      model: "local",
+      stream: false,
+      timeoutMs: 60_000,
+    }).chat([{ role: "user", content: "ns" }], undefined, undefined, ns.signal);
+    await ticks(3);
+    ns.abort();
+    await assert.rejects(p, InterruptedError);
+  }
+  ok("llm: non-stream requests stay interruptable (InterruptedError, not a timeout)");
 
   await assert.rejects(
     new LlmClient({ apiUrl: `${base}/v1/err500`, apiKey: "none", model: "m", stream: false, timeoutMs: 5000 }).chat([]),
@@ -4412,6 +4889,9 @@ const ok = (name: string): void => {
   assert.equal(toolsWire[0].type, "function");
   assert.equal((toolsWire[0].function as Record<string, unknown>).name, "web_search");
   assert.equal(toolBody.tool_choice, "auto");
+  const trackedToolChat = new TurnTokens().track((messages, callbacks, tools, signal, options) => toolClient.chat(messages, callbacks, tools, signal, options));
+  await trackedToolChat([{ role: "user", content: "decide" }], undefined, [CHIME_TOOL_SPEC], undefined, { toolChoice: "required" });
+  assert.equal((seenRequests.at(-1)!.body as Record<string, unknown>).tool_choice, "required", "required tool choice survives accounting and reaches HTTP");
   const wireMsgs = toolBody.messages as Array<Record<string, unknown>>;
   assert.equal(wireMsgs[1].role, "assistant");
   const wireTcs = wireMsgs[1].tool_calls as Array<Record<string, unknown>>;
@@ -4466,6 +4946,19 @@ const ok = (name: string): void => {
   assert.equal("reasoning_content" in rtWire[3], false, "tool messages never carry it");
   ok("llm: assistant reasoning round-trips as reasoning_content on the wire");
 
+  const recoveryClient = new LlmClient({ apiUrl: `${base}/v1/chime-recovery`, apiKey: "none", model: "local", stream: true, timeoutMs: 5000 });
+  const account = new TurnTokens();
+  const recoveryChat = account.track((messages, callbacks, tools, signal, options) => recoveryClient.chat(messages, callbacks, tools, signal, options));
+  const requestStart = seenRequests.length;
+  assert.deepEqual(await decideChime((messages, tools, signal, options) => recoveryChat(messages, undefined, tools, signal, options), [{ role: "user", content: "hello" }]),
+    { respond: false, reason: "this is chatter" });
+  const recoveryRequests = seenRequests.slice(requestStart).map(r => r.body as Record<string, unknown>);
+  assert.equal(recoveryRequests.length, 2);
+  assert.equal(recoveryRequests[0].tool_choice, "required");
+  assert.equal(recoveryRequests[1].tools, undefined);
+  assert.equal(recoveryRequests[1].tool_choice, undefined);
+  ok("chime: real HTTP tool rejection recovers through accounting and streamed plain-text parsing");
+
   server.close();
 }
 
@@ -4473,7 +4966,10 @@ const ok = (name: string): void => {
 {
   // The /slots probe: parses and aggregates the llama-server's slot report
   // (trailing slash on the base URL tolerated), and fails soft to null on
-  // every kind of failure.
+  // every kind of failure. The aggregated window is ONE slot's n_ctx (the
+  // smallest — llama-server splits -c across its -np slots, so a request
+  // gets one slot's window; the sum would be -np times too large), and the
+  // use is the largest slot's last-request token count.
   let slotsResponse: { status: number; body: string } | "slow" = {
     status: 200,
     body: JSON.stringify([
@@ -4499,8 +4995,8 @@ const ok = (name: string): void => {
       { id: 0, ctxSize: 4096, lastRequestTokens: 1234, processing: true },
       { id: 1, ctxSize: 8192, lastRequestTokens: 66, processing: false },
     ],
-    ctxSize: 12288,
-    lastRequestTokens: 1300,
+    ctxSize: 4096, // the per-slot window (the smallest slot's n_ctx), not the sum
+    lastRequestTokens: 1234, // the largest slot's last request, not the sum
     processing: true,
   });
   slotsResponse = { status: 500, body: "boom" };
@@ -4550,6 +5046,127 @@ const ok = (name: string): void => {
   assert.equal(deriveCompactionBudget(4096), null, "window minus headroom too small");
   assert.equal(deriveCompactionBudget(1000), null);
   ok("metrics: the automatic budget = window minus completion headroom (too-small window -> null)");
+}
+
+// ---------------------------------------------------- regression fixes --
+{
+  for (const mutation of ["clear", "delete", "edit", "arrival", "failure"] as const) {
+    const context = new ChannelContext();
+    context.seeded = true;
+    for (let i = 1; i <= 4; i++) context.pushUser("User", "old text ".repeat(20), String(i), i, []);
+    let resolve!: (text: string) => void;
+    let reject!: (err: Error) => void;
+    const pending = buildChannelContext({} as GuildTextBasedChannel, context, "4", {
+      botId: "bot", botName: "Bot", systemPrompt: "", maxMessages: 20,
+      enableImages: false, imagesMaxBytes: 1024, enableFileContents: false,
+      fileContentsMaxBytes: 1024, maxTokens: 1, keepMessages: 1,
+      summarize: () => new Promise<string>((yes, no) => { resolve = yes; reject = no; }),
+    });
+    if (mutation === "clear") {
+      context.reset();
+      context.pushUser("User", "new conversation", "5", 5, []);
+    } else if (mutation === "delete") context.removeById("1");
+    else if (mutation === "edit") context.updateContent("1", "corrected text");
+    else context.pushUser("User", "new message", "5", 5, []);
+    const expected = context.serialize();
+    if (mutation === "failure") reject(new Error("summarizer failed"));
+    else resolve("stale summary");
+    const built = await pending;
+    assert.deepEqual(context.serialize(), expected, "stale compaction must neither apply nor emergency-trim");
+    if (mutation === "clear") assert.equal(built, null, "cleared trigger skips the turn");
+  }
+  ok("compaction: concurrent clears, deletes, edits and arrivals preserve current context even on summarizer failure");
+}
+{
+  for (const failure of [new InterruptedError(), new Error("request (9000 tokens) exceeds the available context size (8000 tokens)")]) {
+    let executions = 0;
+    let requests = 0;
+    const context = new ChannelContext();
+    const registry = new ToolRegistry().register({ name: "write", description: "", parameters: {} }, async () => {
+      executions++;
+      return "operation completed";
+    });
+    const rounds: Parameters<ChannelContext["appendTurn"]>[0] = [];
+    const run = () => runToolTurn([{ role: "user", content: "do it" }], {
+      registry, maxRounds: 3,
+      chat: async () => {
+        if (++requests === 1) return { content: "writing", toolCalls: [{ id: "write1", name: "write", arguments: "{}" }] };
+        throw failure;
+      },
+      onRoundComplete: (round) => { rounds.push({ ...round, ids: [] }); },
+    });
+    // Same classification as the turn runner: retry only interruption/overflow;
+    // all other failures record completed rounds through the ordinary error path.
+    try { await run(); assert.fail("expected continuation failure"); } catch (err) {
+      if (isInterruptedError(err) || isContextOverflowError(err)) await run();
+      else context.appendTurn(rounds, { content: String(err), ids: [] });
+    }
+    assert.equal(executions, 1);
+    assert.equal(requests, 2);
+    assert.equal(context.snapshot().filter(e => e.role === "tool")[0]?.content, "operation completed");
+    assert.match(context.snapshot().at(-1)!.content, /automatic retry was skipped/);
+    await assert.rejects(runToolTurn([], { registry, maxRounds: 3, chat: async () => { throw failure; } }), err => err === failure);
+  }
+  ok("loop: interruption and overflow after execution retain results without replay; pre-tool failures remain retryable");
+}
+{
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    let finishDns!: (ips: string[]) => void;
+    const pending = pinnedFetch("http://example.test", {
+      timeoutMs: 100, maxBytes: 1024,
+      resolver: () => new Promise(resolve => { finishDns = resolve; }),
+    });
+    const checked = assert.rejects(pending, /timed out/);
+    mock.timers.tick(100);
+    await checked; // resolves even though DNS is still pending
+    finishDns(["127.0.0.1"]);
+    await ticks(2); // late rejection is handled, no socket is started
+    let resolutions = 0;
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(pinnedFetch("http://example.test", {
+      timeoutMs: 100, maxBytes: 1024, signal: controller.signal,
+      resolver: async () => { resolutions++; return ["127.0.0.1"]; },
+    }), /aborted/);
+    assert.equal(resolutions, 0, "already aborted fetch does not resolve DNS");
+    const duringDns = new AbortController();
+    const aborted = pinnedFetch("http://example.test", {
+      timeoutMs: 100, maxBytes: 1024, signal: duringDns.signal,
+      resolver: () => new Promise(() => {}),
+    });
+    const abortCheck = assert.rejects(aborted, /aborted/);
+    duringDns.abort();
+    await abortCheck;
+  } finally { mock.timers.reset(); }
+  ok("web fetch: deadline and external abort bound DNS waiting, including pre-aborted requests");
+}
+{
+  mock.timers.enable({ apis: ["setInterval"] });
+  try {
+    for (const outcome of ["yes", "no", "broken", "failure", "interrupted", "overflow"] as const) {
+      let typing = 0;
+      let finish!: (result: ChatResult) => void;
+      let fail!: (error: Error) => void;
+      const response = new Promise<ChatResult>((resolve, reject) => { finish = resolve; fail = reject; });
+      const pending = decideChime(() => response, [], undefined,
+        { sendTyping: async () => { typing++; }, intervalMs: 100 });
+      const checked = outcome === "interrupted" || outcome === "overflow" ? assert.rejects(pending) : pending;
+      assert.equal(typing, 1, "decision starts typing immediately");
+      mock.timers.tick(100);
+      assert.equal(typing, 2, "typing refreshes during the decision");
+      if (outcome === "failure") fail(new Error("offline"));
+      else if (outcome === "interrupted") fail(new InterruptedError());
+      else if (outcome === "overflow") fail(new Error("request (9000 tokens) exceeds the available context size (8000 tokens)"));
+      else finish({ content: outcome === "broken" ? "garbage" : outcome, toolCalls: [] });
+      await checked;
+      mock.timers.tick(500);
+      assert.equal(typing, 2, "all exit paths stop refreshing typing");
+    }
+    assert.equal((await decideChime(async () => ({ content: "yes", toolCalls: [] }), [], undefined,
+      { sendTyping: async () => { throw new Error("Discord unavailable"); }, intervalMs: 100 }))?.respond, true);
+  } finally { mock.timers.reset(); }
+  ok("chime: typing starts and refreshes during decisions, stops on every outcome, and tolerates Discord errors");
 }
 
 console.log(`\n${checks} check groups passed`);

@@ -150,7 +150,7 @@ export function compactionTranscript(summary: string | null, older: ContextEntry
 }
 
 /** The outcome of a compaction attempt (an empty fold and a failed summarizer are distinct). */
-export type CompactionResult = { ok: true } | { ok: false; reason: "nothing-to-fold" | "summarizer" };
+export type CompactionResult = { ok: true } | { ok: false; reason: "nothing-to-fold" | "summarizer" | "changed" };
 
 /**
  * One channel's persistent context: an optional summary of the compacted
@@ -158,6 +158,7 @@ export type CompactionResult = { ok: true } | { ok: false; reason: "nothing-to-f
  */
 export class ChannelContext {
   private summary: string | null = null;
+  private revision = 0;
   private readonly entries: ContextEntry[] = [];
   /** Whether the startup seed (the channel's last N messages) has been taken in. */
   seeded = false;
@@ -180,6 +181,11 @@ export class ChannelContext {
    */
   onChange?: () => void;
 
+  private changed(): void {
+    this.revision++;
+    this.onChange?.();
+  }
+
   /** Append an arrival (a human's or another bot's message; `bot` labels it "(bot)" in the context). */
   pushUser(
     name: string,
@@ -192,7 +198,7 @@ export class ChannelContext {
     const entry: ContextEntry = { role: "user", content, ids: [id], name, ts, attachments: [...attachments] };
     if (bot) entry.bot = true;
     this.entries.push(entry);
-    this.onChange?.();
+    this.changed();
     return entry;
   }
 
@@ -213,7 +219,7 @@ export class ChannelContext {
     if (extra?.reasoning) entry.reasoning = extra.reasoning;
     if (extra?.toolCalls) entry.toolCalls = [...extra.toolCalls];
     this.entries.push(entry);
-    this.onChange?.();
+    this.changed();
     return entry;
   }
 
@@ -221,7 +227,7 @@ export class ChannelContext {
   pushTool(name: string, toolCallId: string, content: string): ContextEntry {
     const entry: ContextEntry = { role: "tool", content, ids: [], ts: Date.now(), attachments: [], name, toolCallId };
     this.entries.push(entry);
-    this.onChange?.();
+    this.changed();
     return entry;
   }
 
@@ -288,7 +294,7 @@ export class ChannelContext {
     const entry = this.find(messageId);
     if (entry) {
       entry.content = content;
-      this.onChange?.();
+      this.changed();
     }
   }
 
@@ -301,7 +307,7 @@ export class ChannelContext {
     const entry = this.find(messageId);
     if (entry) {
       entry.attachments = [...attachments];
-      this.onChange?.();
+      this.changed();
     }
   }
 
@@ -313,7 +319,7 @@ export class ChannelContext {
     if (i === -1) return;
     entry.chunks[i] = chunkContent;
     entry.content = entry.chunks.join("\n");
-    this.onChange?.();
+    this.changed();
   }
 
   /**
@@ -326,7 +332,7 @@ export class ChannelContext {
     const i = this.entries.findIndex((e) => e.ids.includes(messageId));
     if (i === -1) return false;
     this.entries.splice(i, this.entryGroupSize(i));
-    this.onChange?.();
+    this.changed();
     return true;
   }
 
@@ -351,7 +357,7 @@ export class ChannelContext {
     this.entries.length = 0;
     this.seeded = false;
     this.measuredTokens = null;
-    this.onChange?.();
+    this.changed();
   }
 
   /**
@@ -366,7 +372,7 @@ export class ChannelContext {
     this.seeded = true;
     this.measuredTokens = null;
     this.clearedAt = Date.now();
-    this.onChange?.();
+    this.changed();
   }
 
   /** The time of the latest !clear, or null (never cleared). */
@@ -383,7 +389,7 @@ export class ChannelContext {
   setMeasuredTokens(tokens: number | null): void {
     if (this.measuredTokens === tokens) return;
     this.measuredTokens = tokens;
-    this.onChange?.();
+    this.changed();
   }
 
   get length(): number {
@@ -459,7 +465,7 @@ export class ChannelContext {
     this.entries.length = 0;
     this.entries.push(...groupConsecutiveReplies(merged));
     this.seeded = true;
-    this.onChange?.();
+    this.changed();
   }
 
   /**
@@ -527,6 +533,7 @@ export class ChannelContext {
     const older = this.entries.slice(0, keepStart);
     const transcript = compactionTranscript(this.summary, older);
     if (transcript.trim().length === 0) return { ok: false, reason: "nothing-to-fold" };
+    const revision = this.revision;
     let text: string;
     try {
       text = (
@@ -536,12 +543,14 @@ export class ChannelContext {
         ])
       ).trim();
     } catch {
-      return { ok: false, reason: "summarizer" };
+      return { ok: false, reason: this.revision === revision ? "summarizer" : "changed" };
     }
+    // Never apply a snapshot over a clear, edit, deletion, or newer arrival.
+    if (this.revision !== revision) return { ok: false, reason: "changed" };
     if (text.length === 0) return { ok: false, reason: "summarizer" };
     this.summary = text.slice(0, COMPACTION_SUMMARY_MAX_CHARS);
     this.entries.splice(0, keepStart);
-    this.onChange?.();
+    this.changed();
     return { ok: true };
   }
 
@@ -564,7 +573,7 @@ export class ChannelContext {
       // — that would leave the history invalid for the endpoint).
       this.entries.splice(i, this.entryGroupSize(i));
     }
-    this.onChange?.();
+    this.changed();
   }
 
   /**
@@ -585,7 +594,7 @@ export class ChannelContext {
     this.emergencyTrim(protectedId, targetTokens, systemPrompt, window, fileMaxBytes);
     if (this.estimateTokens(systemPrompt, window, fileMaxBytes) > targetTokens && this.summary !== null) {
       this.summary = null;
-      this.onChange?.();
+      this.changed();
     }
   }
 }

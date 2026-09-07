@@ -84,20 +84,20 @@ export interface ContextOptions {
  * The bot's own UI lines — the turn's activity message (one per turn,
  * edited in place: the thinking terminal lines and the tool-call lines
  * interleaved in the order they happened, so its first line is "🤔 *…*",
- * "🔎 *…*", "📁 *…*", "🐚 *…*", "📚 *…*" or "🔧 *…*", or the "🔧 *… N
- * earlier activity lines …*" header once the oldest lines are dropped),
- * the clear confirmation ("🧹 *…") and the chime NO line ("🔕 *chime: no
- * …", see formatChimeNo in bot/chime.ts) — are posted for humans, not
- * part of the conversation: they never enter the model context, and the
- * seed must not re-introduce them after a restart. Every icon a UI line
- * can start with must be listed here — a missed icon lets that line into
- * the context. (The tool-round narrations are NOT UI lines: they are the
- * bot's own reply text, tracked live as the round entries of the turn's
- * record — the model's history keeps the whole turn — and a persisted
- * context is never re-seeded, so the seed only sees them on a first-run
- * channel, where they are the model's own complete words.)
+ * "🔎 *…*", "📁 *…*", "🐚 *…*", "📚 *…*", "🗃 *…*" or "🔧 *…*", or the
+ * "🔧 *… N earlier activity lines …*" header once the oldest lines are
+ * dropped), the clear confirmation ("🧹 *…") and the chime NO line ("🔕
+ * *chime: no …", see formatChimeNo in bot/chime.ts) — are posted for
+ * humans, not part of the conversation: they never enter the model
+ * context, and the seed must not re-introduce them after a restart. Every
+ * icon a UI line can start with must be listed here — a missed icon lets
+ * that line into the context. (The tool-round narrations are NOT UI lines:
+ * they are the bot's own reply text, tracked live as the round entries of
+ * the turn's record — the model's history keeps the whole turn — and a
+ * persisted context is never re-seeded, so the seed only sees them on a
+ * first-run channel, where they are the model's own complete words.)
  */
-const BOT_UI_RE = /^(?:🤔|🔎|📁|🐚|🔧|📚|🧹|🔕) \*/;
+const BOT_UI_RE = /^(?:🤔|🔎|📁|🐚|🔧|📚|🗃|🧹|🔕) \*/;
 
 /**
  * Build the `messages` array for a turn from the channel's persistent
@@ -158,13 +158,14 @@ export async function buildChannelContext(
       log.info(
         `channel context filled the budget (${measured !== null ? `measured ${measured}` : `estimated ${estimate}`} tokens > ${opts.maxTokens}); compacted to a summary + ${context.length} recent message(s)`,
       );
-    } else {
+    } else if (res.reason !== "changed") {
       log.warn(
         `context compaction did not apply (${res.reason}); trimming the oldest messages to fit the budget`,
       );
       context.emergencyTrim(mentionId, opts.maxTokens, opts.systemPrompt, opts.maxMessages, fileCost);
     }
   }
+  if (!context.has(mentionId)) return null;
   return contextToMessages(context, opts);
 }
 

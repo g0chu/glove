@@ -138,11 +138,29 @@ export interface ZimToolsConfig {
   scanBudgetMs: number;
 }
 
+/**
+ * Vault tool family (in-process): search and read notes of a local
+ * offline Wikipedia vault of markdown notes (one flat note per article,
+ * built by the wiki2vault project — see src/tools/vault/).
+ */
+export interface VaultToolsConfig {
+  enabled: boolean;
+  /** Path to the vault directory (required when enabled). */
+  dir: string;
+  /** Hard cap on search results (the tool arg is clamped to this). */
+  searchMaxResults: number;
+  /** Time budget (ms) for the title scan and the body scan. */
+  scanBudgetMs: number;
+  /** The ripgrep binary for the body scan ("rg" = from PATH; a missing binary falls back to a bounded JS scan). */
+  rgPath: string;
+}
+
 export interface ToolsConfig {
   web: WebToolsConfig;
   file: FileToolsConfig;
   shell: ShellToolsConfig;
   zim: ZimToolsConfig;
+  vault: VaultToolsConfig;
   /** Max tool-execution rounds per turn before the turn is cut off. */
   maxRounds: number;
   /** Hard cap on characters in one tool result (all families). */
@@ -286,6 +304,13 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
         searchMaxResults: intEnv("ZIMTOOLS_SEARCH_MAX_RESULTS", 8, 1),
         scanBudgetMs: intEnv("ZIMTOOLS_SCAN_BUDGET_S", 10, 1) * 1000,
       },
+      vault: {
+        enabled: boolEnv("VAULTTOOLS_ENABLED", false),
+        dir: env.VAULT_DIR?.trim() ?? "",
+        searchMaxResults: intEnv("VAULTTOOLS_SEARCH_MAX_RESULTS", 8, 1),
+        scanBudgetMs: intEnv("VAULTTOOLS_SCAN_BUDGET_S", 10, 1) * 1000,
+        rgPath: optional("VAULTTOOLS_RG_PATH", "rg"),
+      },
       maxRounds: intEnv("TOOLS_MAX_ROUNDS", 5, 1),
       maxResultChars: intEnv("TOOLS_MAX_RESULT_CHARS", 200_000, 1_000),
     },
@@ -293,6 +318,9 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
 
   if (config.tools.zim.enabled && config.tools.zim.file.length === 0) {
     errors.push("ZIM_FILE is required when ZIMTOOLS_ENABLED is true");
+  }
+  if (config.tools.vault.enabled && config.tools.vault.dir.length === 0) {
+    errors.push("VAULT_DIR is required when VAULTTOOLS_ENABLED is true");
   }
 
   // The compaction budget: an explicit CONTEXT_COMPACTION_MAX_TOKENS wins;

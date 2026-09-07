@@ -7,6 +7,7 @@ function iconFor(name: string): string {
   if (name.startsWith("web_")) return "🔎";
   if (name.startsWith("file_")) return "📁";
   if (name.startsWith("wikipedia_")) return "📚";
+  if (name.startsWith("vault_")) return "🗃";
   if (name.startsWith("shell_")) return "🐚";
   return "🔧";
 }
