@@ -39,10 +39,14 @@ npm run dev            # or: npm run build && npm start
 - **Chime** (`BOT_CHIME_ENABLED`, default off): non-mention messages from
   humans or other bots queue a decision after the channel goes quiet. The
   bot shows a typing indicator while the model decides. YES runs a normal
-  reply; NO posts a short decision and reason. A failed or unusable decision
-  gets one plain YES/NO repair attempt before staying silent. The first
+  reply; NO posts a short decision and reason. An unusable decision or tool
+  compatibility rejection gets one plain YES/NO repair attempt before staying
+  silent; timeouts and outages do not retry. Both decision requests cap output
+  at 1,024 tokens (including reasoning on compatible endpoints). The first
   request requires a tool decision; JSON and Markdown YES/NO responses are
-  also accepted. Typing refreshes stop when the decision finishes.
+  also accepted. Typing refreshes stop when the decision finishes. Failure logs
+  identify the channel and message; streaming timeouts report whether generation
+  started, distinguishing a first-token wait from unfinished generation.
 - **Recovery safety:** compaction discards stale summaries if the context
   changes while the model is summarizing. Interrupted or overflowing turns
   retry only before tools execute. After execution, the bot retains the
@@ -201,3 +205,9 @@ control how cached prompts survive intervening requests; check your installed
 version before tuning them. Chime and reply prompts have different instructions
 and tool schemas, so reuse between those request types is limited. Edits and
 compaction also change prefixes. No server settings are changed by the bot.
+
+Chime and compaction prompts can be overridden with `BOT_CHIME_PROMPT` and
+`CONTEXT_COMPACTION_PROMPT` in `.env`. Missing or blank values keep the built-in
+prompts. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
+to hide chime NO decisions in Discord while keeping their diagnostic logs
+(default: `true`). Restart the bot after changing these settings.

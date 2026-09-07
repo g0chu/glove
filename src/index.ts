@@ -311,6 +311,7 @@ async function main(): Promise<void> {
             fileContentsMaxBytes: cfg.model.fileContentsMaxBytes,
             maxTokens: compactionBudget,
             keepMessages: cfg.model.compactionKeepMessages,
+            compactionPrompt: cfg.model.compactionPrompt,
             // The summarizer is the same endpoint as the replies: one
             // plain (tool-less) chat call over the old transcript.
             summarize: async (msgs) => (await plainChat(msgs)).content,
@@ -358,6 +359,8 @@ async function main(): Promise<void> {
                 chimeTranscript(systemPrompt.trim().length > 0 ? prefix.slice(1) : prefix),
                 attemptController.signal,
                 { sendTyping: () => textChannel.sendTyping(), intervalMs: cfg.discord.typingIntervalMs },
+                { channelId, messageId: turn.id },
+                cfg.discord.chimePrompt,
               );
             };
             let decision: ChimeDecision | null;
@@ -425,7 +428,7 @@ async function main(): Promise<void> {
               log.info(
                 `channel ${channelId}: chime decision NO for message ${turn.id}: ${decision.reason || "(no reason given)"}`,
               );
-              await textChannel.send({ content: formatChimeNo(decision.reason), allowedMentions: SAFE_MENTIONS }).catch((err) => {
+              if (cfg.discord.showChimeNo) await textChannel.send({ content: formatChimeNo(decision.reason), allowedMentions: SAFE_MENTIONS }).catch((err) => {
                 log.warn(`failed to post the chime decision: ${errMsg(err)}`);
               });
               return;

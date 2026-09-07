@@ -91,6 +91,8 @@ export interface ToolSpec {
 /** Per-call controls; ordinary replies retain the endpoint defaults. */
 export interface ChatRequestOptions {
   toolChoice?: "auto" | "required";
+  /** Maximum generated tokens for this call, including reasoning at compatible endpoints. */
+  maxTokens?: number;
 }
 
 export interface LlmClientOptions {
@@ -355,7 +357,9 @@ export class LlmClient {
         throw new InterruptedError();
       }
       if (isAbortError(err)) {
-        throw new Error(`model request timed out after ${Math.round(this.opts.timeoutMs / 1000)}s`);
+        throw new Error(`model request timed out after ${Math.round(this.opts.timeoutMs / 1000)}s (${this.opts.stream
+          ? phase.generating ? "generation started but did not finish" : "waiting for first token"
+          : "waiting for complete non-stream response"})`);
       }
       throw err;
     } finally {
@@ -377,6 +381,7 @@ export class LlmClient {
       messages: messages.map(toWireMessage),
       stream: this.opts.stream,
     };
+    if (options?.maxTokens !== undefined) body.max_tokens = options.maxTokens;
     if (tools && tools.length > 0) {
       body.tools = tools.map((t) => ({
         type: "function",
