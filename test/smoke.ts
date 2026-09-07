@@ -28,7 +28,7 @@ import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextW
 import { ChatPersistence } from "../src/llm/persist.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
-import { CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
+import { CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
 import { InterruptedError, isInterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
@@ -100,6 +100,19 @@ const ok = (name: string): void => {
   assert.equal(config.discord.showToolActivity, true); // default
   assert.equal(config.discord.messageStableMs, 2000); // default
   assert.equal(config.discord.chimeEnabled, false); // default
+  assert.equal(config.discord.showChimeNo, true);
+  assert.equal(config.discord.chimePrompt, "");
+  assert.equal(config.model.compactionPrompt, "");
+  const customPrompts = parseConfig({
+    DISCORD_TOKEN: "tok", MODEL_API_URL: "http://localhost/v1/chat/completions",
+    BOT_CHIME_SHOW_NO: "false", BOT_CHIME_PROMPT: "Custom chime\nSecond line",
+    CONTEXT_COMPACTION_PROMPT: "Custom summary",
+  });
+  assert.deepEqual(customPrompts.errors, []);
+  assert.equal(customPrompts.config.discord.showChimeNo, false);
+  assert.equal(customPrompts.config.discord.chimePrompt, "Custom chime\nSecond line");
+  assert.equal(customPrompts.config.model.compactionPrompt, "Custom summary");
+  assert.ok(parseConfig({ BOT_CHIME_SHOW_NO: "invalid" }).errors.some((e) => e.includes("BOT_CHIME_SHOW_NO")));
   ok("config: parses valid env and applies defaults");
 
   const { errors: badErrors } = parseConfig({
@@ -645,9 +658,9 @@ const ok = (name: string): void => {
 
   // Bounded compatibility recovery: required tool first, plain decision once.
   for (const first of ["empty", "invalid", "unsupported", "multiple"] as const) {
-    const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string }> = [];
+    const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string; maxTokens?: number }> = [];
     const recovered = await decideChime(async (messages, tools, signal, options) => {
-      requests.push({ messages, tools, choice: options?.toolChoice });
+      requests.push({ messages, tools, choice: options?.toolChoice, maxTokens: options?.maxTokens });
       if (requests.length === 1) {
         if (first === "unsupported") throw new Error("model endpoint returned HTTP 400: tool_choice is not supported");
         if (first === "multiple") return { content: "", toolCalls: [
@@ -663,6 +676,8 @@ const ok = (name: string): void => {
     assert.equal(requests[0].choice, "required");
     assert.equal(requests[1].tools, undefined);
     assert.equal(requests[1].choice, undefined);
+    assert.equal(requests[0].maxTokens, CHIME_MAX_TOKENS);
+    assert.equal(requests[1].maxTokens, CHIME_MAX_TOKENS, "repair also bounds generation");
     assert.deepEqual(requests[1].messages.slice(0, -1), requests[0].messages, "repair preserves the message prefix");
   }
   let attempts = 0;
@@ -700,6 +715,16 @@ const ok = (name: string): void => {
   assert.deepEqual(sent.slice(1), transcript);
   assert.deepEqual(sentTools, [CHIME_TOOL_SPEC]);
   ok("chime: the decision is one call (system prompt + transcript) with the chime tool on the wire");
+
+  let customCalls = 0;
+  await decideChime(async (msgs) => {
+    assert.equal(msgs[0].content, "Custom chime\nSecond line");
+    customCalls++;
+    return { content: customCalls === 1 ? "invalid" : "NO chatter", toolCalls: [] };
+  }, transcript, undefined, undefined, undefined, "Custom chime\nSecond line");
+  assert.equal(customCalls, 2, "custom prompt also reaches the repair request");
+  await decideChime(spying, transcript, undefined, undefined, undefined, "  ");
+  assert.equal(sent[0].content, CHIME_SYSTEM_PROMPT);
 
   // The NO line posted to the channel: a UI line with the reason, truncated.
   assert.equal(formatChimeNo("just chatter"), "🔕 *chime: no — just chatter*");
@@ -1538,6 +1563,18 @@ const ok = (name: string): void => {
   assert.ok(transcript.includes("P1: old message 1"), "oldest messages in the transcript");
   assert.ok(!transcript.includes("old message 7"), "kept messages are not re-summarized");
   ok("compaction: old messages become a summary, newest kept verbatim");
+
+  const customStore = new ChannelContext();
+  customStore.pushUser("Alice", "old", "custom-old", 1, []);
+  customStore.pushUser("Alice", "new", "custom-new", 2, []);
+  await buildChannelContext(noFetch, customStore, "custom-new", {
+    ...cOpts, keepMessages: 1, maxTokens: 1, compactionPrompt: "Custom summary",
+    summarize: async (msgs) => {
+      assert.equal(msgs[0].content, "Custom summary");
+      return "custom summary result";
+    },
+  });
+  assert.equal(customStore.getSummary(), "custom summary result");
 
   // A later compaction folds the previous summary into the new one.
   cstore.pushUser("Bob", "more talk", "m2", 10000, []);
@@ -4889,6 +4926,7 @@ const ok = (name: string): void => {
   assert.equal(toolsWire[0].type, "function");
   assert.equal((toolsWire[0].function as Record<string, unknown>).name, "web_search");
   assert.equal(toolBody.tool_choice, "auto");
+  assert.equal(toolBody.max_tokens, undefined, "ordinary replies keep the endpoint output limit");
   const trackedToolChat = new TurnTokens().track((messages, callbacks, tools, signal, options) => toolClient.chat(messages, callbacks, tools, signal, options));
   await trackedToolChat([{ role: "user", content: "decide" }], undefined, [CHIME_TOOL_SPEC], undefined, { toolChoice: "required" });
   assert.equal((seenRequests.at(-1)!.body as Record<string, unknown>).tool_choice, "required", "required tool choice survives accounting and reaches HTTP");
@@ -4957,6 +4995,8 @@ const ok = (name: string): void => {
   assert.equal(recoveryRequests[0].tool_choice, "required");
   assert.equal(recoveryRequests[1].tools, undefined);
   assert.equal(recoveryRequests[1].tool_choice, undefined);
+  assert.equal(recoveryRequests[0].max_tokens, CHIME_MAX_TOKENS);
+  assert.equal(recoveryRequests[1].max_tokens, CHIME_MAX_TOKENS, "repair token limit reaches HTTP through accounting");
   ok("chime: real HTTP tool rejection recovers through accounting and streamed plain-text parsing");
 
   server.close();

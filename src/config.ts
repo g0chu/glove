@@ -28,6 +28,10 @@ export interface DiscordConfig {
    * (from any author) always respond.
    */
   chimeEnabled: boolean;
+  /** Post chime NO decisions to Discord. */
+  showChimeNo: boolean;
+  /** Custom chime system prompt; empty uses the built-in prompt. */
+  chimePrompt: string;
 }
 
 export interface ModelConfig {
@@ -61,6 +65,8 @@ export interface ModelConfig {
   compactionAuto: boolean;
   /** How many of the newest messages survive a compaction verbatim. */
   compactionKeepMessages: number;
+  /** Custom summarization system prompt; empty uses the built-in prompt. */
+  compactionPrompt: string;
   /**
    * When true, the bot uses the model side's own tokenizer counts: the
    * turn's token usage is reported per turn, the compaction trigger compares
@@ -252,6 +258,8 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       showToolActivity: boolEnv("DISCORD_SHOW_TOOL_ACTIVITY", true),
       messageStableMs: intEnv("DISCORD_MESSAGE_STABLE_MS", 2000, 0),
       chimeEnabled: boolEnv("BOT_CHIME_ENABLED", false),
+      showChimeNo: boolEnv("BOT_CHIME_SHOW_NO", true),
+      chimePrompt: optional("BOT_CHIME_PROMPT", ""),
     },
     model: {
       apiUrl,
@@ -267,6 +275,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       compactionMaxTokens: 0, // filled in below (empty env = automatic budget)
       compactionAuto: false, // filled in below
       compactionKeepMessages: intEnv("CONTEXT_COMPACTION_KEEP_MESSAGES", 20, 1),
+      compactionPrompt: optional("CONTEXT_COMPACTION_PROMPT", ""),
       metricsEnabled: boolEnv("MODEL_METRICS_ENABLED", false),
       metricsUrl: optional("MODEL_METRICS_URL", ""),
       metricsTimeoutMs: intEnv("MODEL_METRICS_TIMEOUT_MS", 5000, 100),

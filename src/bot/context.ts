@@ -76,6 +76,8 @@ export interface ContextOptions {
   maxTokens: number;
   /** How many of the newest messages survive a compaction verbatim. */
   keepMessages: number;
+  /** Custom summarization system prompt; empty uses the built-in prompt. */
+  compactionPrompt?: string;
   /** One plain (tool-less) chat call over the old transcript (production: the same model endpoint). */
   summarize: (messages: ChatMessage[]) => Promise<string>;
 }
@@ -152,7 +154,7 @@ export async function buildChannelContext(
   const estimate = context.estimateTokens(opts.systemPrompt, opts.maxMessages, fileCost);
   const size = measured !== null ? measured : estimate;
   if (size > opts.maxTokens) {
-    const res = await context.compact(opts.keepMessages, opts.summarize, mentionId);
+    const res = await context.compact(opts.keepMessages, opts.summarize, mentionId, opts.compactionPrompt);
     context.setMeasuredTokens(null);
     if (res.ok) {
       log.info(

@@ -510,6 +510,7 @@ export class ChannelContext {
     keep: number,
     summarize: (messages: ChatMessage[]) => Promise<string>,
     protectedId?: string,
+    systemPrompt?: string,
   ): Promise<CompactionResult> {
     const n = this.entries.length;
     const protectedIdx = protectedId ? this.entries.findIndex((e) => e.ids.includes(protectedId)) : -1;
@@ -538,7 +539,7 @@ export class ChannelContext {
     try {
       text = (
         await summarize([
-          { role: "system", content: COMPACTION_SYSTEM_PROMPT },
+          { role: "system", content: systemPrompt?.trim() || COMPACTION_SYSTEM_PROMPT },
           { role: "user", content: transcript },
         ])
       ).trim();

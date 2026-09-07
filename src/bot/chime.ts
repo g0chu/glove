@@ -20,6 +20,9 @@ export const CHIME_SYSTEM_PROMPT =
   "If tool calling is unavailable, answer YES or NO followed by a short reason. " +
   "Be quick with this.";
 
+/** Bound decision generation, including reasoning, so it cannot run like a full reply. */
+export const CHIME_MAX_TOKENS = 1024;
+
 /** The name of the (virtual) tool the chime decision is reported through. */
 export const CHIME_TOOL_NAME = "chime";
 
@@ -78,7 +81,12 @@ export async function decideChime(
   transcript: ChatMessage[],
   signal?: AbortSignal,
   typing?: { sendTyping: () => Promise<unknown>; intervalMs: number },
+  diagnosticContext?: { channelId: string; messageId: string },
+  systemPrompt?: string,
 ): Promise<ChimeDecision | null> {
+  const prefix = diagnosticContext
+    ? `channel ${diagnosticContext.channelId}: message ${diagnosticContext.messageId}: ` : "";
+  const warn = (message: string): void => log.warn(`${prefix}${message}`);
   let timer: ReturnType<typeof setInterval> | undefined;
   const sendTyping = async (): Promise<void> => {
     try { await typing?.sendTyping(); } catch { /* Discord typing is best-effort. */ }
@@ -88,7 +96,7 @@ export async function decideChime(
     timer = setInterval(() => { void sendTyping(); }, typing.intervalMs);
     timer.unref?.();
   }
-  const messages: ChatMessage[] = [{ role: "system", content: CHIME_SYSTEM_PROMPT }, ...transcript];
+  const messages: ChatMessage[] = [{ role: "system", content: systemPrompt?.trim() || CHIME_SYSTEM_PROMPT }, ...transcript];
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       let res: ChatResult;
@@ -99,25 +107,25 @@ export async function decideChime(
           }],
           attempt === 0 ? [CHIME_TOOL_SPEC] : undefined,
           signal,
-          attempt === 0 ? { toolChoice: "required" } : undefined,
+          attempt === 0 ? { toolChoice: "required", maxTokens: CHIME_MAX_TOKENS } : { maxTokens: CHIME_MAX_TOKENS },
         );
       } catch (err) {
         if (isInterruptedError(err) || isContextOverflowError(err)) throw err;
         // Some compatible endpoints reject tool calling. Retry those once
         // without tools, but do not double timeouts, auth errors or outages.
         if (attempt === 0 && /HTTP (400|422)\b/i.test(errMsg(err)) && /tool|function.call/i.test(errMsg(err))) {
-          log.warn("chime endpoint rejected tool calling; retrying once with a plain YES/NO decision");
+          warn("chime endpoint rejected tool calling; retrying once with a plain YES/NO decision");
           continue;
         }
-        log.warn(`chime decision failed: ${errMsg(err)}; staying silent`);
+        warn(`chime decision failed: ${errMsg(err)}; staying silent`);
         return null;
       }
       if (res.usage?.cachedInput !== undefined) {
-        log.info(`chime prompt cache: ${res.usage.cachedInput}/${res.usage.input} input tokens reused`);
+        log.info(`${prefix}chime prompt cache: ${res.usage.cachedInput}/${res.usage.input} input tokens reused`);
       }
-      const decision = parseDecision(res);
+      const decision = parseDecision(res, warn);
       if (decision !== null) return decision;
-      if (attempt === 0) log.warn("retrying unusable chime decision once with plain YES/NO output");
+      if (attempt === 0) warn("retrying unusable chime decision once with plain YES/NO output");
     }
     return null;
   } finally {
@@ -126,9 +134,9 @@ export async function decideChime(
 }
 
 /** Parse only an explicit decision, with a bounded diagnostic on failure. */
-function parseDecision(res: ChatResult): ChimeDecision | null {
+function parseDecision(res: ChatResult, warn: (message: string) => void): ChimeDecision | null {
   if (res.toolCalls.length > 1) {
-    log.warn("chime decision unusable: multiple tool calls instead of one decision");
+    warn("chime decision unusable: multiple tool calls instead of one decision");
     return null;
   }
   const call = res.toolCalls.find((c) => c.name === CHIME_TOOL_NAME);
@@ -150,7 +158,7 @@ function parseDecision(res: ChatResult): ChimeDecision | null {
         : res.reasoning?.trim()
           ? "reasoning-only response (no final answer or chime call)"
           : "empty response (no final answer or chime call)";
-  log.warn(`chime decision unusable: ${truncate(detail, 350)}`);
+  warn(`chime decision unusable: ${truncate(detail, 350)}`);
   return null;
 }
 
