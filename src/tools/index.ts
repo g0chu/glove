@@ -4,6 +4,7 @@ import { FileTools, registerFileTools } from "./filetools.js";
 import { ShellTools, registerShellTools } from "./shelltools.js";
 import { WebTools, registerWebTools } from "./webtools.js";
 import { ZimTools, registerZimTools } from "./zimtools.js";
+import { VaultTools, registerVaultTools } from "./vaulttools.js";
 
 /** Everything abortable the tool stack owns (wired into shutdown). */
 export interface ToolsSetup {
@@ -92,6 +93,24 @@ export function buildTools(cfg: Config): ToolsSetup {
       "- wikipedia_search, wikipedia_read: an offline Wikipedia archive on this machine (no internet needed) — search article titles, then read the article text. Prefer it for established facts: people, places, events, science topics.",
     );
     rules.push("Cite Wikipedia article titles when you use wikipedia_read.");
+  }
+  if (cfg.tools.vault.enabled) {
+    const vault = new VaultTools({
+      dir: cfg.tools.vault.dir,
+      maxResults: cfg.tools.vault.searchMaxResults,
+      scanBudgetMs: cfg.tools.vault.scanBudgetMs,
+      maxTextChars: cfg.tools.maxResultChars,
+      rgPath: cfg.tools.vault.rgPath,
+      // The no-match hint may only point at web_search when the web
+      // family is registered too.
+      webSearchAvailable: cfg.tools.web.enabled,
+    });
+    clients.push(vault);
+    registerVaultTools(registry, vault);
+    bullets.push(
+      "- vault_search, vault_read, vault_links: an offline Wikipedia vault of markdown notes on this machine (no internet needed) — search note titles and bodies, read a note by title, list a note's [[wikilinks]] and follow them. Prefer it for established facts: people, places, events, science topics.",
+    );
+    rules.push("Cite the vault note titles when you use vault_read.");
   }
   const systemNote = bullets.length
     ? [

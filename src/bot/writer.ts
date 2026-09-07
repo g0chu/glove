@@ -34,6 +34,10 @@ const LIST_RE = /^\s*(?:[-*+]|\d{1,9}[.)])\s/;
 /**
  * Split text into Discord-safe chunks (<= maxChars each).
  *
+ *  - the FIRST chunk may additionally be capped by `firstMaxChars` (the
+ *    round text that streams inside the turn's activity message is
+ *    budgeted to the room the settled lines leave); every chunk after the
+ *    first uses maxChars. Omitted, every chunk is capped at maxChars;
  *  - prefers to break on newline boundaries;
  *  - never splits *inside* a code fence: when a chunk boundary falls inside
  *    a fenced block, the fence is closed at the end of the current chunk and
@@ -49,8 +53,16 @@ const LIST_RE = /^\s*(?:[-*+]|\d{1,9}[.)])\s/;
  *    row start) so sections, lists, and paragraphs stay intact;
  *  - a single line longer than maxChars is hard-split.
  */
-export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MESSAGE_CHARS): string[] {
-  if (text.length <= maxChars) {
+export function splitForDiscord(
+  text: string,
+  maxChars: number = DISCORD_MAX_MESSAGE_CHARS,
+  firstMaxChars?: number,
+): string[] {
+  // The first chunk may be capped tighter than the rest (the live text
+  // slice inside the activity message is budgeted to the room the settled
+  // lines leave); every chunk after the first uses maxChars.
+  const firstCap = Math.min(maxChars, firstMaxChars ?? maxChars);
+  if (text.length <= firstCap) {
     return text.length > 0 ? [text] : [];
   }
 
@@ -60,6 +72,9 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
   let curLen = 0; // length of cur.join("\n")
   let fenceReopen: string | null = null; // opening token of the open fence, e.g. "```ts"
   let fenceClose: string | null = null; // bare closing token, e.g. "```"
+
+  /** The cap of the chunk currently being built (chunk 0 may be smaller). */
+  const cap = (): number => (chunks.length === 0 ? firstCap : maxChars);
 
   /** Exclusive end of the table-row run starting at i, or -1 when not a row. */
   const tableEnd = new Array<number>(lines.length).fill(-1);
@@ -95,8 +110,12 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
 
   const hardSplit = (line: string, budget: number): void => {
     if (cur.length > 0 || fenceReopen !== null) emit();
-    for (let i = 0; i < line.length; i += budget) {
-      chunks.push(line.slice(i, i + budget));
+    let i = 0;
+    while (i < line.length) {
+      // The first raw piece is chunk 0: cap it at the first chunk's cap.
+      const b = Math.min(budget, chunks.length === 0 ? firstCap : budget);
+      chunks.push(line.slice(i, i + b));
+      i += b;
     }
     fenceReopen = null; // fence state cannot be preserved across raw splits
     fenceClose = null;
@@ -113,6 +132,12 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
    * once the token is appended.
    */
   const breakCarryOver = (line: string, closeOverhead: number): void => {
+    if (cur.length === 0 && line.length + closeOverhead > cap()) {
+      // The line is alone in chunk 0 and overflows the first chunk's cap:
+      // raw-split it (the first raw piece is capped too).
+      hardSplit(line, Math.max(1, maxChars - closeOverhead));
+      return;
+    }
     if (line.length + closeOverhead > maxChars) {
       hardSplit(line, Math.max(1, maxChars - closeOverhead));
       return;
@@ -184,13 +209,17 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
     const body = hasHeader ? rows.slice(2) : rows;
     const total = joinedLen(rows);
 
-    if (total <= maxChars) {
-      if (cur.length === 0 || curLen + 1 + total <= maxChars) {
+    if (total <= cap()) {
+      if (cur.length === 0 || curLen + 1 + total <= cap()) {
         for (const r of rows) appendLine(r);
         return;
       }
       const intro = tableIntro();
-      if (intro.length > 0 && joinedLen(intro) + 1 + total <= maxChars) {
+      // The intro + table lands in the next chunk: chunk 1 (maxChars) when
+      // the current lines flush before it, chunk 0 (the first cap) when cur
+      // holds only the intro.
+      const introCap = cur.length - intro.length === 0 ? firstCap : maxChars;
+      if (intro.length > 0 && joinedLen(intro) + 1 + total <= introCap) {
         // The trailing heading belongs to the table: keep it with the table.
         cur = cur.slice(0, cur.length - intro.length);
         curLen = cur.length > 0 ? joinedLen(cur) : 0;
@@ -233,7 +262,34 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
     if (part.length > 0) parts.push(part);
 
     if (cur.length > 0) emit();
-    for (const p of parts) chunks.push(p.join("\n"));
+    // The table's first part may be chunk 0 (cur was empty): it must fit
+    // the first chunk's cap — repack it under firstCap when needed.
+    let out = parts;
+    if (chunks.length === 0 && out.length > 0 && joinedLen(out[0]) > firstCap) {
+      const repacked: string[][] = [];
+      let rp: string[] = [];
+      let rpLen = 0;
+      const flushRp = (): void => {
+        if (rp.length > 0) {
+          repacked.push(rp);
+          rp = [];
+          rpLen = 0;
+        }
+      };
+      for (const r of out[0]) {
+        if (r.length > firstCap) {
+          flushRp();
+          for (let i = 0; i < r.length; i += firstCap) repacked.push([r.slice(i, i + firstCap)]);
+          continue;
+        }
+        if (rp.length > 0 && rpLen + 1 + r.length > firstCap) flushRp();
+        rp.push(r);
+        rpLen += r.length + 1;
+      }
+      flushRp();
+      out = [...repacked, ...out.slice(1)];
+    }
+    for (const p of out) chunks.push(p.join("\n"));
   };
 
   for (let i = 0; i < lines.length; i++) {
@@ -253,7 +309,8 @@ export function splitForDiscord(text: string, maxChars: number = DISCORD_MAX_MES
       // line toggles it), since this line is what the chunk would end with.
       const postClose = fenceMatch ? (fenceReopen === null ? fenceMatch[1] : null) : fenceClose;
       const closeOverhead = postClose !== null ? 1 + postClose.length : 0;
-      const fits = cur.length === 0 ? line.length + closeOverhead <= maxChars : curLen + 1 + line.length + closeOverhead <= maxChars;
+      const fits =
+        cur.length === 0 ? line.length + closeOverhead <= cap() : curLen + 1 + line.length + closeOverhead <= cap();
       if (fits) {
         appendLine(line);
       } else if (fenceReopen !== null && fenceClose !== null) {
@@ -299,7 +356,12 @@ export interface WriterOptions {
 
 /** What the writer actually posted to the channel (for history tracking). */
 export interface PostedReply {
-  /** Discord message ids in send order (one per chunk). */
+  /**
+   * Discord message ids in send order (one per chunk). Empty when the text
+   * settled inside the turn's activity message (a UI line, never context):
+   * the text is then recorded without a backing message (no edit/delete
+   * sync), while a text in its own message(s) carries their ids.
+   */
   messageIds: string[];
   /** Text to record in the history: the canonical reply when every chunk posted. */
   text: string;
@@ -310,28 +372,36 @@ export interface PostedReply {
 /**
  * Posts a model reply to a channel with Discord-specific concerns:
  *  - typing indicator refreshed every `typingIntervalMs`;
- *  - the turn's activity message: ONE message per turn (posted on the first
- *    line, edited in place for every later one — the channel stays quiet)
- *    holding the turn's UI lines in the order they happened: each round's
- *    thinking terminal line (while a round is thinking, the live preview
- *    shows at the bottom, "🤔 *thinking: …*"; when the round ends — the
- *    reply starts, or discard() settles the round, or finish() runs with no
- *    reply content — it completes in place to "🤔 *first line of the
- *    thinking… (12s)*") and the tool-call lines (appendActivityLines,
- *    interleaved after each round's thinking line). Every round's reasoning
- *    thus persists as its own line, not just the final one's; past 2000
- *    chars the oldest lines collapse into a "… N earlier activity lines …"
- *    header. A `*` from the model's text is dropped from the displayed
- *    thinking (a markdown bullet or bold would break the italic wrapping);
- *  - the reply streams in its own live message(s), created on the first
- *    content delta: when the text grows past a 2000-char slice boundary a
- *    fresh live message is created for the next slice — the same
- *    code-fence-aware chunks the final post will use — and only the
- *    growing last slice is edited (throttled to `throttleMs`, serialized);
- *  - on completion the final text is chunked (code-fence aware); each live
- *    message settles in place to its final chunk and any remaining chunks
- *    are posted fresh. Reasoning never lands in the final messages or in
- *    the writer's report (the caller records the rounds' reasoning from the
+ *  - ONE activity message per turn, holding everything in the order it
+ *    happened: each round's thinking terminal line (while a round is
+ *    thinking, the live preview shows at the bottom, "🤔 *thinking: …*";
+ *    when the round ends — the reply starts, or discard() settles the
+ *    round, or finish() runs with no reply content — it completes in place
+ *    to "🤔 *first line of the thinking… (12s)*"), the round's text (the
+ *    round's narration, settled in place when the round ends), and the
+ *    tool-call lines (appendActivityLines, after each round's lines). The
+ *    message is posted on the first line, edited in place for every later
+ *    one — the channel stays quiet no matter how many rounds run. When a
+ *    round's text outgrows the room the message leaves (a slice boundary is
+ *    crossed), the text demotes to its own live message(s) below it (the
+ *    record then keeps their ids, so the seed and the edit/delete sync stay
+ *    correct), and later lines open a FRESH activity message below the
+ *    overflow, so the channel order always matches the order they
+ *    happened. Past 2000 chars the oldest lines collapse into a "… N
+ *    earlier activity lines …" header that keeps a leading icon (the
+ *    message always starts with a 🤔/🔎/📁/🐚/📚/🔧 line, so it stays a
+ *    UI line, never context). A `*` from the model's text is dropped from
+ *    the displayed thinking (a markdown bullet or bold would break the
+ *    italic wrapping);
+ *  - a turn whose first content is plain text (no thinking, no call line
+ *    yet) posts that text in its own message(s) — the activity message is
+ *    created only when a thinking or call line lands — so the bot's
+ *    context-seeding skips (a UI line, never tracked) stay correct;
+ *  - on completion the final text is chunked (code-fence aware, the first
+ *    slice budgeted to the activity message's room when it lives there);
+ *    each live message settles in place and any remaining slices are
+ *    posted fresh. Reasoning never lands in the final messages or in the
+ *    writer's report (the caller records the rounds' reasoning from the
  *    model results, not from the writer);
  *  - `finish()`/`reportError()` return the ids and text of whatever was
  *    actually posted, so the caller can record the reply in the channel
@@ -357,30 +427,59 @@ export class ResponseWriter {
   private reasoningFirstLineDone = false;
   /**
    * True once this round's thinking has been completed into its terminal
-   * line in the shared activity message (by the reply taking over, by
-   * finish(), or by discard()). Guards against appending a second terminal
-   * line for the same round.
+   * line (by the text taking over, by discard(), or by finish()). Guards
+   * against settling a second terminal line for the same round.
    */
   private thinkingSettled = false;
   /**
-   * The reply's live messages, in send order. Each holds its own slice
-   * (<= 2000 chars, the same chunks the final post will use); a fresh
-   * message is created when the text grows past the next slice boundary,
-   * so a long reply streams as several messages instead of one "…" tail.
+   * The settled blocks of the current activity message, in the order they
+   * happened: each round's thinking terminal line, the round text blocks
+   * (a round's narration that settled inside the message), and the
+   * tool-call lines. A text that outgrew the message lives in its own
+   * message(s) instead (see textMode) — the blocks hold what the message
+   * shows.
    */
-  private liveMessages: Message[] = [];
+  private blocks: string[] = [];
+  /** Lines collapsed behind the "… N earlier activity lines …" header. */
+  private droppedLines = 0;
   /**
-   * The turn's shared activity message's lines, in the order they
-   * happened: each round's thinking terminal line, then the tool-call
-   * lines the round requested. One Discord message holds them all (posted
-   * on the first line, edited in place for every later line); past the
-   * 2000-char cap the oldest lines are dropped (see activityDropped).
+   * Lines that could not be posted to the current (stale) activity message
+   * yet: they wait for the fresh message that opens below the overflow
+   * (a failed post keeps them, so the retry carries every line so far).
    */
-  private activityLines: string[] = [];
-  /** Activity lines dropped behind the "… N earlier activity lines …" header. */
-  private activityDropped = 0;
-  /** The shared activity message itself (null until a first line or preview lands). */
+  private pendingLines: string[] = [];
+  /** Pending lines collapsed behind the header (same as droppedLines). */
+  private pendingDropped = 0;
+  /** The current activity message (null until its first line/preview lands). */
   private activityMessage: Message | null = null;
+  /**
+   * True once a message was posted below the activity message (a round
+   * text that outgrew it, demoted to its own message): later lines open a
+   * FRESH activity message below the overflow, so the channel order
+   * matches the order they happened.
+   */
+  private activityStale = false;
+  /**
+   * Where this round's text block lives: not started; inside the fresh
+   * activity message (its first slice, budgeted to the room the settled
+   * blocks leave); or in its own live message(s) (no message to join, or
+   * it outgrew the message and was demoted).
+   */
+  private textMode: "none" | "activity" | "own" = "none";
+  /**
+   * The cap of the text block's first slice: the room the settled blocks
+   * left at stream start (the same cap is used at settle, so the slice
+   * boundaries stay stable across the demotion), or 2000 when the block is
+   * its own message from the start.
+   */
+  private textFirstCap = DISCORD_MAX_MESSAGE_CHARS;
+  /**
+   * The live messages of the text block's slices OUTSIDE the activity
+   * message: "activity" mode — slice 1+ (index = slice index − 1, normally
+   * none — the first overflow demotes the block); "own" mode — every slice
+   * (index = slice index).
+   */
+  private textSlices: Message[] = [];
   /** When the current round's thinking started (for the "thought for Ns" line). */
   private reasoningStartedAt: number | null = null;
   private typingTimer: NodeJS.Timeout | null = null;
@@ -409,9 +508,9 @@ export class ResponseWriter {
 
   /**
    * Feed a streamed reasoning delta (the model's "thinking", when the
-   * endpoint sends it). Shown live at the bottom of the turn's shared
-   * activity message, completing into a terminal line (the first line of
-   * the thinking, truncated, plus how long it took) when the reply starts
+   * endpoint sends it). Shown live at the bottom of the turn's activity
+   * message, completing into a terminal line (the first line of the
+   * thinking, truncated, plus how long it took) when the reply starts
    * or the round ends; reasoning is never posted or recorded in full.
    */
   reason(delta: string): void {
@@ -449,16 +548,17 @@ export class ResponseWriter {
 
   /**
    * End a tool-call round without finishing the turn. The round's streamed
-   * reply text is settled in place (its live messages are completed to the
-   * round's full text, so the narration stays in the channel between the
-   * tool-activity lines), and its thinking is completed into its terminal
-   * line, appended to the turn's shared activity message, so every round's
-   * reasoning shows up above the next round (the next round's preview and
-   * lines continue in the same message, in the order they happen). The next
-   * round streams its own fresh reply live messages. Resolves with what the
-   * round's text settled to (the message ids + text, like finish) so the
-   * caller can record the round in the channel history (its message ids
-   * keep edits and deletes in sync), or null when the turn already finished.
+   * text is settled in place (inside the activity message it becomes a
+   * settled block — recorded without a message id, the message being a UI
+   * line — or in its own message(s), completed to the round's full text),
+   * and its thinking is completed into its terminal line (in the order
+   * they happened: the thinking line, then the text, then — on the next
+   * step — the call lines). The next round's preview and lines continue in
+   * the same message (or a fresh one below the overflow). Resolves with
+   * what the round's text settled to (the message ids + text, like finish)
+   * so the caller can record the round in the channel history (its message
+   * ids keep edits and deletes in sync), or null when there was no text or
+   * the turn already finished.
    */
   async discard(): Promise<PostedReply | null> {
     if (this.finished) return null;
@@ -468,10 +568,9 @@ export class ResponseWriter {
     // text), and whether there was thinking to persist all belong to the
     // round ending now.
     // (thinkingSettled is deliberately NOT reset here — an in-flight
-    // updateReply may still complete the thinking message after this sync
-    // part runs; it is reset at the end of the step, below, once the
-    // thinking has been handled, so a terminal line an in-flight updateReply
-    // already posted is not posted again.)
+    // updateText may still settle the thinking after this sync part runs;
+    // it is reset at the end of the step, below, once the thinking has been
+    // handled, so a terminal line already settled is not settled again.)
     const doneLine = this.thinkingDoneLine();
     const hadReasoning = this.reasoningBuffer.length > 0;
     const replyText = sanitizeForDiscord(this.buffer).trim();
@@ -495,24 +594,17 @@ export class ResponseWriter {
     this.chain = this.chain.then(async () => {
       if (hadReasoning && !this.thinkingSettled) {
         // Reasoning streamed (the live preview may or may not have landed)
-        // and the reply never took over: append the round's terminal line
-        // to the shared activity message so the thinking is not lost.
+        // and the text never took over: complete the round's thinking into
+        // its terminal line so the thinking is not lost.
         this.thinkingSettled = true;
-        this.activityLines.push(doneLine);
-        this.dropOldestActivityLines();
-        await this.syncActivity(this.renderActivity());
+        await this.settleThinkingLine(doneLine);
       }
-      // The round's text is not transient: settle the live messages in
-      // place (the preview used the same splitter, so each live message
-      // normally just completes to its final chunk; a slice that grew past
-      // its boundary is posted fresh). A live message with no chunk left
-      // (defensive — the round streamed no text, so normally none exist)
-      // is deleted.
-      const landed = await this.settle(splitForDiscord(replyText));
+      if (replyText.length > 0) {
+        settled = await this.settleText(replyText);
+      }
       // A new round starts: reset the settled flag so the next round's
       // thinking is tracked fresh.
       this.thinkingSettled = false;
-      settled = this.reported(landed, replyText);
     });
     await this.chain;
     return settled;
@@ -530,27 +622,44 @@ export class ResponseWriter {
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
-    await this.completeThinking();
-
+    if (this.reasoningBuffer.length > 0 && !this.thinkingSettled) {
+      // A reasoning-only response (or non-stream mode): the thinking still
+      // completes into its terminal line, above the reply/note — the order
+      // they happened.
+      this.thinkingSettled = true;
+      await this.settleThinkingLine(this.thinkingDoneLine());
+    }
     const text = sanitizeForDiscord(fullText.trim() || this.buffer.trim());
-    const posted: Message[] = [];
     try {
       if (!text) {
+        // No reply content: a short note (the caller still records it, so
+        // the history shows the turn ended without a reply).
         const note = "*(the model returned no response)*";
-        await this.clearLive(); // defensive: nothing streamed, so none exist
-        posted.push(await this.opts.channel.send({ content: note, allowedMentions: SAFE_MENTIONS }));
-        return { messageIds: [posted[0].id], text: note };
+        if (this.activityFresh()) {
+          this.blocks.push(note);
+          this.collapseBlocks();
+          await this.syncActivity(this.renderBlocks());
+          return { messageIds: [], text: note };
+        }
+        const m = await this.opts.channel.send({ content: note, allowedMentions: SAFE_MENTIONS });
+        return { messageIds: [m.id], text: note };
       }
-      const chunks = splitForDiscord(text);
-      const landed = await this.settle(chunks);
-      for (const m of landed) posted.push(m);
-      // The canonical text is what the model wrote — honest only when every
-      // chunk landed; otherwise report the visible text of what was posted.
-      return this.reported(posted, landed.length === chunks.length ? text : undefined);
+      if (this.textMode === "none") {
+        // The text never streamed (non-stream mode): start the block now so
+        // it settles where it belongs (the fresh activity message when
+        // there is one, its own message(s) otherwise).
+        this.startText();
+      }
+      // (startText may have moved the thinking line to the blocks): the text
+      // posts below the activity message, so complete the line in place.
+      if (this.textMode === "own" && this.activityMessage !== null) {
+        await this.syncActivity(this.renderBlocks());
+      }
+      return await this.settleText(text);
     } catch (err) {
       log.error(`failed to finalize reply: ${errMsg(err)}`);
-      // Partial post: keep an honest record of whatever did land in the channel.
-      return this.reported(posted);
+      // Nothing could be posted: the caller records nothing.
+      return null;
     }
   }
 
@@ -563,40 +672,67 @@ export class ResponseWriter {
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
-    await this.completeThinking();
-
+    if (this.reasoningBuffer.length > 0 && !this.thinkingSettled) {
+      this.thinkingSettled = true;
+      await this.settleThinkingLine(this.thinkingDoneLine());
+    }
     const note = `⚠️ *generation failed:* ${truncate(errMsg(err), 400)}`;
     const partial = sanitizeForDiscord(this.buffer.trim());
-    const text = partial ? `${partial}\n\n${note}` : note;
-    const posted: Message[] = [];
     try {
-      const chunks = splitForDiscord(text);
-      const landed = await this.settle(chunks);
-      for (const m of landed) posted.push(m);
-      return this.reported(posted, landed.length === chunks.length ? text : undefined);
+      if (partial.length === 0 && this.textMode === "none") {
+        // Nothing streamed: the note goes inside the fresh activity message
+        // (when there is one — it is the turn's only content), else in its
+        // own message.
+        if (this.activityFresh()) {
+          this.blocks.push(note);
+          this.collapseBlocks();
+          await this.syncActivity(this.renderBlocks());
+          return { messageIds: [], text: note };
+        }
+        const m = await this.opts.channel.send({ content: note, allowedMentions: SAFE_MENTIONS });
+        return { messageIds: [m.id], text: note };
+      }
+      const text = partial.length > 0 ? `${partial}\n\n${note}` : note;
+      if (this.textMode === "none") this.startText();
+      return await this.settleText(text);
     } catch (err2) {
       log.error(`failed to post error message: ${errMsg(err2)}`);
-      return this.reported(posted);
+      return null;
     }
   }
 
   /**
    * Interrupt an in-progress attempt (the model request was aborted by
-   * channel activity, see index.ts): stop the typing indicator, complete the
-   * round's thinking line in place (its thinking is kept, like a finished
-   * round's), and delete the reply's live (partial) messages — the caller
-   * then waits for the channel to go quiet and either discards the turn
-   * (a newer turn supersedes it) or retries it with a fresh writer, so the
-   * partial text does not stay in the channel as a broken reply either
-   * way. A no-op when the writer never started or already finished.
+   * channel activity, see index.ts): stop the typing indicator, complete
+   * the round's thinking line (kept, like a finished round's), and withdraw
+   * the round's partial text (stripped from the activity message, or its
+   * live message(s) deleted). With the prefill-only interruption (see
+   * LlmClient.chat) an interrupted attempt has streamed no token yet, so
+   * this is normally a no-op beyond stopping typing; the paths below cover
+   * the defensive cases (a non-stream call aborted mid-flight, a manual
+   * interrupt). The caller then waits for the channel to go quiet and
+   * either discards the turn (a newer turn supersedes it) or retries it
+   * with a fresh writer, so the partial text never lingers as a broken
+   * reply. A no-op when the writer never started or already finished.
    */
   async interrupt(): Promise<void> {
     if (this.finished) return;
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
-    await this.completeThinking();
-    await this.clearLive();
+    if (this.reasoningBuffer.length > 0 && !this.thinkingSettled) {
+      this.thinkingSettled = true;
+      await this.settleThinkingLine(this.thinkingDoneLine());
+    }
+    if (this.textMode === "activity") {
+      // The round's partial text streamed inside the activity message:
+      // strip it out (the message goes back to its settled blocks).
+      if (this.activityMessage !== null) await this.syncActivity(this.renderBlocks());
+    } else if (this.textMode === "own") {
+      // The round's partial text streamed in its own live message(s):
+      // delete them.
+      await this.clearTextSlices();
+    }
   }
 
   /**
@@ -616,120 +752,277 @@ export class ResponseWriter {
   private async updateLive(): Promise<void> {
     if (this.finished) return;
     if (this.buffer.length > 0) {
-      await this.updateReply();
+      await this.updateText();
       return;
     }
     await this.updateThinking();
   }
 
   /**
-   * The thinking preview, live, at the bottom of the shared activity
-   * message: the settled lines above, the streaming reasoning below
-   * (budgeted to the room the lines leave in the 2000-char message). Once
-   * the round ends the preview is replaced by the round's terminal line.
+   * The thinking preview, live, at the bottom of the activity message: the
+   * settled blocks above, the streaming reasoning below (budgeted to the
+   * room the blocks leave in the 2000-char message). Once the round ends
+   * the preview is replaced by the round's terminal line. When there is no
+   * fresh activity message (a turn whose first content is the thinking, or
+   * a fresh one opening below the overflow), this opens it.
    */
   private async updateThinking(): Promise<void> {
     if (this.reasoningBuffer.length === 0) return;
-    const settled = this.renderActivity();
-    // The preview gets exactly the room the settled lines leave in the
-    // 2000-char message (reasoningPreview degrades to the plain "thinking…"
-    // indicator — or less — when the room runs out, never overflows).
-    const budget = Math.max(DISCORD_MAX_MESSAGE_CHARS - (settled.length > 0 ? settled.length + 1 : 0), 0);
-    const preview = this.reasoningPreview(budget);
-    const content = settled.length > 0 ? `${settled}\n${preview}` : preview;
-    // The preview updates per reasoning delta: edits are throttled (the
-    // first post is not).
-    if (this.activityMessage !== null) {
+    if (this.activityMessage !== null && !this.activityStale) {
+      const settled = this.renderBlocks();
+      // The preview gets exactly the room the settled blocks leave in the
+      // 2000-char message (reasoningPreview degrades to the plain
+      // "thinking…" indicator — or less — when the room runs out, never
+      // overflows).
+      const budget = Math.max(DISCORD_MAX_MESSAGE_CHARS - (settled.length > 0 ? settled.length + 1 : 0), 0);
+      const preview = this.reasoningPreview(budget);
+      const content =
+        preview.length === 0 ? settled : settled.length > 0 ? `${settled}\n${preview}` : preview;
+      // The preview updates per reasoning delta: edits are throttled (the
+      // first post is not — it goes through ensureActivity).
       if (Date.now() - this.lastThinkingEditAt < this.opts.throttleMs) return;
       this.lastThinkingEditAt = Date.now();
+      await this.syncActivity(content);
+      return;
     }
-    await this.syncActivity(content);
+    await this.ensureActivity();
   }
 
   /**
-   * Post or edit the turn's shared activity message to `content` (the
-   * settled lines, or the lines + the live preview). A failed post is
-   * retried by the next line or preview (the retry carries every line so
-   * far — the message stays null until a post lands); a failed edit keeps
-   * the last good content and is retried the same way.
+   * Post or edit the turn's activity message: a fresh message is edited in
+   * place; when none exists yet one is posted (it starts with the waiting
+   * blocks, the live preview at the bottom when the round is still
+   * thinking); when the current one is stale (a message was posted below
+   * it) a fresh one is posted below the overflow, starting with the lines
+   * that waited (the live preview at the bottom). A failed post is retried
+   * by the next line or preview (the retry carries every line so far).
+   */
+  private async ensureActivity(): Promise<void> {
+    if (this.activityMessage !== null && !this.activityStale) {
+      await this.syncActivity(this.renderBlocks());
+      return;
+    }
+    const blocks = this.activityStale ? [...this.pendingLines] : this.blocks;
+    const dropped = this.activityStale ? this.pendingDropped : this.droppedLines;
+    let content = this.renderBlocksFor(blocks, dropped);
+    if (this.reasoningBuffer.length > 0) {
+      const budget = Math.max(DISCORD_MAX_MESSAGE_CHARS - (content.length > 0 ? content.length + 1 : 0), 0);
+      const preview = this.reasoningPreview(budget);
+      if (preview.length > 0) {
+        content = content.length > 0 ? `${content}\n${preview}` : preview;
+      }
+    }
+    await this.openActivity(content, blocks, dropped);
+  }
+
+  /** Post a fresh activity message; on success the state moves to it. */
+  private async openActivity(content: string, blocks: string[], dropped: number): Promise<void> {
+    try {
+      this.activityMessage = await this.opts.channel.send({ content, allowedMentions: SAFE_MENTIONS });
+      this.activityStale = false;
+      this.blocks = blocks;
+      this.droppedLines = dropped;
+      this.pendingLines = [];
+      this.pendingDropped = 0;
+    } catch (err) {
+      log.warn(`failed to post the activity message: ${errMsg(err)}`);
+    }
+  }
+
+  /**
+   * Post or edit the current activity message to `content` (it exists):
+   * a failed edit keeps the last good content and is retried by the next
+   * line or preview.
    */
   private async syncActivity(content: string): Promise<void> {
+    const m = this.activityMessage;
+    if (!m) return;
     try {
-      if (this.activityMessage) {
-        if (this.activityMessage.content !== content) {
-          await this.activityMessage.edit({ content, allowedMentions: SAFE_MENTIONS });
-        }
-      } else {
-        this.activityMessage = await this.opts.channel.send({ content, allowedMentions: SAFE_MENTIONS });
+      if (m.content !== content) {
+        await m.edit({ content, allowedMentions: SAFE_MENTIONS });
       }
     } catch (err) {
       log.warn(`failed to update the activity message: ${errMsg(err)}`);
     }
   }
 
-  /** The kept activity lines, the dropped ones summarized in the header. */
-  private renderActivity(): string {
-    if (this.activityDropped > 0) {
-      const header = `🔧 *… ${this.activityDropped} earlier activity lines …*`;
-      return [header, ...this.activityLines].join("\n");
-    }
-    return this.activityLines.join("\n");
+  private activityFresh(): boolean {
+    return this.activityMessage !== null && !this.activityStale;
   }
 
-  /** Past the 2000-char cap, drop the oldest activity lines behind the header. */
-  private dropOldestActivityLines(): void {
-    while (this.activityLines.length > 1 && this.renderActivity().length > DISCORD_MAX_MESSAGE_CHARS) {
-      this.activityDropped += 1;
-      this.activityLines.shift();
+  /** The kept blocks, the dropped ones summarized in the header. */
+  private renderBlocks(): string {
+    return this.renderBlocksFor(this.blocks, this.droppedLines);
+  }
+
+  private renderBlocksFor(blocks: string[], dropped: number): string {
+    if (dropped > 0) {
+      const header = `🔧 *… ${dropped} earlier activity lines …*`;
+      return [header, ...blocks].join("\n");
+    }
+    return blocks.join("\n");
+  }
+
+  /** The settled blocks above, the streaming text at the bottom. */
+  private renderWithTail(tail: string): string {
+    const settled = this.renderBlocks();
+    return settled.length > 0 ? `${settled}\n${tail}` : tail;
+  }
+
+  /** Past the 2000-char cap, collapse the oldest blocks behind the header. */
+  private collapseBlocks(): void {
+    while (this.blocks.length > 1 && this.renderBlocks().length > DISCORD_MAX_MESSAGE_CHARS) {
+      this.droppedLines += this.blocks[0].split("\n").length;
+      this.blocks.shift();
+    }
+  }
+
+  /** Same, for the lines waiting for a fresh message. */
+  private collapsePending(): void {
+    while (this.pendingLines.length > 1 && this.renderBlocksFor(this.pendingLines, this.pendingDropped).length > DISCORD_MAX_MESSAGE_CHARS) {
+      this.pendingDropped++;
+      this.pendingLines.shift();
     }
   }
 
   /**
-   * Append lines to the turn's shared activity message (the tool-call
-   * lines, one per call, in call order): the first line posts the message,
-   * every later line edits it in place — one message for the whole turn,
-   * no matter how many rounds run, the lines interleaved with the thinking
-   * lines in the order they happened. Awaited, so the post/edit lands
-   * before the caller proceeds.
+   * Append lines to the turn's activity lines (the tool-call lines, one
+   * per call, in call order): a fresh activity message gets them appended
+   * to its blocks (edited in place); otherwise they wait for the message
+   * that opens below the overflow (or the first one, when none exists
+   * yet). Awaited, so the post/edit lands before the caller proceeds.
    */
   async appendActivityLines(lines: string[]): Promise<void> {
     if (lines.length === 0 || this.finished) return;
-    for (const line of lines) this.activityLines.push(line);
-    this.dropOldestActivityLines();
-    this.chain = this.chain.then(() => this.syncActivity(this.renderActivity()));
+    if (this.activityFresh()) {
+      for (const line of lines) this.blocks.push(line);
+      this.collapseBlocks();
+      this.chain = this.chain.then(() => this.syncActivity(this.renderBlocks()));
+    } else {
+      if (this.activityMessage === null) {
+        // No message exists yet: the lines open it (the first post carries
+        // them — the turn's first content is a call line, and the message
+        // starts with its icon, so it stays a UI line).
+        for (const line of lines) this.blocks.push(line);
+        this.collapseBlocks();
+      } else {
+        // The current message is stale (a message was posted below it): the
+        // lines wait for the fresh one that opens below the overflow.
+        for (const line of lines) this.pendingLines.push(line);
+        this.collapsePending();
+      }
+      this.chain = this.chain.then(() => this.ensureActivity());
+    }
     await this.chain;
   }
 
   /**
-   * The reply preview: its own live message(s) once content has started.
-   * On the first content delta the thinking message (when there was one)
-   * completes in place, then the reply's first slice is created as a fresh
-   * message. When the text grows past a slice boundary a fresh live message
-   * is created for the next slice; only the growing last slice is edited.
+   * Complete the round's thinking into its terminal line where the activity
+   * lines live: the fresh activity message's blocks (synced in place), the
+   * waiting blocks when no message exists yet, or the pending lines that
+   * open the fresh message below the overflow.
    */
-  private async updateReply(): Promise<void> {
+  private async settleThinkingLine(line: string): Promise<void> {
+    if (this.activityFresh()) {
+      this.blocks.push(line);
+      this.collapseBlocks();
+      await this.syncActivity(this.renderBlocks());
+    } else if (this.activityMessage === null) {
+      // No message yet (a failed preview post): the line opens it, so the
+      // round's thinking is not lost when the round ends now.
+      this.blocks.push(line);
+      this.collapseBlocks();
+      await this.ensureActivity();
+    } else {
+      this.pendingLines.push(line);
+      this.collapsePending();
+      await this.ensureActivity();
+    }
+  }
+
+  /**
+   * Begin this round's text block. First the round's thinking completes
+   * into its terminal line (it happened before the text), then the text's
+   * landing is decided: inside the fresh activity message (its first
+   * slice, budgeted to the room the settled blocks leave) or in its own
+   * live message(s) (no message yet, or the message cannot host it).
+   */
+  private startText(): void {
+    if (this.reasoningBuffer.length > 0 && !this.thinkingSettled) {
+      this.thinkingSettled = true;
+      const line = this.thinkingDoneLine();
+      if (this.activityStale) {
+        this.pendingLines.push(line);
+        this.collapsePending();
+      } else {
+        this.blocks.push(line);
+        this.collapseBlocks();
+      }
+    }
+    const settled = this.renderBlocks();
+    const room = DISCORD_MAX_MESSAGE_CHARS - (settled.length > 0 ? settled.length + 1 : 0);
+    if (this.activityFresh() && room >= 1) {
+      this.textMode = "activity";
+      this.textFirstCap = room;
+    } else {
+      this.textMode = "own";
+      this.textFirstCap = DISCORD_MAX_MESSAGE_CHARS;
+      if (this.activityMessage !== null) this.activityStale = true; // the text posts below it
+    }
+  }
+
+  /**
+   * The text preview, live: inside the fresh activity message (the settled
+   * blocks above, the growing first slice at the bottom), or in its own
+   * live message(s) (a fresh message per slice as they appear; only the
+   * growing last slice is edited, throttled). When the text outgrows the
+   * activity message's room, the block demotes to its own message(s).
+   */
+  private async updateText(): Promise<void> {
     const text = sanitizeForDiscord(this.buffer);
     if (text.length === 0) return;
     try {
-      const chunks = splitForDiscord(text);
-      if (this.liveMessages.length === 0 && this.reasoningBuffer.length > 0 && !this.thinkingSettled) {
-        // The reply took over: append the round's terminal line to the
-        // shared activity message before the reply's first slice is created.
-        this.thinkingSettled = true;
-        this.activityLines.push(this.thinkingDoneLine());
-        this.dropOldestActivityLines();
-        await this.syncActivity(this.renderActivity());
+      if (this.textMode === "none") {
+        this.startText();
       }
-      // A new slice appeared: start its live message with the slice as it
-      // stands now; it keeps growing in the edits that follow.
-      while (this.liveMessages.length < chunks.length) {
-        const i = this.liveMessages.length;
-        this.liveMessages.push(await this.opts.channel.send({ content: chunks[i], allowedMentions: SAFE_MENTIONS }));
+      // The text posts in its own message(s) below the activity message:
+      // complete the thinking line in place there (the preview is replaced).
+      // (A no-op via the content check when the line already landed.)
+      if (this.textMode === "own" && this.activityMessage !== null) {
+        await this.syncActivity(this.renderBlocks());
       }
-      const last = this.liveMessages.length - 1;
+      const chunks = splitForDiscord(text, DISCORD_MAX_MESSAGE_CHARS, this.textFirstCap);
+      if (this.textMode === "activity" && chunks.length > 1) {
+        // The text outgrew the activity message's room: demote — the first
+        // slice is final, so it moves out into its own message (the channel
+        // order: the activity message, then the text's slices), and the
+        // block continues in its own live message(s) (the record keeps the
+        // message ids: the seed and the edit/delete sync stay correct).
+        if (this.activityMessage !== null) await this.syncActivity(this.renderBlocks());
+        const first = await this.opts.channel.send({ content: chunks[0], allowedMentions: SAFE_MENTIONS });
+        this.textSlices = [first, ...this.textSlices];
+        this.textMode = "own";
+        this.activityStale = true; // a message now sits below the activity message
+      }
+      if (this.textMode === "activity") {
+        // No overflow: the first slice grows inside the activity message.
+        const content = this.renderWithTail(chunks[0]);
+        if (Date.now() - this.lastReplyEditAt >= this.opts.throttleMs) {
+          this.lastReplyEditAt = Date.now();
+          await this.syncActivity(content);
+        }
+        return;
+      }
+      // "own": a live message per slice (created as the slices appear);
+      // only the growing last slice is edited (throttled, serialized).
+      while (this.textSlices.length < chunks.length) {
+        const i = this.textSlices.length;
+        this.textSlices.push(await this.opts.channel.send({ content: chunks[i], allowedMentions: SAFE_MENTIONS }));
+      }
+      const last = this.textSlices.length - 1;
       if (Date.now() - this.lastReplyEditAt >= this.opts.throttleMs) {
         this.lastReplyEditAt = Date.now();
-        const target = this.liveMessages[last];
+        const target = this.textSlices[last];
         if (target.content !== chunks[last]) await target.edit({ content: chunks[last], allowedMentions: SAFE_MENTIONS });
       }
     } catch (err) {
@@ -739,25 +1032,40 @@ export class ResponseWriter {
   }
 
   /**
-   * If no reply ever took over (non-stream mode, or a reasoning-only
-   * response), the thinking still completes into its terminal line at
-   * finish()/reportError()/interrupt() time, appended to the shared
-   * activity message, so the final post lands in a fresh message below it
-   * instead of overwriting it.
+   * Settle this round's text block: inside the activity message (when it
+   * fit) the final first slice becomes a settled block — recorded without
+   * a message id, the message being a UI line (never context, never
+   * tracked); when the text lives in its own message(s) (or outgrew the
+   * message with the final settle) the slices settle in place, and the
+   * record carries their ids (the seed skips it as tracked, and edits and
+   * deletes keep syncing). Returns what was posted (null only when the
+   * own-message settle posted nothing).
    */
-  private async completeThinking(): Promise<void> {
-    if (this.reasoningBuffer.length === 0 || this.thinkingSettled) return;
-    this.thinkingSettled = true;
-    const line = this.thinkingDoneLine();
-    this.activityLines.push(line);
-    this.dropOldestActivityLines();
-    await this.syncActivity(this.renderActivity());
+  private async settleText(text: string): Promise<PostedReply | null> {
+    const chunks = splitForDiscord(text, DISCORD_MAX_MESSAGE_CHARS, this.textFirstCap);
+    if (this.textMode === "activity") {
+      if (chunks.length === 1) {
+        this.blocks.push(chunks[0]);
+        this.collapseBlocks();
+        await this.syncActivity(this.renderBlocks());
+        this.resetTextState();
+        return { messageIds: [], text };
+      }
+      // The final text outgrew the message (the overflow appeared with the
+      // final settle, not during the stream): strip the tail out and settle
+      // the text in its own message(s).
+      if (this.activityMessage !== null) await this.syncActivity(this.renderBlocks());
+    }
+    const landed = await this.settleSlices(chunks);
+    if (this.activityMessage !== null) this.activityStale = true;
+    this.resetTextState();
+    return this.reported(landed, landed.length === chunks.length ? text : undefined);
   }
 
-  private async postInto(target: Message | null, content: string): Promise<Message> {
-    return target
-      ? await target.edit({ content, allowedMentions: SAFE_MENTIONS })
-      : await this.opts.channel.send({ content, allowedMentions: SAFE_MENTIONS });
+  private resetTextState(): void {
+    this.textMode = "none";
+    this.textFirstCap = DISCORD_MAX_MESSAGE_CHARS;
+    this.textSlices = [];
   }
 
   /**
@@ -767,11 +1075,11 @@ export class ResponseWriter {
    * beyond the live messages are posted fresh. Returns the messages in
    * send order; a live message with no chunk left (defensive) is deleted.
    */
-  private async settle(chunks: string[]): Promise<Message[]> {
+  private async settleSlices(chunks: string[]): Promise<Message[]> {
     const posted: Message[] = [];
-    const n = Math.max(this.liveMessages.length, chunks.length);
+    const n = Math.max(this.textSlices.length, chunks.length);
     for (let i = 0; i < n; i++) {
-      const live = this.liveMessages[i];
+      const live = this.textSlices[i];
       if (i < chunks.length) {
         try {
           posted.push(live ? await this.postInto(live, chunks[i]) : await this.opts.channel.send({ content: chunks[i], allowedMentions: SAFE_MENTIONS }));
@@ -779,21 +1087,27 @@ export class ResponseWriter {
           // Best effort: one failed chunk (rate limit, API hiccup) must not
           // strand the rest — the remaining chunks are still posted, and a
           // live message that failed to settle keeps its last preview.
-          log.warn(`final post: chunk ${i + 1}/${chunks.length} failed: ${errMsg(err)}`);
+          log.warn(`final post: slice ${i + 1}/${chunks.length} failed: ${errMsg(err)}`);
         }
       } else if (live) {
         await live.delete().catch(() => {});
       }
     }
-    this.liveMessages = [];
+    this.textSlices = [];
     return posted;
   }
 
   /** Delete any in-progress live messages (best-effort, normally none exist). */
-  private async clearLive(): Promise<void> {
-    const targets = this.liveMessages;
-    this.liveMessages = [];
+  private async clearTextSlices(): Promise<void> {
+    const targets = this.textSlices;
+    this.textSlices = [];
     for (const m of targets) await m.delete().catch(() => {});
+  }
+
+  private async postInto(target: Message | null, content: string): Promise<Message> {
+    return target
+      ? await target.edit({ content, allowedMentions: SAFE_MENTIONS })
+      : await this.opts.channel.send({ content, allowedMentions: SAFE_MENTIONS });
   }
 
   /**
@@ -820,7 +1134,7 @@ export class ResponseWriter {
 
   /**
    * Reasoning preview, capped at `max` chars (the room the preview has in
-   * the shared activity message): the whole thinking while it fits inline
+   * the activity message): the whole thinking while it fits inline
    * ("🤔 *thinking: …*", only while the buffer is complete); otherwise a
    * header + a "*N lines hidden*" line + the last REASONING_TAIL_LINES
    * lines of the thinking (cut from the front with a "…" when even those

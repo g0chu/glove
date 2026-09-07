@@ -36,14 +36,18 @@ npm run dev            # or: npm run build && npm start
   context and labeled `(bot)` in it, while the bot's own messages never
   are. Without a mention, a message only triggers the bot when chime is on
   (below).
-- **Chime** (`BOT_CHIME_ENABLED`, default off): the bot can *chime in* to
-  conversations it is not mentioned in — but only when another bot speaks,
-  and only if the model wants to. Each such message queues a turn in which
-  the model first makes one small tool-less decision (a YES/NO answer over
-  the channel's transcript): YES runs a normal turn (streamed reply, tools
-  and all), NO stays completely silent (no typing indicator, no message,
-  nothing recorded; a failed decision stays silent too). Human non-mentions
-  never trigger a chime.
+- **Chime** (`BOT_CHIME_ENABLED`, default off): non-mention messages from
+  humans or other bots queue a decision after the channel goes quiet. The
+  bot shows a typing indicator while the model decides. YES runs a normal
+  reply; NO posts a short decision and reason. A failed or unusable decision
+  gets one plain YES/NO repair attempt before staying silent. The first
+  request requires a tool decision; JSON and Markdown YES/NO responses are
+  also accepted. Typing refreshes stop when the decision finishes.
+- **Recovery safety:** compaction discards stale summaries if the context
+  changes while the model is summarizing. Interrupted or overflowing turns
+  retry only before tools execute. After execution, the bot retains the
+  completed rounds and reports that it stopped, avoiding automatic replay
+  of writes or shell commands. Web-fetch deadlines include DNS waiting.
 - **Stability gate:** a message is committed to the channel context (and
   able to queue a turn) only once it has been unchanged for
   `DISCORD_MESSAGE_STABLE_MS` (default 2000). Other bots stream their
@@ -182,3 +186,18 @@ See [.env.example](.env.example) for the documented list.
 | `npm start` | run the compiled bot |
 | `npm run typecheck` | type-check without emitting |
 | `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file/shell/zim tools, LLM client incl. tool calls vs. a mock endpoint) |
+
+### Chime prompt caching
+
+Chime keeps its system prompt and tool schema fixed, with new conversation
+messages at the end. Compatible servers can reuse that prefix. The bot logs
+`chime prompt cache: X/Y input tokens reused` when usage includes cache counts;
+missing counts mean unknown, not a cache miss. Decisions themselves are never
+cached.
+
+[llama-server documents](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+`cache_prompt` as enabled by default. Its `--cache-ram` and slot configuration
+control how cached prompts survive intervening requests; check your installed
+version before tuning them. Chime and reply prompts have different instructions
+and tool schemas, so reuse between those request types is limited. Edits and
+compaction also change prefixes. No server settings are changed by the bot.

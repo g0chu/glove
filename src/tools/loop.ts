@@ -1,4 +1,6 @@
 import type { ChatMessage, ChatResult, StreamCallbacks, ToolCall, ToolSpec } from "../llm/client.js";
+import { isInterruptedError } from "../llm/client.js";
+import { isContextOverflowError } from "../llm/context.js";
 import { executeToolCalls, ToolRegistry, type ToolResultMessage } from "./executor.js";
 
 /**
@@ -47,14 +49,22 @@ export interface ToolTurnDeps {
   maxRounds: number;
   /**
    * When provided, it is passed to every model call of the turn, so the
-   * caller can abort the in-flight request mid-turn (the channel-activity
-   * interruption, see index.ts: the channel changed while the prompt was
-   * being processed). An already-aborted signal makes the next call fail
-   * with the client's interruption error, which the caller turns into a
-   * quiet-wait, after which the turn is discarded (a newer turn supersedes
-   * it) or retried. Tool calls that are already executing run to
-   * completion (they have their own deadlines); only model calls are
-   * aborted.
+   * caller can interrupt the turn on channel activity (see index.ts). Only
+   * the PROMPT processing of a model call is interruptable: a signal aborted
+   * while the prompt is still being processed cancels the request at once,
+   * and an already-aborted signal makes the next call fail at once with the
+   * client's interruption error — both before the model's first token. Once
+   * generation has started (reasoning, tool calls, the response) the request
+   * runs to completion regardless of the signal, so activity during a tool
+   * execution interrupts the NEXT model call, before its prompt is sent.
+   * The caller turns the interruption error into a quiet-wait, after which
+   * the turn is discarded (a newer turn supersedes it) or retried with a
+   * freshly built context that carries everything that arrived while it
+   * waited. Tool calls that are already executing run to completion (they
+   * have their own deadlines); only not-yet-started prompt processing is
+   * aborted. After any executed round, interruption or overflow instead
+   * becomes an ordinary failure: the caller retains the rounds and stops,
+   * preventing automatic replay of side effects.
    */
   signal?: AbortSignal;
   /**
@@ -100,7 +110,17 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
   const tools = deps.registry.specs();
   let toolRounds = 0;
   for (;;) {
-    const res = await deps.chat(messages, undefined, tools.length > 0 ? tools : undefined, deps.signal);
+    let res: ChatResult;
+    try {
+      res = await deps.chat(messages, undefined, tools.length > 0 ? tools : undefined, deps.signal);
+    } catch (err) {
+      // Retrying from scratch loses executed operations and may repeat side
+      // effects. Use the ordinary error path, which records completed rounds.
+      if (toolRounds > 0 && (isInterruptedError(err) || isContextOverflowError(err))) {
+        throw new Error("stopped after tools executed because the model could not continue; completed tool results were retained and automatic retry was skipped");
+      }
+      throw err;
+    }
     if (res.toolCalls.length === 0) {
       const out: ToolTurnOutcome = { content: res.content, toolRounds, exhausted: false };
       if (res.reasoning) out.reasoning = res.reasoning;

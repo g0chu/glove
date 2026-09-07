@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatResult, StreamCallbacks, ToolSpec } from "./client.js";
+import type { ChatMessage, ChatResult, ChatRequestOptions, StreamCallbacks, ToolSpec } from "./client.js";
 
 /** One model request (the same shape `LlmClient.chat` and the tool loop's `chat` dep take). */
 export type ChatFn = (
@@ -7,6 +7,7 @@ export type ChatFn = (
   tools?: ToolSpec[],
   /** Optional: the caller's abort signal (the channel-activity interruption, see LlmClient.chat). */
   signal?: AbortSignal,
+  options?: ChatRequestOptions,
 ) => Promise<ChatResult>;
 
 /**
@@ -30,8 +31,8 @@ export class TurnTokens {
 
   /** Wrap a chat function so every call it makes reports its usage here. */
   track(chat: ChatFn): ChatFn {
-    return async (messages, callbacks, tools, signal) => {
-      const res = await chat(messages, callbacks, tools, signal);
+    return async (messages, callbacks, tools, signal, options) => {
+      const res = await chat(messages, callbacks, tools, signal, options);
       if (res.usage) {
         this.input += res.usage.input;
         this.output += res.usage.output;
@@ -62,11 +63,18 @@ export interface ServerSlot {
 /** The llama-server's context state, aggregated over all its slots. */
 export interface ServerMetrics {
   slots: ServerSlot[];
-  /** Sum of the slots' context windows (tokens). */
+  /**
+   * The context window of a single request (tokens): llama-server splits
+   * its -c across the -np parallel slots, so every request gets one slot's
+   * window. The SMALLEST slot's window (on a real server all slots are
+   * equal) — the sum would overstate what a request can use by a factor of
+   * -np.
+   */
   ctxSize: number;
   /**
-   * Sum of the slots' most-recent-request token counts (the server's
-   * current context use), or null when any slot does not report its count.
+   * The LARGEST of the slots' most-recent-request token counts (how full
+   * the fullest slot is right now, 0 when no slot has processed a request
+   * yet), or null when any slot does not report its count.
    */
   lastRequestTokens: number | null;
   /** True while any slot is generating. */
@@ -156,10 +164,14 @@ export class LlamaMetrics {
     }
     if (slots.length === 0) return null;
     const allReported = slots.every((s) => s.lastRequestTokens !== null);
+    // A request lands on ONE slot, so the window that matters is one slot's
+    // n_ctx (llama-server divides -c by -np) — the sum would be -np times
+    // too large. The smallest slot is the conservative guarantee, and the
+    // largest recent request is the fullest slot's use.
     return {
       slots,
-      ctxSize: slots.reduce((a, s) => a + s.ctxSize, 0),
-      lastRequestTokens: allReported ? slots.reduce((a, s) => a + (s.lastRequestTokens ?? 0), 0) : null,
+      ctxSize: Math.min(...slots.map((s) => s.ctxSize)),
+      lastRequestTokens: allReported ? slots.reduce((a, s) => Math.max(a, s.lastRequestTokens ?? 0), 0) : null,
       processing: slots.some((s) => s.processing),
     };
   }
