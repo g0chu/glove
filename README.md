@@ -39,12 +39,12 @@ npm run dev            # or: npm run build && npm start
 - **Chime** (`BOT_CHIME_ENABLED`, default off): non-mention messages from
   humans or other bots queue a decision after the channel goes quiet. The
   bot shows a typing indicator while the model decides. YES runs a normal
-  reply; NO posts a short decision and reason. An unusable decision or tool
-  compatibility rejection gets one plain YES/NO repair attempt before staying
-  silent; timeouts and outages do not retry. Both decision requests cap output
-  at 1,024 tokens (including reasoning on compatible endpoints). The first
-  request requires a tool decision; JSON and Markdown YES/NO responses are
-  also accepted. Typing refreshes stop when the decision finishes. Failure logs
+  reply; NO optionally posts a short decision and reason. Only a `chime` tool
+  call is accepted; plain text (including YES/NO and JSON) never decides.
+  An unusable decision gets one repair with the tool still required; HTTP
+  failures, timeouts and outages do not retry. Both decision requests cap
+  output at 1,024 tokens (including reasoning on compatible endpoints).
+  Typing refreshes stop when the decision finishes. Failure logs
   identify the channel and message; streaming timeouts report whether generation
   started, distinguishing a first-token wait from unfinished generation.
 - **Recovery safety:** compaction discards stale summaries if the context
