@@ -604,8 +604,7 @@ const ok = (name: string): void => {
 {
   // The chime decision (driven with a fake client — no HTTP): the model sees
   // the system prompt + the transcript and reports the decision as a call of
-  // the chime tool (respond + reason). A plain-text answer falls back to the
-  // leading word; garbage, an empty answer, and a failed call stay silent.
+  // the chime tool (respond + reason). Text and failed calls stay silent.
   const transcript: ChatMessage[] = [
     { role: "user", content: "Alice: hi" },
     { role: "user", content: "Bob (bot): should we ship it?" },
@@ -629,53 +628,36 @@ const ok = (name: string): void => {
   assert.equal(await decideChime(toolChat({ reason: "no flag" }), transcript), null, "a missing respond flag stays silent");
   assert.deepEqual(await decideChime(toolChat({ respond: false }), transcript),
     { respond: false, reason: "" }, "a missing reason is tolerated");
-  assert.deepEqual(await decideChime(textChat("YES — it asks a direct question"), transcript),
-    { respond: true, reason: "it asks a direct question" }, "plain text falls back to the leading word");
-  assert.deepEqual(await decideChime(textChat("no, it is just chatter"), transcript),
-    { respond: false, reason: "it is just chatter" }, "the rest of the text is the reason");
-  assert.equal(await decideChime(textChat("maybe"), transcript), null, "plain-text garbage stays silent");
-  assert.equal(await decideChime(textChat(""), transcript), null, "an empty answer stays silent");
-  assert.equal(await decideChime(textChat("", true), transcript), null, "a failed call stays silent");
-  ok("chime: the chime tool decides (respond + reason); plain text falls back; garbage/empty/failed stay silent");
-
-  for (const answer of [
-    '{"respond":true,"reason":"direct question"}',
-    '```json\n{"respond":true,"reason":"direct question"}\n```',
-    "**YES** — direct question", "*YES*: direct question", "`YES`: direct question",
-  ]) {
-    assert.deepEqual(await decideChime(textChat(answer), transcript), { respond: true, reason: "direct question" });
+  for (const answer of ["YES — direct question", "NO chatter", "**YES**", "maybe", "",
+    '{"respond":true,"reason":"question"}', '```json\n{"respond":false}\n```']) {
+    assert.equal(await decideChime(textChat(answer), transcript), null, "text never decides");
   }
-  assert.deepEqual(await decideChime(textChat('```json\n{"respond":false,"reason":"chatter"}\n```'), transcript),
-    { respond: false, reason: "chatter" });
-  for (const answer of ["yesterday was good", "not sure", "nobody asked", "I think YES", '{"reason":"YES"}']) {
-    assert.equal(await decideChime(textChat(answer), transcript), null, "ambiguous answers never become decisions");
-  }
-  assert.equal(await decideChime(async () => ({ content: "", reasoning: "YES, perhaps", toolCalls: [] }), transcript), null);
-  assert.equal(await decideChime(async () => ({ content: "", toolCalls: [{ id: "t", name: "other", arguments: '{"respond":true}' }] }), transcript), null);
-  assert.deepEqual(await decideChime(async () => ({ content: "NO — chatter", toolCalls: [{ id: "t", name: "chime", arguments: "broken" }] }), transcript),
-    { respond: false, reason: "chatter" });
-  ok("chime: JSON and decorated decisions work; unrelated tools, reasoning and word prefixes never decide");
+  assert.equal(await decideChime(textChat("", true), transcript), null);
+  ok("chime: only tool calls decide; text, JSON and failed calls stay silent");
+  assert.equal(await decideChime(async () => ({ content: "", reasoning: "YES", toolCalls: [] }), transcript), null);
+  assert.equal(await decideChime(async () => ({ content: "YES", toolCalls: [{ id: "t", name: "other", arguments: '{"respond":true}' }] }), transcript), null);
+  assert.equal(await decideChime(async () => ({ content: "NO chatter", toolCalls: [{ id: "t", name: "chime", arguments: "broken" }] }), transcript), null);
+  ok("chime: unrelated tools, reasoning and text beside broken arguments never decide");
 
-  // Bounded compatibility recovery: required tool first, plain decision once.
-  for (const first of ["empty", "invalid", "unsupported", "multiple"] as const) {
+  // Bounded recovery: the chime tool is required on both calls.
+  for (const first of ["empty", "invalid", "multiple"] as const) {
     const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string; maxTokens?: number }> = [];
     const recovered = await decideChime(async (messages, tools, signal, options) => {
       requests.push({ messages, tools, choice: options?.toolChoice, maxTokens: options?.maxTokens });
       if (requests.length === 1) {
-        if (first === "unsupported") throw new Error("model endpoint returned HTTP 400: tool_choice is not supported");
         if (first === "multiple") return { content: "", toolCalls: [
           { id: "1", name: "chime", arguments: '{"respond":true}' },
           { id: "2", name: "chime", arguments: '{"respond":false}' },
         ] };
         return { content: first === "empty" ? "" : "maybe", toolCalls: [] };
       }
-      return { content: "NO — chatter", toolCalls: [] };
+      return { content: "", toolCalls: [{ id: "fixed", name: "chime", arguments: '{"respond":false,"reason":"chatter"}' }] };
     }, transcript);
     assert.deepEqual(recovered, { respond: false, reason: "chatter" });
     assert.equal(requests.length, 2);
     assert.equal(requests[0].choice, "required");
-    assert.equal(requests[1].tools, undefined);
-    assert.equal(requests[1].choice, undefined);
+    assert.deepEqual(requests[1].tools, [CHIME_TOOL_SPEC]);
+    assert.equal(requests[1].choice, "required");
     assert.equal(requests[0].maxTokens, CHIME_MAX_TOKENS);
     assert.equal(requests[1].maxTokens, CHIME_MAX_TOKENS, "repair also bounds generation");
     assert.deepEqual(requests[1].messages.slice(0, -1), requests[0].messages, "repair preserves the message prefix");
@@ -683,7 +665,7 @@ const ok = (name: string): void => {
   let attempts = 0;
   assert.equal(await decideChime(async () => { attempts++; return { content: "maybe", toolCalls: [] }; }, transcript), null);
   assert.equal(attempts, 2, "unusable decisions stop after one repair");
-  for (const failure of [new Error("model endpoint returned HTTP 401: unauthorized"), new Error("model request timed out"), new Error("HTTP 500: unavailable")]) {
+  for (const failure of [new Error("HTTP 400: tool_choice unsupported"), new Error("HTTP 422: tools unsupported"), new Error("model endpoint returned HTTP 401: unauthorized"), new Error("model request timed out"), new Error("HTTP 500: unavailable")]) {
     attempts = 0;
     assert.equal(await decideChime(async () => { attempts++; throw failure; }, transcript), null);
     assert.equal(attempts, 1, "outages and timeouts are not multiplied");
@@ -4989,15 +4971,12 @@ const ok = (name: string): void => {
   const recoveryChat = account.track((messages, callbacks, tools, signal, options) => recoveryClient.chat(messages, callbacks, tools, signal, options));
   const requestStart = seenRequests.length;
   assert.deepEqual(await decideChime((messages, tools, signal, options) => recoveryChat(messages, undefined, tools, signal, options), [{ role: "user", content: "hello" }]),
-    { respond: false, reason: "this is chatter" });
+    null);
   const recoveryRequests = seenRequests.slice(requestStart).map(r => r.body as Record<string, unknown>);
-  assert.equal(recoveryRequests.length, 2);
+  assert.equal(recoveryRequests.length, 1);
   assert.equal(recoveryRequests[0].tool_choice, "required");
-  assert.equal(recoveryRequests[1].tools, undefined);
-  assert.equal(recoveryRequests[1].tool_choice, undefined);
   assert.equal(recoveryRequests[0].max_tokens, CHIME_MAX_TOKENS);
-  assert.equal(recoveryRequests[1].max_tokens, CHIME_MAX_TOKENS, "repair token limit reaches HTTP through accounting");
-  ok("chime: real HTTP tool rejection recovers through accounting and streamed plain-text parsing");
+  ok("chime: real HTTP tool rejection stays silent without a text fallback");
 
   server.close();
 }
@@ -5198,12 +5177,12 @@ const ok = (name: string): void => {
       if (outcome === "failure") fail(new Error("offline"));
       else if (outcome === "interrupted") fail(new InterruptedError());
       else if (outcome === "overflow") fail(new Error("request (9000 tokens) exceeds the available context size (8000 tokens)"));
-      else finish({ content: outcome === "broken" ? "garbage" : outcome, toolCalls: [] });
+      else finish({ content: outcome === "broken" ? "garbage" : "", toolCalls: outcome === "broken" ? [] : [{ id: "decision", name: "chime", arguments: JSON.stringify({ respond: outcome === "yes", reason: "test" }) }] });
       await checked;
       mock.timers.tick(500);
       assert.equal(typing, 2, "all exit paths stop refreshing typing");
     }
-    assert.equal((await decideChime(async () => ({ content: "yes", toolCalls: [] }), [], undefined,
+    assert.equal((await decideChime(async () => ({ content: "", toolCalls: [{ id: "t", name: "chime", arguments: '{"respond":true,"reason":"test"}' }] }), [], undefined,
       { sendTyping: async () => { throw new Error("Discord unavailable"); }, intervalMs: 100 }))?.respond, true);
   } finally { mock.timers.reset(); }
   ok("chime: typing starts and refreshes during decisions, stops on every outcome, and tolerates Discord errors");
