@@ -1,7 +1,7 @@
 import type { ChatMessage, ChatResult, StreamCallbacks, ToolCall, ToolSpec } from "../llm/client.js";
 import { isInterruptedError } from "../llm/client.js";
 import { isContextOverflowError } from "../llm/context.js";
-import { executeToolCalls, ToolRegistry, type ToolResultMessage } from "./executor.js";
+import { executeToolCalls, ToolRegistry, type ToolResultMessage, type ToolExecutionObserver } from "./executor.js";
 
 /**
  * One executed tool round of a turn: the model's answer for the round (its
@@ -93,6 +93,8 @@ export interface ToolTurnDeps {
    * preserved in full, not just the final reply).
    */
   onRoundComplete?: (round: ToolRound) => void;
+  /** Per-round observer journals each tool before execution and on completion. */
+  observeTools?: (round: number) => ToolExecutionObserver;
 }
 
 export interface ToolTurnOutcome {
@@ -141,7 +143,7 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
     }
     await deps.onToolRound?.();
     await deps.onToolCalls?.(res.toolCalls);
-    const results = await executeToolCalls(deps.registry, res.toolCalls);
+    const results = await executeToolCalls(deps.registry, res.toolCalls, deps.observeTools?.(toolRounds));
     const round: ToolRound = { content: res.content, calls: res.toolCalls, results };
     if (res.reasoning) round.reasoning = res.reasoning;
     // The next round continues with the round's full conversation: text,

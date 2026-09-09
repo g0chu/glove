@@ -20,12 +20,19 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import type { AddressInfo } from "node:net";
 import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMentionText } from "../src/bot/router.js";
 import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError, type ContextEntry } from "../src/llm/context.js";
 import { ChatPersistence } from "../src/llm/persist.js";
+import { ConversationArchive, type ArchiveRecord } from "../src/llm/archive.js";
+import { archiveChat } from "../src/llm/archived-chat.js";
+import { recoverTurns } from "../src/llm/recovery.js";
+import { archiveTools } from "../src/tools/archive.js";
+import { archiveAttachments } from "../src/bot/attachment-store.js";
+import { captureCatchup } from "../src/bot/catchup.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
 import { CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
@@ -88,6 +95,8 @@ const ok = (name: string): void => {
   assert.equal(config.model.timeoutMs, 5000);
   assert.equal(config.model.contextMaxMessages, 7);
   assert.equal(config.model.apiKey, "k1");
+  assert.equal(config.model.archiveDir, "./data/archive");
+  assert.equal(parseConfig({ DISCORD_TOKEN: "tok", MODEL_API_URL: "http://localhost:8080/v1/chat/completions", CHATS_ARCHIVE_DIR: "/tmp/custom-archive" }).config.model.archiveDir, "/tmp/custom-archive");
   assert.equal(config.model.enableImages, false); // default
   assert.equal(config.model.imagesMaxBytes, 2048);
   assert.equal(config.model.enableFileContents, true);
@@ -2033,6 +2042,27 @@ const ok = (name: string): void => {
   assert.equal(restored.snapshot().length, roundTrip.length + 1);
   ok("context: serialize/restore round-trips the full turn conversation (malformed entries skipped)");
 
+  const catchupData = roundTrip.serialize();
+  catchupData.entries.forEach((e, i) => { e.ts = 100 + i * 10; });
+  const catchup = ChannelContext.restore(catchupData);
+  catchup.pushAssistant("", [], undefined, { reasoning: "a reasoning-only answer" });
+  catchup.pushUser("Bob", "next question", "catchup-trigger", Date.now() + 1, []);
+  catchup.seedFrom([
+    { id: "between", ts: 115, role: "user", name: "Bob", content: "during the tool", attachments: [] },
+    { id: "prior", ts: 105, role: "assistant", content: "earlier answer", attachments: [] },
+  ]);
+  const catchupEntries = catchup.snapshot();
+  const callIndex = catchupEntries.findIndex((e) => e.toolCalls?.[0]?.id === "rtc");
+  assert.ok(callIndex >= 0, "catch-up must not merge away the assistant's calls");
+  assert.equal(catchupEntries[callIndex].reasoning, "the plan");
+  assert.equal(catchupEntries[callIndex + 1].toolCallId, "rtc", "an offline message cannot split calls from results");
+  assert.equal(catchup.find("rtf1")?.reasoning, "done thinking");
+  const catchupMessages = await contextToMessages(catchup, renderOpts);
+  assert.ok(catchupMessages.some((m) => m.content === "" && m.reasoningContent === "a reasoning-only answer"));
+  assert.equal(prefixEndIndex(catchup, renderOpts, "catchup-trigger"), catchupMessages.length);
+  assert.deepEqual(ChannelContext.restore(catchup.serialize()).snapshot(), catchup.snapshot());
+  ok("context: catch-up preserves reasoning, tool groups and reasoning-only request entries");
+
   // File persistence: save writes atomically (tmp + rename, valid JSON),
   // load restores every channel, remove forgets one, and a missing or
   // corrupt file fails soft to an empty store (the old re-seed behavior).
@@ -2071,6 +2101,10 @@ const ok = (name: string): void => {
     assert.equal((JSON.parse(fs.readFileSync(pfile, "utf8")) as { channels: Record<string, unknown> }).channels["chan1"], undefined, "remove forgets the channel");
     fs.writeFileSync(pfile, '{"version": 1, "channels": {"c": '); // a truncated write (a crash mid-write)
     assert.deepEqual([...new ChatPersistence(pfile).load().keys()], [], "a corrupt file fails soft to an empty store");
+    for (const invalid of ["null", "42", '{"version":1,"channels":[]}']) {
+      fs.writeFileSync(pfile, invalid);
+      assert.deepEqual([...new ChatPersistence(pfile).load().keys()], [], "invalid JSON shapes fail soft");
+    }
     assert.deepEqual([...new ChatPersistence(path.join(pdir, "missing.json")).load().keys()], [], "a missing file is an empty store (first run)");
     ok("persistence: save/load/remove round-trip the file (atomic), corrupt/missing files fail soft");
 
@@ -5186,6 +5220,288 @@ const ok = (name: string): void => {
       { sendTyping: async () => { throw new Error("Discord unavailable"); }, intervalMs: 100 }))?.respond, true);
   } finally { mock.timers.reset(); }
   ok("chime: typing starts and refreshes during decisions, stops on every outcome, and tolerates Discord errors");
+}
+
+// ------------------------------------------------------- durable archive --
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-"));
+  const journal = path.join(dir, "events.jsonl");
+  const records = (): ArchiveRecord[] => fs.readFileSync(journal, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as ArchiveRecord);
+  let archive = new ConversationArchive(dir);
+  try {
+    assert.throws(() => new ConversationArchive(dir), /already owned/, "a second writer is refused");
+    const context = new ChannelContext();
+    context.onChange = () => archive.record("context.checkpoint", { channelId: "c" }, context.serialize());
+    context.pushUser("Alice", "remember this original", "100", 100, []);
+    const beforeTurn = records().length;
+    context.appendTurn([{
+      content: "original narration", reasoning: "full reasoning", ids: ["101"],
+      calls: [{ id: "call", name: "echo", arguments: '{"value":"original argument"}' }],
+      results: [{ toolCallId: "call", name: "echo", content: "original tool result" }],
+    }], { content: "original response", reasoning: "final reasoning", ids: ["102"] });
+    assert.equal(records().length, beforeTurn + 1, "whole turn is one atomic checkpoint, never orphaned calls");
+    const fullCheckpoint = records().at(-1)!;
+    context.pushUser("Bob", "recent", "103", 103, []);
+    await context.compact(1, async () => "lossy summary", "103");
+    context.reset();
+    assert.equal(archive.restoreContexts().get("c")?.entries.length, 0);
+    const original = archive.readData<{ entries: Array<{ content: string; reasoning?: string }> }>(fullCheckpoint);
+    assert.ok(original.entries.some((e) => e.content === "original tool result"));
+    assert.ok(original.entries.some((e) => e.reasoning === "full reasoning"));
+    assert.equal(archive.wasTracked("c", "100"), true, "retired IDs remain excluded from seeding");
+    archive.record("discord.message", { channelId: "c", messageId: "200" }, { content: "before edit" });
+    archive.record("catchup.started", { channelId: "c" }, { after: "200" });
+    archive.record("discord.message", { channelId: "c", messageId: "400" }, { content: "new arrival during catch-up" });
+    archive.record("discord.message", { channelId: "c", messageId: "200" }, { content: "after edit" });
+    archive.record("discord.deleted", { channelId: "c", messageId: "200" }, {});
+    archive.record("tool.started", { channelId: "c", executionId: "unfinished" }, { call: { id: "maybe-executed" } });
+    const seq = records().at(-1)!.seq;
+    archive.close();
+    fs.appendFileSync(journal, '{"version":1,"seq":');
+    archive = new ConversationArchive(dir);
+    assert.ok(archive.recoveredTail);
+    assert.equal(fs.readFileSync(archive.recoveredTail!, "utf8"), '{"version":1,"seq":');
+    assert.equal(archive.record("reopened", {}, {}), seq + 1);
+    assert.deepEqual(archive.incomplete().tools.map((r) => r.scope.executionId), ["unfinished"]);
+    assert.equal(archive.catchupCursors().get("c"), "200", "restart retains the offline gap despite newer gateway arrivals");
+    assert.equal(archive.restoreContexts().get("c")?.entries.length, 0, "clear survives archive recovery");
+    assert.equal(archive.wasTracked("c", "100"), true);
+    assert.deepEqual(records().filter((r) => r.type === "discord.message" && r.scope.messageId === "200").map((r) => archive.readData(r)), [
+      { content: "before edit" }, { content: "after edit" },
+    ]);
+    ok("archive: full history survives compaction, clear, edits, deletions, torn-tail recovery and restart");
+
+    let release!: (text: string) => void;
+    let executions = 0;
+    const registry = new ToolRegistry().register({ name: "echo", description: "test", parameters: {} }, async (args) => {
+      executions++;
+      assert.ok(records().some((r) => r.type === "tool.started" && archive.readData<{ call: { arguments: string } }>(r).call.arguments === JSON.stringify(args)), "start is durable before handler execution");
+      if (args.slow) return new Promise<string>((resolve) => { release = resolve; });
+      return "fast result";
+    });
+    const pending = executeToolCalls(registry, [
+      { id: "duplicate", name: "echo", arguments: '{"slow":true}' },
+      { id: "duplicate", name: "echo", arguments: "{}" },
+    ], archiveTools(archive, { channelId: "c", turnId: "tools", round: 0 }));
+    await ticks(3);
+    assert.ok(records().some((r) => r.type === "tool.finished" && archive.readData<{ result: { content: string } }>(r).result.content === "fast result"), "fast result is durable while the other tool still runs");
+    assert.equal(archive.incomplete().tools.length, 2, "old indeterminate execution and current slow execution");
+    release("slow result");
+    assert.deepEqual((await pending).map((r) => r.content), ["slow result", "fast result"]);
+    assert.equal(archive.incomplete().tools.length, 1);
+    const executionIds = records().filter((r) => r.type === "tool.started" && r.scope.turnId === "tools").map((r) => r.scope.executionId);
+    assert.equal(new Set(executionIds).size, 2, "model-supplied duplicate IDs do not collide in the archive");
+    archive.close();
+    await assert.rejects(executeToolCalls(registry, [{ id: "never", name: "echo", arguments: "{}" }], archiveTools(archive, {})), /closed/);
+    assert.equal(executions, 2, "archive failure prevents tool execution");
+    archive = new ConversationArchive(dir);
+    assert.equal(executions, 2, "recovery never replays a handler");
+    ok("archive: tools journal before execution and individually on completion; recovery never replays side effects");
+
+    const att = { url: "https://cdn.discordapp.com/attachments/a/b/file.txt", name: "file.txt", size: 12, contentType: "text/plain" };
+    const bytes = Buffer.from("original file\n");
+    const saved = await fetchMessageFiles([att], 1000, {
+      storage: archiveAttachments(archive, { channelId: "c", messageId: "200" }),
+      fetchImpl: async () => new Response(bytes),
+    });
+    assert.equal(saved.files.length, 1);
+    const imageAtt = { ...att, url: att.url + ".png", name: "file.png", contentType: "image/png" };
+    const imageResult = await fetchMessageImages([imageAtt], 1000, {
+      storage: archiveAttachments(archive, { channelId: "c" }), fetchImpl: async () => new Response(bytes),
+    });
+    const captured = records().filter((r) => r.type === "attachment.saved").map((r) => archive.readData<{ blob: string }>(r).blob);
+    assert.equal(captured[0], captured[1], "identical attachment bytes deduplicate by content");
+    archive.close();
+    archive = new ConversationArchive(dir);
+    const storage = archiveAttachments(archive, { channelId: "c" });
+    const unavailable = async (): Promise<Response> => { throw new Error("CDN expired"); };
+    assert.deepEqual(await fetchMessageFiles([att], 1000, { storage, fetchImpl: unavailable }), saved);
+    assert.deepEqual(await fetchMessageImages([imageAtt], 1000, { storage, fetchImpl: unavailable }), imageResult);
+    assert.equal((await fetchMessageFiles([att], 1, { storage, fetchImpl: unavailable })).files.length, 0, "cache does not bypass byte caps");
+    await assert.rejects(fetchMessageFiles([{ ...att, url: att.url + "?new" }], 1000, {
+      storage: { load: () => null, save: () => { throw new Error("disk full"); } }, fetchImpl: async () => new Response(bytes),
+    }), /disk full/, "archive failure must not silently send unarchived file content");
+    ok("archive: attachment bytes deduplicate and survive expired URLs across restart, with limits enforced");
+
+    const partialChat = archiveChat(archive, { channelId: "c", turnId: "partial" }, async (_messages, cbs) => {
+      cbs?.onRequest?.({ messages: [], stream: true });
+      cbs?.onResponseBytes?.(Buffer.from('data: {"choices":[{"delta":{"reasoning":"unfinished thought"}}]}\n\n'));
+      throw new Error("connection lost");
+    });
+    await assert.rejects(partialChat([]), /connection lost/);
+    const partial = records().filter((r) => r.scope.turnId === "partial");
+    assert.ok(partial.some((r) => r.type === "model.failed"));
+    assert.ok(archive.readBlob(archive.readData<{ blob: string }>(partial.find((r) => r.type === "model.bytes")!).blob).includes("unfinished thought"));
+    ok("archive: failed generations retain received reasoning bytes and failure identity");
+  } finally {
+    archive.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-corrupt-"));
+  try {
+    const archive = new ConversationArchive(dir);
+    archive.record("test", {}, { preserved: true });
+    archive.close();
+    const journal = path.join(dir, "events.jsonl");
+    const original = fs.readFileSync(journal, "utf8");
+    fs.writeFileSync(journal, original.replace('"seq":1', '"seq":2'));
+    assert.throws(() => new ConversationArchive(dir), /corrupt/);
+    assert.equal(fs.readFileSync(journal, "utf8"), original.replace('"seq":1', '"seq":2'), "complete corrupt records are never silently truncated");
+    fs.writeFileSync(journal, original);
+    const row = JSON.parse(original) as ArchiveRecord;
+    fs.writeFileSync(path.join(dir, "blobs", row.data), "corrupt");
+    assert.throws(() => new ConversationArchive(dir), /blob is corrupt/);
+    ok("archive: journal and payload corruption fail closed without destroying evidence");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const messages = Array.from({ length: 251 }, (_, i) => ({ id: String(1000 + i) }));
+  const seen: string[] = [];
+  let fetches = 0;
+  await captureCatchup("1000", async (before) => {
+    fetches++;
+    return messages.filter((m) => !before || BigInt(m.id) < BigInt(before)).slice(-100).reverse();
+  }, (message) => { seen.push(message.id); });
+  assert.equal(fetches, 3);
+  assert.equal(seen.length, 250);
+  assert.equal(new Set(seen).size, 250);
+  assert.ok(!seen.includes("1000"));
+  let firstRunFetches = 0;
+  await captureCatchup(null, async () => { firstRunFetches++; return messages.slice(-100); }, () => {});
+  assert.equal(firstRunFetches, 1, "first archive baseline is bounded");
+  await assert.rejects(captureCatchup("1000", async () => messages.slice(-100), () => {}), /did not advance/);
+  ok("archive: offline catch-up paginates beyond 100 messages and rejects nonadvancing pages");
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-recover-turns-"));
+  let archive = new ConversationArchive(dir);
+  const makeStore = (): ChannelContextStore => {
+    const store = new ChannelContextStore((channelId, context) => archive.record("context.checkpoint", { channelId }, context.serialize()));
+    for (const [id, data] of archive.restoreContexts()) if (data) store.restore(id, data);
+    return store;
+  };
+  try {
+    let store = makeStore();
+    store.get("c").pushUser("Alice", "do work", "trigger", 100, []);
+    const scope = { channelId: "c", turnId: "interrupted", messageId: "trigger", attempt: 0, round: 0, purpose: "reply" as const };
+    archive.record("turn.started", scope, { id: "trigger", chime: false });
+    const calls = [{ id: "one", name: "echo", arguments: "{}" }, { id: "two", name: "echo", arguments: "{}" }];
+    archive.record("model.finished", scope, { content: "raw narration", reasoning: "retained thought", toolCalls: calls });
+    const observer = archiveTools(archive, scope);
+    observer.started(calls[0], 0);
+    observer.started(calls[1], 1);
+    observer.finished({ role: "tool", name: "echo", toolCallId: "one", content: "completed before crash" }, 0);
+    archive.close();
+    archive = new ConversationArchive(dir);
+    store = makeStore();
+    assert.equal(recoverTurns(archive, store), 1);
+    const entries = store.get("c").snapshot();
+    assert.equal(entries[1].reasoning, "retained thought");
+    assert.equal(entries[2].content, "completed before crash");
+    assert.match(entries[3].content, /indeterminate.*restart/);
+    assert.equal(entries[3].toolCallId, "two");
+    assert.equal(archive.incomplete().tools.length, 1, "archive evidence remains indeterminate, never forged into a completed execution");
+    const recovered = store.get("c").serialize();
+    archive.close();
+    archive = new ConversationArchive(dir);
+    store = makeStore();
+    assert.equal(recoverTurns(archive, store), 0);
+    assert.deepEqual(store.get("c").snapshot(), ChannelContext.restore(recovered).snapshot(), "second restart does not duplicate recovered work");
+    archive.record("turn.started", { ...scope, turnId: "checkpointed" }, {});
+    store.get("c").appendTurn([], { content: "already recorded before crash", ids: [] }, "checkpointed");
+    assert.equal(recoverTurns(archive, store), 0, "crash after checkpoint but before turn.finished stays idempotent");
+    archive.record("turn.started", { ...scope, turnId: "cleared" }, {});
+    archive.record("model.finished", { ...scope, turnId: "cleared" }, { content: "must not restore", toolCalls: [] });
+    store.get("c").reset();
+    assert.equal(recoverTurns(archive, store), 0);
+    assert.equal(store.get("c").length, 0, "cleared trigger prevents resurrection");
+    const deleted = store.get("gone");
+    deleted.pushUser("Alice", "old", "old", 1, []);
+    archive.record("channel.deleted", { channelId: "gone" }, {});
+    store.clear("gone");
+    deleted.setMeasuredTokens(10);
+    assert.equal(archive.restoreContexts().get("gone"), null, "late turn accounting cannot resurrect a deleted channel");
+    ok("archive: crash recovery restores completed work once, labels uncertain tools, and respects clears/deletions");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-http-"));
+  const archive = new ConversationArchive(dir);
+  const sse = 'data: {"choices":[{"delta":{"reasoning_content":"full thought","content":"hello 🌍","tool_calls":[{"index":0,"id":"tc","function":{"name":"echo","arguments":"{}"}}]}}]}\n\ndata: [DONE]\n\n';
+  const json = JSON.stringify({ choices: [{ message: { content: "json answer", reasoning_content: "json thought" } }] });
+  let wireRequest = "";
+  let brokenResponse: http.ServerResponse | undefined;
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += String(chunk); });
+    req.on("end", () => {
+      wireRequest = body;
+      if (req.url === "/json") { res.setHeader("Content-Type", "application/json"); res.end(json); }
+      else if (req.url === "/broken") {
+        brokenResponse = res;
+        res.setHeader("Content-Type", "text/event-stream");
+        res.write('data: {"choices":[{"delta":{"reasoning_content":"unfinished reasoning"}}]}\n\n');
+      } else { res.setHeader("Content-Type", "text/event-stream"); res.end(sse); }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    for (const mode of ["stream", "json", "broken"]) {
+      const llm = new LlmClient({ apiUrl: `${base}/${mode}`, apiKey: "archive-test-secret-key", model: "test-model", stream: mode !== "json", timeoutMs: 5000 });
+      const chat = archiveChat(archive, { channelId: "c", turnId: mode }, llm.chat.bind(llm));
+      const pending = chat([{ role: "user", content: "exact input" }], { onReasoning: () => { if (mode === "broken") brokenResponse?.destroy(); } });
+      if (mode === "broken") await assert.rejects(pending);
+      else assert.equal((await pending).reasoning, mode === "stream" ? "full thought" : "json thought");
+      const events = [...archive.records()].filter((r) => r.scope.turnId === mode);
+      assert.deepEqual(archive.readData(events.find((r) => r.type === "model.request")!), JSON.parse(wireRequest));
+      const received = Buffer.concat(events.filter((r) => r.type === "model.bytes").map((r) => archive.readBlob(archive.readData<{ blob: string }>(r).blob))).toString("utf8");
+      if (mode === "broken") assert.match(received, /unfinished reasoning/);
+      else assert.equal(received, mode === "stream" ? sse : json, "exact response bytes preserved, including SSE framing and Unicode");
+    }
+    for (const file of fs.readdirSync(path.join(dir, "blobs"))) {
+      assert.ok(!fs.readFileSync(path.join(dir, "blobs", file)).includes("archive-test-secret-key"), "authorization headers are never archived");
+    }
+    ok("archive: real HTTP JSON/SSE requests, responses, reasoning, tool fragments and broken streams round-trip without auth headers");
+  } finally {
+    archive.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-cli-"));
+  const dir = path.join(parent, "archive");
+  const archive = new ConversationArchive(dir);
+  archive.record("discord.message", { channelId: "c", messageId: "1" }, { content: "export me" });
+  archive.close();
+  const cli = (...args: string[]): ReturnType<typeof spawnSync> => spawnSync(process.execPath, ["--import", "tsx", "src/archive-cli.ts", ...args], { encoding: "utf8" });
+  try {
+    const inspected = cli("inspect", dir);
+    assert.equal(inspected.status, 0, String(inspected.stderr));
+    assert.equal(JSON.parse(String(inspected.stdout)).lastSequence, 1);
+    const exported = cli("export", dir, "--channel=c");
+    assert.equal(exported.status, 0, String(exported.stderr));
+    assert.equal(JSON.parse(String(exported.stdout)).payload.content, "export me");
+    assert.notEqual(cli("purge", dir).status, 0);
+    assert.ok(fs.existsSync(dir), "purge without confirmation keeps archive intact");
+    const locked = new ConversationArchive(dir);
+    assert.notEqual(cli("purge", dir, "--confirm").status, 0);
+    locked.close();
+    fs.writeFileSync(path.join(parent, "chats.json"), "working context");
+    assert.equal(cli("purge", dir, "--confirm").status, 0);
+    assert.ok(!fs.existsSync(dir));
+    assert.equal(fs.readFileSync(path.join(parent, "chats.json"), "utf8"), "working context");
+    ok("archive: inspect/export work; purge requires explicit confirmation and refuses an active writer");
+  } finally { fs.rmSync(parent, { recursive: true, force: true }); }
 }
 
 console.log(`\n${checks} check groups passed`);

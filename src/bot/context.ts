@@ -16,6 +16,7 @@ import {
   type MessageAttachmentLike,
 } from "./images.js";
 import { replaceMentionText } from "./router.js";
+import type { AttachmentStore } from "./attachment-store.js";
 
 /** Discord's hard cap on `messages.fetch` `limit`. */
 const DISCORD_FETCH_LIMIT = 100;
@@ -48,6 +49,10 @@ function toMessageLike(m: Message): MessageLike {
 }
 
 export interface ContextOptions {
+  /** Durable attachment bytes shared across requests and restarts. */
+  attachmentStore?: AttachmentStore;
+  /** Reject a seed entry previously retired from the working context. */
+  acceptSeed?: (id: string) => boolean;
   /** The bot's own user id (its non-reply lines are never context). */
   botId: string;
   /**
@@ -137,6 +142,7 @@ export async function buildChannelContext(
         seed
           .map((m) => toSeedEntry(m, opts.botId, opts.botName))
           .filter((e): e is SeedEntry => e !== null)
+          .filter((e) => context.has(e.id) || opts.acceptSeed?.(e.id) !== false)
           .filter((e) => clearedAt === null || e.ts > clearedAt),
       );
     }
@@ -245,7 +251,7 @@ export function prefixEndIndex(
     // in-window-attachment case for a textless assistant is unreachable —
     // bot messages carry no attachments — and the pipelines never apply to
     // tool entries, so the rule above is exact.)
-    if (e.role === "user" || e.content.length > 0 || (e.toolCalls?.length ?? 0) > 0) {
+    if (e.role === "user" || e.role === "tool" || e.content.length > 0 || (e.toolCalls?.length ?? 0) > 0 || e.reasoning) {
       n += 1;
       continue;
     }
@@ -349,7 +355,7 @@ export async function contextToMessages(
   context: ChannelContext,
   opts: Pick<
     ContextOptions,
-    "systemPrompt" | "maxMessages" | "enableImages" | "imagesMaxBytes" | "imageFetch" | "enableFileContents" | "fileContentsMaxBytes" | "fileFetch"
+    "systemPrompt" | "maxMessages" | "enableImages" | "imagesMaxBytes" | "imageFetch" | "enableFileContents" | "fileContentsMaxBytes" | "fileFetch" | "attachmentStore"
   >,
 ): Promise<ChatMessage[]> {
   const out: ChatMessage[] = [];
@@ -379,6 +385,7 @@ export async function contextToMessages(
       if (i >= imageWindowStart) {
         const res = await fetchMessageImages(e.attachments, opts.imagesMaxBytes, {
           fetchImpl: opts.imageFetch,
+          storage: opts.attachmentStore,
           // With file contents on, non-image attachments are the file
           // pipeline's job (no "unsupported type" notes for them).
           skipNonImages: opts.enableFileContents,
@@ -398,6 +405,7 @@ export async function contextToMessages(
       if (i >= imageWindowStart) {
         const res = await fetchMessageFiles(e.attachments, opts.fileContentsMaxBytes, {
           fetchImpl: opts.fileFetch,
+          storage: opts.attachmentStore,
         });
         files.push(...res.files.map((f) => f.text));
         notes.push(...res.notes);
@@ -423,7 +431,7 @@ export async function contextToMessages(
     // An assistant entry that requested tools carries them even when it has
     // no text (the model answered with calls only) — the history must not
     // lose the call/result pairing.
-    if (body.length === 0 && images.length === 0 && files.length === 0 && (e.toolCalls?.length ?? 0) === 0) continue; // carries nothing
+    if (body.length === 0 && images.length === 0 && files.length === 0 && (e.toolCalls?.length ?? 0) === 0 && !e.reasoning) continue; // carries nothing
     const msg: ChatMessage =
       images.length === 0 ? { role: e.role, content: body } : { role: e.role, content: [] };
     if (images.length > 0) {
@@ -437,4 +445,3 @@ export async function contextToMessages(
   }
   return out;
 }
-

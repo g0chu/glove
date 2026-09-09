@@ -81,11 +81,12 @@ export interface ModelConfig {
   timeoutMs: number;
   /**
    * The JSON file the per-channel conversation contexts are persisted to
-   * (the full history — text, reasoning, tool calls, results — so a restart
-   * resumes where the conversation left off instead of re-seeding the
-   * channel's last-N text).
+   * (the compactable working history; the durable archive retains originals
+   * and takes precedence over this copy on restart).
    */
   chatsFile: string;
+  /** Durable append-only history, independent of working-context compaction. */
+  archiveDir: string;
 }
 
 /** Web tool family (in-process: the bot does the search/fetch itself, no sidecar). */
@@ -281,6 +282,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       metricsTimeoutMs: intEnv("MODEL_METRICS_TIMEOUT_MS", 5000, 100),
       timeoutMs: intEnv("MODEL_TIMEOUT_S", 120, 1) * 1000,
       chatsFile: optional("CHATS_FILE", "./data/chats.json"),
+      archiveDir: optional("CHATS_ARCHIVE_DIR", "./data/archive"),
     },
     tools: {
       // Off by default: not every Chat Completions endpoint supports

@@ -1,4 +1,5 @@
-import { ChannelType, type GuildTextBasedChannel } from "discord.js";
+import { randomUUID } from "node:crypto";
+import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, chimeTranscript, endWithTrigger, prefixEndIndex, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
 import { decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
@@ -9,11 +10,17 @@ import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMe
 import { ResponseWriter, SAFE_MENTIONS, type PostedReply } from "./bot/writer.js";
 import { LlmClient, isInterruptedError, type ChatMessage } from "./llm/client.js";
 import { ChatPersistence } from "./llm/persist.js";
+import { ConversationArchive } from "./llm/archive.js";
+import { archiveChat } from "./llm/archived-chat.js";
+import { archiveAttachments } from "./bot/attachment-store.js";
+import { captureCatchup } from "./bot/catchup.js";
+import { archiveTools } from "./tools/archive.js";
+import { recoverTurns } from "./llm/recovery.js";
 import {
   ChannelContextStore,
   contextWindowFromOverflowError,
   isContextOverflowError,
-  type ChannelContext,
+  ChannelContext,
 } from "./llm/context.js";
 import { COMPACT_OUTPUT_RESERVE_TOKENS, LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "./llm/metrics.js";
 import { loadConfig } from "./config.js";
@@ -24,6 +31,8 @@ import { runToolTurn, type ToolRound, type ToolTurnOutcome } from "./tools/loop.
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
+  let stopping = false;
+  const activeTurns = new Set<Promise<void>>();
   log.info(
     "config loaded:",
     cfg.discord.guildId !== "" ? `guild=${cfg.discord.guildId}` : "guilds=all",
@@ -55,10 +64,96 @@ async function main(): Promise<void> {
   // re-seeding the channel's last-N text (which would lose the reasoning
   // and tool activity). A channel with a persisted context never re-seeds.
   const persistence = new ChatPersistence(cfg.model.chatsFile);
-  const contexts = new ChannelContextStore((channelId, context) => persistence.save(channelId, context));
-  for (const [channelId, data] of persistence.load()) {
-    contexts.restore(channelId, data);
+  const archive = new ConversationArchive(cfg.model.archiveDir, (error) => {
+    // Continuing would allow unrecorded side effects. Already committed
+    // events are durable; unfinished operations are identified on restart.
+    log.error(error.message);
+    process.exit(1);
+  });
+  log.info(`durable archive: ${cfg.model.archiveDir}`);
+  if (archive.recoveredTail) log.warn(`quarantined incomplete archive tail: ${archive.recoveredTail}`);
+  const incomplete = archive.incomplete();
+  if (incomplete.tools.length || incomplete.requests.length || incomplete.turns.length) {
+    log.warn(`archive recovery: ${incomplete.tools.length} indeterminate tool execution(s), ${incomplete.requests.length} unfinished request(s), ${incomplete.turns.length} unfinished turn(s); no automatic replay`);
+    archive.record("recovery.observed", {}, incomplete);
   }
+  const contexts = new ChannelContextStore((channelId, context) => {
+    archive.record("context.checkpoint", { channelId }, context.serialize());
+    persistence.save(channelId, context);
+  });
+  const savedContexts = persistence.load();
+  const archivedContexts = archive.restoreContexts();
+  for (const [channelId, data] of savedContexts) {
+    if (!archivedContexts.has(channelId)) {
+      archive.record("migration.context", { channelId }, data);
+      const sanitized = ChannelContext.restore(data).serialize();
+      archive.record("context.checkpoint", { channelId }, sanitized);
+      archivedContexts.set(channelId, sanitized);
+    }
+  }
+  for (const [channelId, data] of archivedContexts) {
+    if (data !== null) contexts.restore(channelId, data);
+    else persistence.remove(channelId);
+  }
+  const recoveredTurns = recoverTurns(archive, contexts);
+  if (recoveredTurns) log.info(`restored ${recoveredTurns} interrupted turn(s) from the archive without replay`);
+  const catchupBoundaries = archive.catchupCursors();
+  for (const channelId of archivedContexts.keys()) {
+    if (!catchupBoundaries.has(channelId)) catchupBoundaries.set(channelId, null);
+  }
+  // Persist the old boundary before any new gateway messages can advance
+  // the observed cursor; a crash during catch-up must not skip the gap.
+  for (const [channelId, after] of catchupBoundaries) archive.record("catchup.started", { channelId }, { after });
+  const liveMessageIds = new Set<string>();
+  const catchups = new Map<string, Promise<void>>();
+  const ensureCatchupBoundary = (channelId: string): void => {
+    if (!catchupBoundaries.has(channelId)) {
+      catchupBoundaries.set(channelId, null);
+      archive.record("catchup.started", { channelId }, { after: null });
+    }
+  };
+  const archiveMessage = (message: Message | PartialMessage, source: string): void => {
+    const channelId = message.channelId;
+    ensureCatchupBoundary(channelId);
+    archive.record("discord.message", { channelId, messageId: message.id }, {
+      source,
+      displayName: message.member?.displayName ?? message.author?.username,
+      message: message.toJSON(),
+    });
+  };
+  const captureChannel = (channel: GuildTextBasedChannel): Promise<void> => {
+    const existing = catchups.get(channel.id);
+    if (existing) return existing;
+    ensureCatchupBoundary(channel.id);
+    const task = (async (): Promise<void> => {
+      await captureCatchup(catchupBoundaries.get(channel.id) ?? null,
+        async (before) => [...(await channel.messages.fetch({ limit: 100, before })).values()],
+        (message) => archiveMessage(message, "catchup"));
+      // Reconcile the recent stored user messages where Discord still
+      // permits a direct fetch. A live event always wins over a fetch.
+      const context = contexts.has(channel.id) ? contexts.get(channel.id) : null;
+      const recent = context?.snapshot().filter((e) => e.role === "user").slice(-100) ?? [];
+      for (const entry of recent) {
+        const id = entry.ids[0];
+        if (!id || liveMessageIds.has(id)) continue;
+        try {
+          const message = await channel.messages.fetch({ message: id, force: true });
+          if (liveMessageIds.has(id)) continue;
+          archiveMessage(message, "reconcile");
+          if (context && client.user) syncMessageUpdate(context, message, client.user.id, client.user.username);
+        } catch (err) {
+          if ((err as { code?: unknown }).code === 10008 && !liveMessageIds.has(id)) {
+            archive.record("discord.deleted", { channelId: channel.id, messageId: id }, { source: "reconcile" });
+            context?.removeById(id);
+          } else throw err;
+        }
+      }
+      archive.record("catchup.finished", { channelId: channel.id }, {});
+    })();
+    catchups.set(channel.id, task);
+    void task.catch(() => { catchups.delete(channel.id); });
+    return task;
+  };
   // The llama-server's own metric endpoint (GET /slots): the model side's
   // ground truth for its context window and current use. Best-effort —
   // every probe failure resolves to null and never touches a turn.
@@ -183,6 +278,7 @@ async function main(): Promise<void> {
    * into one decision (the newest turn's) over what was actually said.
    */
   const runTurn = async (channelId: string, turn: TurnRequest): Promise<void> => {
+    if (stopping) return;
     const context = contexts.get(channelId);
     if (!context.has(turn.id)) {
       // Deleted before its turn ran.
@@ -208,6 +304,11 @@ async function main(): Promise<void> {
       return;
     }
     const textChannel = channel;
+    await captureChannel(textChannel).catch((err) => {
+      log.warn(`archive catch-up for ${channelId}: ${errMsg(err)}; continuing with available context, gap retained for retry`);
+    });
+    const turnId = randomUUID();
+    archive.record("turn.started", { channelId, turnId, messageId: turn.id }, turn);
 
     // One token account for the whole turn: interrupted attempts consumed
     // real tokens too, so their model calls count in the turn's report.
@@ -215,6 +316,12 @@ async function main(): Promise<void> {
 
     try {
       for (let attempt = 0; ; attempt++) {
+        if (stopping) return;
+        const scope = { channelId, turnId, messageId: turn.id, attempt };
+        const callModel: ChatFn = (msgs, cbs, t, signal, options) => {
+          if (stopping) throw new Error("bot is shutting down");
+          return llm.chat(msgs, cbs, t, signal, options);
+        };
         // Per-attempt state: a fresh writer (a previous attempt's partial
         // reply has been withdrawn), a fresh activity poster, a fresh round
         // record, and a fresh abort controller — any channel activity while
@@ -242,7 +349,7 @@ async function main(): Promise<void> {
         // summarization must not fall into the emergency-trim path).
         const replyChat: ChatFn = tokens.track(
           (msgs, _cbs, t, signal) =>
-            llm.chat(
+            archiveChat(archive, { ...scope, purpose: "reply", round: rounds.length }, callModel)(
               msgs,
               {
                 onDelta: (d) => writer.chunk(d),
@@ -252,7 +359,8 @@ async function main(): Promise<void> {
               signal,
             ),
         );
-        const plainChat: ChatFn = tokens.track((msgs, cbs, tools, signal, options) => llm.chat(msgs, cbs, tools, signal, options));
+        const plainChat: ChatFn = tokens.track((msgs, cbs, t, signal, options) =>
+          archiveChat(archive, { ...scope, purpose: t?.some((tool) => tool.name === "chime") ? "chime" : "compaction" }, callModel)(msgs, cbs, t, signal, options));
         // The attempt's conversation, recorded when the attempt completes:
         // each executed round (the model's text, its reasoning, its calls,
         // the results, and the ids its narration settled to) plus the final
@@ -301,6 +409,8 @@ async function main(): Promise<void> {
           // Shared by the first build and (after an overflow) the rebuild: same
           // window, budget, and summarizer.
           const ctxOpts: ContextOptions = {
+            attachmentStore: archiveAttachments(archive, scope),
+            acceptSeed: (id) => !archive.wasTracked(channelId, id),
             botId,
             botName: botUser.username,
             systemPrompt,
@@ -441,6 +551,10 @@ async function main(): Promise<void> {
               registry: tools.registry,
               maxRounds: cfg.tools.maxRounds,
               signal: attemptController.signal,
+              observeTools: (round) => {
+                if (stopping) throw new Error("bot is shutting down");
+                return archiveTools(archive, { ...scope, round });
+              },
               onToolRound: async () => {
                 roundSettled.push(await writer.discard());
               },
@@ -455,6 +569,7 @@ async function main(): Promise<void> {
                 await writer.appendActivityLines(calls.map(formatToolCall));
               },
               onRoundComplete: (round) => {
+                archive.record("round.finished", { ...scope, round: rounds.length }, { round, delivery: roundSettled[rounds.length] ?? null });
                 rounds.push(round);
               },
             });
@@ -511,7 +626,8 @@ async function main(): Promise<void> {
               ? "*(stopped: the model kept requesting tools past the round limit)*"
               : outcome.content;
           const posted = await writer.finish(finalText);
-          if (context.has(turn.id)) recordTurn(channelId, context, rounds, roundSettled, posted, outcome.reasoning);
+          archive.record("discord.delivery", scope, { posted, raw: finalText, reasoning: outcome.reasoning });
+          if (context.has(turn.id)) recordTurn(turnId, context, rounds, roundSettled, posted, outcome.reasoning, finalText);
           break; // the attempt completed: the turn is done
         } catch (err) {
           if (isInterruptedError(err)) {
@@ -570,13 +686,15 @@ async function main(): Promise<void> {
           }
           log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
           const posted = await writer.reportError(err);
-          if (context.has(turn.id)) recordTurn(channelId, context, rounds, roundSettled, posted, undefined);
+          archive.record("turn.failed", scope, { error: errMsg(err), posted });
+          if (context.has(turn.id)) recordTurn(turnId, context, rounds, roundSettled, posted, undefined);
           break;
         } finally {
           unwatch();
         }
       }
     } finally {
+      archive.record("turn.finished", { channelId, turnId, messageId: turn.id }, {});
       await reportTurnTokens(channelId, context, tokens);
     }
   };
@@ -591,12 +709,13 @@ async function main(): Promise<void> {
    * no backing message ids: the model's history keeps what the model said.
    */
   const recordTurn = (
-    channelId: string,
+    turnId: string,
     context: ChannelContext,
     rounds: ToolRound[],
     roundSettled: Array<PostedReply | null>,
     posted: PostedReply | null,
     finalReasoning?: string,
+    finalContent = "",
   ): void => {
     context.appendTurn(
       rounds.map((r, i) => {
@@ -611,11 +730,12 @@ async function main(): Promise<void> {
         };
       }),
       {
-        content: posted?.text ?? "",
+        content: posted?.text ?? finalContent,
         reasoning: finalReasoning,
         ids: posted?.messageIds ?? [],
         chunks: posted?.chunks,
       },
+      turnId,
     );
   };
 
@@ -624,7 +744,11 @@ async function main(): Promise<void> {
     return contexts.has(channelId) ? contexts.get(channelId) : null;
   };
 
-  const queues = new QueueStore({ runTurn });
+  const queues = new QueueStore({ runTurn: async (channelId, turn) => {
+    const task = runTurn(channelId, turn);
+    activeTurns.add(task);
+    try { await task; } finally { activeTurns.delete(task); }
+  } });
 
   /**
    * Commit a stable trackable message (it has been unchanged for
@@ -641,13 +765,16 @@ async function main(): Promise<void> {
    * stabilization queues the turn; one that removes it does not.
    */
   const commitArrival = (message: GateMessage): void => {
+    if (stopping) return;
     const botUser = client.user;
     if (!botUser) return;
     const botId = botUser.id;
     const channelId = message.channel?.id;
     if (!channelId) return; // the channel vanished while the message was pending
     if (!message.author) return;
+    archiveMessage(message, "stable");
     if (!message.author.bot && isClearCommand(message.content, botId)) {
+      archive.record("context.cleared", { channelId, messageId: message.id }, { authorId: message.author.id });
       // Drop entries + summary and suppress the startup seed: the next turn
       // starts from messages that arrive after the clear, not from the
       // channel's last-N. Mentions queued before the clear are dropped with
@@ -728,6 +855,19 @@ async function main(): Promise<void> {
         ? `responding to @mentions in guild ${cfg.discord.guildId}`
         : "responding to @mentions in any text channel of any guild the bot is in",
     );
+    // Capture offline gaps even in quiet channels that have no new mention.
+    // One channel at a time avoids an unbounded burst of Discord requests.
+    void (async () => {
+      for (const channelId of catchupBoundaries.keys()) {
+        if (stopping) return;
+        try {
+          const channel = await client.channels.fetch(channelId);
+          if (channel?.type === ChannelType.GuildText && (cfg.discord.guildId === "" || channel.guildId === cfg.discord.guildId)) {
+            await captureChannel(channel);
+          }
+        } catch (err) { log.warn(`archive catch-up for ${channelId}: ${errMsg(err)}; will retry at its next turn`); }
+      }
+    })();
     if (cfg.model.enableImages) {
       log.info(
         `image input enabled (png/jpeg/webp/gif, max ${cfg.model.imagesMaxBytes} bytes per image)`,
@@ -780,8 +920,13 @@ async function main(): Promise<void> {
   // content mentions the bot do. With chime enabled, every non-mention
   // message queues a turn the model may decline.
   client.on("messageCreate", (message) => {
+    if (stopping) return;
     const botId = client.user?.id;
     if (!botId) return;
+    if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
+      liveMessageIds.add(message.id);
+      archiveMessage(message, "create");
+    }
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
     gate.arrive(message);
     // A new message is a change in the channel: it interrupts a running
@@ -802,11 +947,16 @@ async function main(): Promise<void> {
   // *adds* a mention does not queue a turn; only fresh (stabilizing)
   // messages do.
   client.on("messageUpdate", (_oldMessage, message) => {
+    if (stopping) return;
     const botUser = client.user;
     const botId = botUser?.id;
     if (!botId || !botUser) return;
     const channelId = message.channel?.id;
     if (!channelId) return;
+    if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
+      liveMessageIds.add(message.id);
+      archiveMessage(message, "update");
+    }
     if (gate.isPending(message.id)) {
       gate.arrive(message);
     } else {
@@ -842,15 +992,25 @@ async function main(): Promise<void> {
   // context, drop it too. (A delete of any chunk of a chunked reply drops
   // the whole reply.)
   client.on("messageDelete", (message) => {
+    if (stopping) return;
     const channelId = message.channel?.id;
     if (!channelId) return;
+    if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
+      liveMessageIds.add(message.id);
+      archive.record("discord.deleted", { channelId, messageId: message.id }, {});
+    }
     gate.drop(message.id);
     conversationFor(channelId)?.removeById(message.id);
   });
 
   client.on("messageDeleteBulk", (messages, channel) => {
+    if (stopping) return;
     const conv = conversationFor(channel.id);
     for (const m of messages.values()) {
+      if (channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || channel.guildId === cfg.discord.guildId)) {
+        liveMessageIds.add(m.id);
+        archive.record("discord.deleted", { channelId: channel.id, messageId: m.id }, { bulk: true });
+      }
       gate.drop(m.id);
       conv?.removeById(m.id);
     }
@@ -859,6 +1019,8 @@ async function main(): Promise<void> {
   // A deleted channel's context and pending messages are gone; forget them
   // (in memory and in the persistence file).
   client.on("channelDelete", (channel) => {
+    if (stopping) return;
+    if (archive.messageCursors().has(channel.id) || contexts.has(channel.id)) archive.record("channel.deleted", { channelId: channel.id }, {});
     contexts.clear(channel.id);
     persistence.remove(channel.id);
     gate.clearChannel(channel.id);
@@ -867,24 +1029,27 @@ async function main(): Promise<void> {
 
   // Lifecycle: cancel in-flight generation, destroy the client, exit cleanly.
   const shutdown = (signal: string): void => {
+    if (stopping) return;
+    stopping = true;
     log.info(`${signal} received, shutting down`);
     gate.clear();
     channelActivity.clear();
     llm.abort();
     for (const c of tools.clients) c.abort();
-    client.destroy();
-    // The contexts are the source of truth for the next start: the in-flight
-    // turns just aborted take their error path (which records the turn in
-    // the context, scheduling a persistence write) — give them a bounded
-    // moment to do so, then flush until the disk is up to date before the
-    // exit.
-    const deadline = Date.now() + 500;
+    // Await active turns so completed tools get their result records. A
+    // bounded deadline leaves durable starts as indeterminate, never replayed.
     const settle = async (): Promise<void> => {
-      do {
-        await persistence.flush();
-        await new Promise((r) => setTimeout(r, 50));
-      } while (Date.now() < deadline);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled([...activeTurns, ...catchups.values()]),
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, 30_000); }),
+        ]);
+      } finally { if (timer) clearTimeout(timer); }
       await persistence.flush();
+      archive.record("shutdown", {}, { signal, activeTurns: activeTurns.size });
+      archive.close();
+      client.destroy();
     };
     void settle().finally(() => process.exit(0));
   };

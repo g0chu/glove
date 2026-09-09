@@ -44,7 +44,7 @@ export class ChatPersistence {
       log.warn(`the context store ${this.file} is not valid JSON (${errMsg(err)}); starting fresh`);
       return new Map();
     }
-    if (parsed.version !== 1 || typeof parsed.channels !== "object" || parsed.channels === null) {
+    if (parsed === null || typeof parsed !== "object" || parsed.version !== 1 || typeof parsed.channels !== "object" || parsed.channels === null || Array.isArray(parsed.channels)) {
       log.warn(`the context store ${this.file} has an unrecognized shape; starting fresh`);
       return new Map();
     }
@@ -95,7 +95,7 @@ export class ChatPersistence {
     try {
       const dir = path.dirname(this.file);
       if (dir !== "" && dir !== ".") mkdirSync(dir, { recursive: true });
-      const body = JSON.stringify({ version: 1, channels: Object.fromEntries(this.data) });
+      const body = JSON.stringify({ version: 1, channels: Object.fromEntries(this.data) }, null, 2) + "\n";
       writeFileSync(`${this.file}.tmp`, body);
       renameSync(`${this.file}.tmp`, this.file);
     } catch (err) {
