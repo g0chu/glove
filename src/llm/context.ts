@@ -35,6 +35,8 @@ export function speakerLabel(name: string, isBot: boolean): string {
  * request always carries the full, unbroken history the model saw).
  */
 export interface ContextEntry {
+  /** Durable turn identity, used to make crash recovery idempotent. */
+  turnId?: string;
   role: Role;
   /** The text as the model sees it (mentions of the bot already replaced by its Discord name). */
   content: string;
@@ -159,6 +161,7 @@ export type CompactionResult = { ok: true } | { ok: false; reason: "nothing-to-f
 export class ChannelContext {
   private summary: string | null = null;
   private revision = 0;
+  private batching = false;
   private readonly entries: ContextEntry[] = [];
   /** Whether the startup seed (the channel's last N messages) has been taken in. */
   seeded = false;
@@ -183,7 +186,7 @@ export class ChannelContext {
 
   private changed(): void {
     this.revision++;
-    this.onChange?.();
+    if (!this.batching) this.onChange?.();
   }
 
   /** Append an arrival (a human's or another bot's message; `bot` labels it "(bot)" in the context). */
@@ -250,12 +253,21 @@ export class ChannelContext {
       chunks?: string[];
     }>,
     final: { content: string; reasoning?: string; ids: string[]; chunks?: string[] },
+    turnId?: string,
   ): void {
-    for (const r of rounds) {
-      this.pushAssistant(r.content, r.ids, r.chunks, { reasoning: r.reasoning, toolCalls: r.calls });
-      for (const t of r.results) this.pushTool(t.name, t.toolCallId, t.content);
+    const start = this.entries.length;
+    this.batching = true;
+    try {
+      for (const r of rounds) {
+        this.pushAssistant(r.content, r.ids, r.chunks, { reasoning: r.reasoning, toolCalls: r.calls });
+        for (const t of r.results) this.pushTool(t.name, t.toolCallId, t.content);
+      }
+      this.pushAssistant(final.content, final.ids, final.chunks, { reasoning: final.reasoning });
+      if (turnId) for (let i = start; i < this.entries.length; i++) this.entries[i].turnId = turnId;
+    } finally {
+      this.batching = false;
+      this.onChange?.();
     }
-    this.pushAssistant(final.content, final.ids, final.chunks, { reasoning: final.reasoning });
   }
 
   /** The entry backed by the given Discord message id, if any. */
@@ -461,9 +473,16 @@ export class ChannelContext {
       if (s.bot !== undefined) entry.bot = s.bot;
       merged.push(entry);
     }
-    merged.sort((a, b) => a.ts - b.ts || compareDiscordIds(a.ids[0], b.ids[0]));
+    // Sort complete call/result groups, never individual tool results: a
+    // fetched Discord message may have a timestamp between a call and result.
+    const groups: ContextEntry[][] = [];
+    for (const entry of merged) {
+      if (entry.role === "tool" && groups.length > 0) groups[groups.length - 1].push(entry);
+      else groups.push([entry]);
+    }
+    groups.sort(([a], [b]) => a.ts - b.ts || compareDiscordIds(a.ids[0], b.ids[0]));
     this.entries.length = 0;
-    this.entries.push(...groupConsecutiveReplies(merged));
+    this.entries.push(...groupConsecutiveReplies(groups.flat()));
     this.seeded = true;
     this.changed();
   }
@@ -650,6 +669,9 @@ function groupConsecutiveReplies(entries: ContextEntry[]): ContextEntry[] {
       e.role === "assistant" &&
       prev !== undefined &&
       prev.role === "assistant" &&
+      e.turnId === undefined && prev.turnId === undefined &&
+      e.reasoning === undefined && prev.reasoning === undefined &&
+      e.toolCalls === undefined && prev.toolCalls === undefined &&
       e.ts - prev.ts <= BOT_REPLY_GROUP_GAP_MS
     ) {
       const prevContent = prev.content;
@@ -702,6 +724,7 @@ function sanitizeEntry(raw: unknown): ContextEntry | null {
   };
   if (Array.isArray(e.chunks) && e.chunks.every((c) => typeof c === "string")) entry.chunks = e.chunks as string[];
   if (typeof e.name === "string") entry.name = e.name;
+  if (typeof e.turnId === "string") entry.turnId = e.turnId;
   if (e.bot === true) entry.bot = true;
   if (typeof e.reasoning === "string" && e.reasoning.length > 0) entry.reasoning = e.reasoning;
   if (Array.isArray(e.toolCalls)) {
@@ -751,6 +774,12 @@ export class ChannelContextStore {
 
   /** Forget a channel's whole context (e.g. the channel was deleted). */
   clear(channelId: string): void {
-    this.byChannel.get(channelId)?.clear();
+    const context = this.byChannel.get(channelId);
+    if (!context) return;
+    // In-flight turns may still hold this object. Detach its persistence
+    // hook so their late metrics/results cannot recreate a deleted channel.
+    context.onChange = undefined;
+    context.clear();
+    this.byChannel.delete(channelId);
   }
 }

@@ -14,6 +14,7 @@
 import type { MessageAttachmentLike } from "../llm/client.js";
 import { isImageAttachment } from "../llm/client.js";
 import { humanBytes, isDiscordCdnUrl } from "./images.js";
+import type { AttachmentStore } from "./attachment-store.js";
 
 /** One downloaded file, ready to inline into the message's context text. */
 export interface AttachmentFile {
@@ -32,6 +33,8 @@ export interface FileDownload {
 export type FileFetch = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface FetchFilesOptions {
+  /** Archive/cache bytes without bypassing source validation or byte limits. */
+  storage?: AttachmentStore;
   /**
    * Test-only: replace the native fetch (e.g. with a local mock server).
    * When set, the Discord-CDN URL validation is skipped — the injected
@@ -115,31 +118,37 @@ export async function fetchMessageFiles(
       continue;
     }
     attempted++;
+    let buf = opts.storage?.load(att) ?? null;
+    const cached = buf !== null;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
     try {
-      const res = await fetchImpl(att.url, { signal: controller.signal });
-      if (!res.ok) {
-        note(att, `download failed (HTTP ${res.status})`);
-        continue;
+      if (!buf) {
+        const res = await fetchImpl(att.url, { signal: controller.signal });
+        if (!res.ok) {
+          note(att, `download failed (HTTP ${res.status})`);
+          continue;
+        }
+        buf = Buffer.from(await res.arrayBuffer());
       }
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.byteLength > maxBytes) {
-        note(att, `${humanBytes(buf.byteLength)} exceeds the ${humanBytes(maxBytes)} limit`);
-        continue;
-      }
-      if (!isProbablyText(buf)) {
-        note(att, buf.byteLength === 0 ? "empty file" : "binary content");
-        continue;
-      }
-      // A leading BOM is valid text but noise for the model.
-      const content = buf.toString("utf8").replace(/^\uFEFF/, "");
-      files.push({ text: formatFileBlock(att, buf.byteLength, content) });
     } catch {
       note(att, controller.signal.aborted ? "download timed out" : "download failed");
     } finally {
       clearTimeout(timer);
     }
+    if (!buf) continue;
+    if (buf.byteLength > maxBytes) {
+      note(att, `${humanBytes(buf.byteLength)} exceeds the ${humanBytes(maxBytes)} limit`);
+      continue;
+    }
+    if (!cached) opts.storage?.save(att, buf);
+    if (!isProbablyText(buf)) {
+      note(att, buf.byteLength === 0 ? "empty file" : "binary content");
+      continue;
+    }
+    // A leading BOM is valid text but noise for the model.
+    const content = buf.toString("utf8").replace(/^\uFEFF/, "");
+    files.push({ text: formatFileBlock(att, buf.byteLength, content) });
   }
   return { files, notes };
 }

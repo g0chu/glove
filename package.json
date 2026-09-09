@@ -12,6 +12,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
+    "archive": "tsx src/archive-cli.ts",
     "test": "tsx test/smoke.ts"
   },
   "dependencies": {

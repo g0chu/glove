@@ -105,6 +105,12 @@ export interface LlmClientOptions {
 
 /** Stream callbacks for one request (both optional). */
 export interface StreamCallbacks {
+  /** Durable observer: exact JSON request body, before network I/O (no headers). */
+  onRequest?: (body: Record<string, unknown>) => void;
+  /** Durable observer: response status, before consuming its body. */
+  onResponse?: (status: number) => void;
+  /** Durable observer: exact received body bytes, including unfinished SSE data. */
+  onResponseBytes?: (bytes: Uint8Array) => void;
   /** Called with each streamed content delta, as it arrives. */
   onDelta?: (delta: string) => void;
   /**
@@ -344,7 +350,7 @@ export class LlmClient {
     };
     signal?.addEventListener("abort", onCallerAbort, { once: true });
     try {
-      const res = await this.request(messages, tools, controller, options);
+      const res = await this.request(messages, tools, controller, options, cbs);
       if (this.opts.stream) {
         return await this.readSse(res, cbs, phase);
       }
@@ -374,6 +380,7 @@ export class LlmClient {
     tools: ToolSpec[] | undefined,
     controller: AbortController,
     options?: ChatRequestOptions,
+    callbacks: StreamCallbacks = {},
   ): Promise<Response> {
     let res: Response;
     const body: Record<string, unknown> = {
@@ -389,6 +396,7 @@ export class LlmClient {
       }));
       body.tool_choice = options?.toolChoice ?? "auto";
     }
+    callbacks.onRequest?.(body);
     try {
       res = await fetch(this.opts.apiUrl, {
         method: "POST",
@@ -404,8 +412,9 @@ export class LlmClient {
       if (isAbortError(err)) throw err; // mapped to "timed out" by the caller
       throw new Error(`could not reach model endpoint ${this.opts.apiUrl}: ${errMsg(err)}`);
     }
+    callbacks.onResponse?.(res.status);
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
+      const text = (await this.readBytes(res, callbacks)).toString("utf8");
       throw new Error(
         `model endpoint returned HTTP ${res.status} ${res.statusText}${text ? `: ${truncate(text, 300)}` : ""}`,
       );
@@ -415,8 +424,9 @@ export class LlmClient {
 
   private async readJson(res: Response, callbacks: StreamCallbacks): Promise<ChatResult> {
     let data: SseMessageChunk;
+    const bytes = await this.readBytes(res, callbacks);
     try {
-      data = (await res.json()) as SseMessageChunk;
+      data = JSON.parse(new TextDecoder().decode(bytes)) as SseMessageChunk;
     } catch {
       throw new Error("model endpoint returned a non-JSON response");
     }
@@ -440,6 +450,22 @@ export class LlmClient {
     const usage = parseUsage(data);
     if (usage) result.usage = usage;
     return result;
+  }
+
+  private async readBytes(res: Response, callbacks: StreamCallbacks): Promise<Buffer> {
+    if (!res.body) return Buffer.alloc(0);
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return Buffer.concat(chunks);
+        callbacks.onResponseBytes?.(value);
+        chunks.push(value);
+      }
+    } finally {
+      void reader.cancel().catch(() => {});
+    }
   }
 
   private async readSse(res: Response, callbacks: StreamCallbacks, phase: { generating: boolean }): Promise<ChatResult> {
@@ -467,6 +493,7 @@ export class LlmClient {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      callbacks.onResponseBytes?.(value);
       buffer += decoder.decode(value, { stream: true });
       let nl: number;
       while ((nl = buffer.indexOf("\n")) >= 0) {

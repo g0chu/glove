@@ -54,6 +54,12 @@ export interface ToolResultMessage {
   content: string;
 }
 
+/** Durable lifecycle hooks. Failure prevents further execution, never a tool result. */
+export interface ToolExecutionObserver {
+  started: (call: ToolCall, index: number) => void;
+  finished: (result: ToolResultMessage, index: number) => void;
+}
+
 /**
  * Parse the raw `arguments` string of a tool call. Endpoints may deliver an
  * empty string (no args) or, in non-stream mode, an object instead of a
@@ -116,14 +122,22 @@ export function argInt(
  * Run every requested tool call (concurrently) and return one `tool`-role
  * message per call, in the same order as `calls`.
  */
-export async function executeToolCalls(registry: ToolRegistry, calls: ToolCall[]): Promise<ToolResultMessage[]> {
-  const results = await Promise.all(
-    calls.map(async (call): Promise<ToolResultMessage> => {
+export async function executeToolCalls(registry: ToolRegistry, calls: ToolCall[], observer?: ToolExecutionObserver): Promise<ToolResultMessage[]> {
+  // Persist every intent before starting any handler. An archive failure
+  // must not start a subset of a batch and leave the others unrecorded.
+  calls.forEach((call, index) => observer?.started(call, index));
+  const settled = await Promise.allSettled(
+    calls.map(async (call, index): Promise<ToolResultMessage> => {
       const content = await runOne(registry, call);
-      return { role: "tool", toolCallId: call.id, name: call.name, content };
+      const result: ToolResultMessage = { role: "tool", toolCallId: call.id, name: call.name, content };
+      observer?.finished(result, index);
+      return result;
     }),
   );
-  return results;
+  return settled.map((result) => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  });
 }
 
 async function runOne(registry: ToolRegistry, call: ToolCall): Promise<string> {

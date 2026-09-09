@@ -106,7 +106,13 @@ npm run dev            # or: npm run build && npm start
   ("🧹 *…*"), the context (entries + summary) is dropped and not re-seeded,
   and the next turn starts from messages that arrive after the clear.
   Mentions queued before the clear are skipped (their mention is no longer
-  in the context).
+  in the context). The durable archive retains the earlier conversation;
+  `!clear` does not purge it.
+- **Archive:** `CHATS_ARCHIVE_DIR` (default `./data/archive`) preserves captured
+  messages and edits, model requests/responses and reasoning, individual tool
+  starts/results, and fetched attachment bytes independently of compaction.
+  Recovery restores completed work without repeating tools or Discord posts.
+  See [ARCHIVE.md](ARCHIVE.md) for retention, recovery, export, and purge.
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 
