@@ -422,6 +422,23 @@ const ok = (name: string): void => {
   }
   ok("gate: a stable message commits exactly once with its final state");
 
+  {
+    const fired: GateMessage[] = [];
+    const timers = makeTimers();
+    const gate = new MessageGate({ stableMs: 2000, onCommit: (m) => fired.push(m), schedule: timers.schedule, cancel: timers.cancel });
+    gate.arrive(fakeMsg("9", "c1", "earlier"));
+    gate.arrive(fakeMsg("10", "c1", "@glove latest"));
+    gate.arrive(fakeMsg("9", "c1", "earlier edited"));
+    timers.cbs.get(2)!();
+    assert.equal(fired.length, 0, "mention waits for earlier message to stabilize");
+    timers.cbs.get(3)!();
+    assert.deepEqual(fired.map((m) => m.content), ["earlier edited", "@glove latest"]);
+    timers.cbs.get(1)!();
+    assert.equal(fired.length, 2);
+  }
+  ok("gate: an earlier edited message commits before a newer stable mention");
+
+
   // Other bots stream their replies: posted as a placeholder, edited as the
   // text arrives. Every edit restarts the window (cancelling the old timer),
   // and the commit carries the final content — the mention only exists in
@@ -4877,6 +4894,18 @@ const ok = (name: string): void => {
   }
   ok("llm: an abort after the first token is ignored (the generation runs to completion)");
 
+  {
+    const mention = new AbortController();
+    const client = new LlmClient({ apiUrl: `${base}/v1/tokenhold`, apiKey: "none", model: "local", stream: true, timeoutMs: 5000 });
+    const pending = client.chat([{ role: "user", content: "old prompt" }],
+      { onDelta: () => mention.abort() }, undefined, undefined, { interruptSignal: mention.signal });
+    await assert.rejects(pending, InterruptedError);
+    await assert.rejects(client.chat([{ role: "user", content: "stale" }], undefined, undefined, undefined,
+      { interruptSignal: mention.signal }), InterruptedError);
+  }
+  ok("llm: a human mention interrupts after the first token and prevents another stale request");
+
+
   // Non-stream calls stay interruptable throughout: their single response
   // has only happened once the body arrives, which the client cannot
   // observe in advance — a mid-flight abort still reports InterruptedError.
@@ -5099,6 +5128,32 @@ const ok = (name: string): void => {
   assert.equal(deriveCompactionBudget(4096), null, "window minus headroom too small");
   assert.equal(deriveCompactionBudget(1000), null);
   ok("metrics: the automatic budget = window minus completion headroom (too-small window -> null)");
+}
+
+// Human mentions stop at tool boundaries without replaying completed work.
+{
+  for (const duringTool of [false, true]) {
+    const mention = new AbortController();
+    let executions = 0;
+    let completed = 0;
+    const registry = new ToolRegistry().register({ name: "write", description: "", parameters: {} }, async () => {
+      executions++;
+      mention.abort();
+      return "saved";
+    });
+    const pending = runToolTurn([{ role: "user", content: "old request" }], {
+      registry, maxRounds: 3, interruptSignal: mention.signal,
+      chat: async () => ({ content: "", toolCalls: [{ id: "1", name: "write", arguments: "{}" }] }),
+      onToolCalls: () => { if (!duringTool) mention.abort(); },
+      onRoundComplete: () => { completed++; },
+    });
+    await assert.rejects(pending, (err: unknown) => duringTool
+      ? err instanceof Error && !isInterruptedError(err)
+      : isInterruptedError(err));
+    assert.equal(executions, duringTool ? 1 : 0);
+    assert.equal(completed, duringTool ? 1 : 0);
+  }
+  ok("loop: mentions skip unstarted tools and preserve already executing tool results");
 }
 
 // ---------------------------------------------------- regression fixes --

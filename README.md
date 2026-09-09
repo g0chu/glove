@@ -217,3 +217,10 @@ Chime and compaction prompts can be overridden with `BOT_CHIME_PROMPT` and
 prompts. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
 to hide chime NO decisions in Discord while keeping their diagnostic logs
 (default: `true`). Restart the bot after changing these settings.
+
+
+### Human mention interruptions
+
+A new human message mentioning the bot interrupts its active model request immediately, including streamed reasoning and response generation. A pending edit containing a human mention does the same. The partial reply is withdrawn; after stabilization, the newer mention's turn rebuilds the prompt from the updated conversation. Ordinary messages and typing retain the prefill-only interruption behavior described above. Tools that have not started are skipped; already-running tools finish and their results are retained before the newer turn runs, without replaying them.
+
+The stability gate commits pending messages in Discord snowflake order within each channel. A newer stable mention waits for earlier pending messages to finish stabilizing, so their final content precedes it in the prompt. Other channels remain independent. Deleting an earlier pending message releases stable messages behind it; clearing a channel or shutting down discards all its pending messages.

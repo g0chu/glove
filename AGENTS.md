@@ -69,7 +69,7 @@ npm test                  # smoke tests (tsx test/smoke.ts)
 ## 3. Testing Guidelines
 
 - Whole suite is `test/smoke.ts` via `npm test` — no framework, no selection, no config. Hermetic: mock OpenAI-compatible HTTP server on an ephemeral port, fake Discord channels, injected DNS/search backends, temp workspace dirs; no `.env`/Discord/network needed.
-- Plain `node:assert/strict`; `ok(name)` check groups (currently **189**); the final line prints the count.
+- Plain `node:assert/strict`; `ok(name)` check groups (currently **192**); the final line prints the count.
 - Async is driven with `ticks()` (`setImmediate`), not real sleeps.
 - In tests use the pure `parseConfig(env)`, never `loadConfig()` (calls `process.exit(1)`).
 - Web-tool tests use `WebToolsOptions.allowPrivate`/`resolver`/`searchFetch` — tests-only escape hatches, never enable in production.
@@ -115,3 +115,10 @@ npm test                  # smoke tests (tsx test/smoke.ts)
 - `FILETOOLS_WORKSPACE` (default `./workspace`) must exist — not created automatically; failures surface per call and the turn continues. The shell tool runs in that same directory, so it needs the directory too.
 - ZIM: v6 only (Wikipedia clusters are zstd-compressed → Node >= 22.15); LZMA2 clusters/non-v6 surface as per-call errors, never crashes. `wikipedia_search` matches titles/paths only (exact → prefix → budgeted substring scan), not article bodies; `wikipedia_read` returns clean text (references/TOC/nav dropped), truncated to `TOOLS_MAX_RESULT_CHARS`.
 - Vault: a flat directory of markdown notes (one per article, built by the wiki2vault project; frontmatter `title`/`path`/`source`, internal links as `[[wikilinks]]`). `vault_search` matches note titles (case- and space/underscore-insensitive, exact → prefix → substring) plus a time-budgeted body scan (ripgrep, `VAULTTOOLS_RG_PATH` default `rg` from PATH — a deadline kills it and flags the result partial — else a bounded pure-JS scan); the title index (`index.tsv`, `title<TAB>filename`) is written by the build, and a vault without one yet falls back to the directory listing. Titles are NOT unique — the build deduplicates file names (`"Title (2)"`), not titles — so a title can resolve to several notes: `vault_read` reads a name straight as a file name first, and an exact-title match against several files is an ambiguity error naming the files. `vault_read` drops the frontmatter, truncates to `TOOLS_MAX_RESULT_CHARS`, and `abstract` mode returns the frontmatter plus the note's start (~1000 chars) for disambiguation; `vault_links` lists a note's `[[wikilinks]]` (capped at 50).
+
+
+### Human mention interruptions
+
+A new human message mentioning the bot interrupts its active model request immediately, including streamed reasoning and response generation. A pending edit containing a human mention does the same. The partial reply is withdrawn; after stabilization, the newer mention's turn rebuilds the prompt from the updated conversation. Ordinary messages and typing retain the prefill-only interruption behavior described above. Tools that have not started are skipped; already-running tools finish and their results are retained before the newer turn runs, without replaying them.
+
+The stability gate commits pending messages in Discord snowflake order within each channel. A newer stable mention waits for earlier pending messages to finish stabilizing, so their final content precedes it in the prompt. Other channels remain independent. Deleting an earlier pending message releases stable messages behind it; clearing a channel or shutting down discards all its pending messages.

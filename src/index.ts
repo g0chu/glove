@@ -320,7 +320,7 @@ async function main(): Promise<void> {
         const scope = { channelId, turnId, messageId: turn.id, attempt };
         const callModel: ChatFn = (msgs, cbs, t, signal, options) => {
           if (stopping) throw new Error("bot is shutting down");
-          return llm.chat(msgs, cbs, t, signal, options);
+          return llm.chat(msgs, cbs, t, signal, { ...options, interruptSignal: signal ? mentionController.signal : undefined });
         };
         // Per-attempt state: a fresh writer (a previous attempt's partial
         // reply has been withdrawn), a fresh activity poster, a fresh round
@@ -332,7 +332,12 @@ async function main(): Promise<void> {
           throttleMs: cfg.discord.streamUpdateThrottleMs,
         });
         const attemptController = new AbortController();
-        const unwatch = channelActivity.watch(channelId, () => attemptController.abort());
+        // Human mentions override the ordinary prefill-only activity signal.
+        const mentionController = new AbortController();
+        const unwatch = channelActivity.watch(channelId, (mention) => {
+          if (mention) mentionController.abort();
+          attemptController.abort();
+        });
         // Every model call of the attempt goes through a tracked wrapper so
         // the endpoint's reported usage (input/output per call, largest
         // prompt) is accumulated: the turn's cost is reported at the end,
@@ -551,6 +556,7 @@ async function main(): Promise<void> {
               registry: tools.registry,
               maxRounds: cfg.tools.maxRounds,
               signal: attemptController.signal,
+              interruptSignal: mentionController.signal,
               observeTools: (round) => {
                 if (stopping) throw new Error("bot is shutting down");
                 return archiveTools(archive, { ...scope, round });
@@ -634,8 +640,8 @@ async function main(): Promise<void> {
             // The channel changed (a new message, an edit, a typing
             // indicator) while the attempt's prompt was still being
             // processed — the interruption lands before the model's first
-            // token (a running generation is never aborted, so this path is
-            // only reached for a pre-first-token interruption): the abort
+            // token for ordinary activity, or during generation for a
+            // human mention: the abort
             // already happened (this error is its trace). Withdraw the
             // partial reply (the thinking line is kept in the channel, like
             // a finished round's) and wait for the channel to go quiet — no
@@ -683,6 +689,12 @@ async function main(): Promise<void> {
               `turn in ${channelId}: no newer turn supersedes it; retrying with a freshly built context (attempt ${attempt + 2})`,
             );
             continue; // next attempt: a fresh context, a fresh prompt
+          }
+          if (mentionController.signal.aborted && rounds.length > 0) {
+            await writer.interrupt();
+            if (context.has(turn.id)) recordTurn(turnId, context, rounds, roundSettled, null);
+            await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
+            break;
           }
           log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
           const posted = await writer.reportError(err);
@@ -933,7 +945,7 @@ async function main(): Promise<void> {
     // turn's prompt processing and restarts its quiet wait (see
     // ChannelActivity).
     const channelId = message.channel?.id;
-    if (channelId) channelActivity.note(channelId);
+    if (channelId) channelActivity.note(channelId, !message.author.bot && isMentionOf(message, botId));
   });
 
   // Edits: a message still in its stability window refreshes the gate (the
@@ -968,7 +980,9 @@ async function main(): Promise<void> {
     // The note comes after the gate refresh, so a still-pending message
     // commits a hair before the quiet wait can resolve — the retry's
     // context carries it.
-    if (isTrackable(message, botId, cfg.discord.guildId)) channelActivity.note(channelId);
+    if (isTrackable(message, botId, cfg.discord.guildId)) {
+      channelActivity.note(channelId, gate.isPending(message.id) && !message.author.bot && isMentionOf(message, botId));
+    }
   });
 
   // A typing indicator is a change in the channel too: someone is about to

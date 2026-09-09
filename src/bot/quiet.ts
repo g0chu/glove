@@ -26,7 +26,7 @@ export interface ActivityOptions {
  */
 export class ChannelActivity {
   private readonly lastActivity = new Map<string, number>();
-  private readonly watchers = new Map<string, Set<() => void>>();
+  private readonly watchers = new Map<string, Set<(mention: boolean) => void>>();
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
 
@@ -36,12 +36,12 @@ export class ChannelActivity {
   }
 
   /** Record a change in a channel (a new message, an edit, a typing indicator). */
-  note(channelId: string): void {
+  note(channelId: string, mention = false): void {
     this.lastActivity.set(channelId, this.now());
     const ws = this.watchers.get(channelId);
     if (ws) {
       // Iterate over a copy: a watcher may unsubscribe itself while firing.
-      for (const w of [...ws]) w();
+      for (const w of [...ws]) w(mention);
     }
   }
 
@@ -50,7 +50,7 @@ export class ChannelActivity {
    * channel (a running turn aborts its in-flight model request). Returns an
    * unsubscribe function (the attempt's end).
    */
-  watch(channelId: string, onActivity: () => void): () => void {
+  watch(channelId: string, onActivity: (mention: boolean) => void): () => void {
     let ws = this.watchers.get(channelId);
     if (!ws) {
       ws = new Set();
