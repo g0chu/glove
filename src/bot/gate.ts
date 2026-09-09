@@ -29,6 +29,7 @@ interface GateEntry {
   message: GateMessage;
   channelId: string;
   timer: GateTimer;
+  ready: boolean;
 }
 
 /**
@@ -69,16 +70,30 @@ export class MessageGate {
   arrive(message: GateMessage): void {
     const prev = this.pending.get(message.id);
     if (prev) this.cancel(prev.timer);
-    const entry: GateEntry = { message, channelId: message.channel?.id ?? "", timer: undefined };
+    const entry: GateEntry = { message, channelId: message.channel?.id ?? "", timer: undefined, ready: false };
     entry.timer = this.schedule(() => {
       // Only the entry that is still stored for this id commits: an edit
       // replaced it (this timer was cancelled) or a delete/channel-delete
       // dropped it.
       if (this.pending.get(message.id) !== entry) return;
-      this.pending.delete(message.id);
-      this.opts.onCommit(entry.message);
+      entry.ready = true;
+      this.drain(entry.channelId);
     }, this.opts.stableMs);
     this.pending.set(message.id, entry);
+  }
+
+  /** Commit stable messages in Discord order, waiting for earlier pending edits. */
+  private drain(channelId: string): void {
+    const entries = [...this.pending.values()]
+      .filter((entry) => entry.channelId === channelId)
+      .sort((a, b) => a.message.id.length - b.message.id.length ||
+        (a.message.id < b.message.id ? -1 : a.message.id > b.message.id ? 1 : 0));
+    for (const entry of entries) {
+      if (!entry.ready) break;
+      if (this.pending.get(entry.message.id) !== entry) continue;
+      this.pending.delete(entry.message.id);
+      this.opts.onCommit(entry.message);
+    }
   }
 
   /** True while the message is in its stability window (edits refresh the gate, not the context). */
@@ -95,18 +110,23 @@ export class MessageGate {
     if (!entry) return false;
     this.cancel(entry.timer);
     this.pending.delete(messageId);
+    this.drain(entry.channelId);
     return true;
   }
 
   /** Forget a channel's still-pending messages (the channel was deleted). */
   clearChannel(channelId: string): void {
     for (const [id, entry] of [...this.pending]) {
-      if (entry.channelId === channelId) this.drop(id);
+      if (entry.channelId === channelId) {
+        this.cancel(entry.timer);
+        this.pending.delete(id);
+      }
     }
   }
 
   /** Forget everything (shutdown): no pending message commits. */
   clear(): void {
-    for (const id of [...this.pending.keys()]) this.drop(id);
+    for (const entry of this.pending.values()) this.cancel(entry.timer);
+    this.pending.clear();
   }
 }

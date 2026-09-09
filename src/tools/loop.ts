@@ -1,5 +1,5 @@
 import type { ChatMessage, ChatResult, StreamCallbacks, ToolCall, ToolSpec } from "../llm/client.js";
-import { isInterruptedError } from "../llm/client.js";
+import { InterruptedError, isInterruptedError } from "../llm/client.js";
 import { isContextOverflowError } from "../llm/context.js";
 import { executeToolCalls, ToolRegistry, type ToolResultMessage, type ToolExecutionObserver } from "./executor.js";
 
@@ -67,6 +67,8 @@ export interface ToolTurnDeps {
    * preventing automatic replay of side effects.
    */
   signal?: AbortSignal;
+  /** Stop generation and skip tools that have not started after a human mention. */
+  interruptSignal?: AbortSignal;
   /**
    * Called right after a response that contains tool calls is fully
    * received (and before the next round starts) — never for the cutoff
@@ -111,9 +113,15 @@ export interface ToolTurnOutcome {
 export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): Promise<ToolTurnOutcome> {
   const tools = deps.registry.specs();
   let toolRounds = 0;
+  const checkMention = (): void => {
+    if (!deps.interruptSignal?.aborted) return;
+    if (toolRounds > 0) throw new Error("stopped after tools executed because a new mention arrived; completed tool results were retained");
+    throw new InterruptedError();
+  };
   for (;;) {
     let res: ChatResult;
     try {
+      checkMention();
       res = await deps.chat(messages, undefined, tools.length > 0 ? tools : undefined, deps.signal);
     } catch (err) {
       // Retrying from scratch loses executed operations and may repeat side
@@ -123,6 +131,7 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
       }
       throw err;
     }
+    checkMention();
     if (res.toolCalls.length === 0) {
       const out: ToolTurnOutcome = { content: res.content, toolRounds, exhausted: false };
       if (res.reasoning) out.reasoning = res.reasoning;
@@ -143,6 +152,7 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
     }
     await deps.onToolRound?.();
     await deps.onToolCalls?.(res.toolCalls);
+    checkMention();
     const results = await executeToolCalls(deps.registry, res.toolCalls, deps.observeTools?.(toolRounds));
     const round: ToolRound = { content: res.content, calls: res.toolCalls, results };
     if (res.reasoning) round.reasoning = res.reasoning;

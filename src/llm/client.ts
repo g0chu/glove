@@ -90,6 +90,8 @@ export interface ToolSpec {
 
 /** Per-call controls; ordinary replies retain the endpoint defaults. */
 export interface ChatRequestOptions {
+  /** Human mentions cancel even after reasoning or response generation starts. */
+  interruptSignal?: AbortSignal;
   toolChoice?: "auto" | "required";
   /** Maximum generated tokens for this call, including reasoning at compatible endpoints. */
   maxTokens?: number;
@@ -323,7 +325,7 @@ export class LlmClient {
     signal?: AbortSignal,
     options?: ChatRequestOptions,
   ): Promise<ChatResult> {
-    if (signal?.aborted) {
+    if (signal?.aborted || options?.interruptSignal?.aborted) {
       // The caller already aborted (the channel changed before this call
       // started): the prompt has not been processed yet, so fail at once —
       // no request goes out.
@@ -348,13 +350,19 @@ export class LlmClient {
       callerAborted = true;
       controller.abort();
     };
+    const onMentionAbort = (): void => {
+      callerAborted = true;
+      controller.abort();
+    };
     signal?.addEventListener("abort", onCallerAbort, { once: true });
+    options?.interruptSignal?.addEventListener("abort", onMentionAbort, { once: true });
     try {
       const res = await this.request(messages, tools, controller, options, cbs);
-      if (this.opts.stream) {
-        return await this.readSse(res, cbs, phase);
-      }
-      return await this.readJson(res, cbs);
+      const result = this.opts.stream
+        ? await this.readSse(res, cbs, phase)
+        : await this.readJson(res, cbs);
+      if (callerAborted) throw new InterruptedError();
+      return result;
     } catch (err) {
       if (callerAborted) {
         // The caller's signal fired while the prompt was still being
@@ -371,6 +379,7 @@ export class LlmClient {
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onCallerAbort);
+      options?.interruptSignal?.removeEventListener("abort", onMentionAbort);
       this.active.delete(controller);
     }
   }
