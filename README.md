@@ -41,7 +41,7 @@ npm run dev            # or: npm run build && npm start
   bot shows a typing indicator while the model decides. YES runs a normal
   reply; NO optionally posts a short decision and reason. Only a `chime` tool
   call is accepted; plain text (including YES/NO and JSON) never decides.
-  An unusable decision gets one repair with the tool still required; HTTP
+  An unusable decision gets one repair with only the required chime tool; HTTP
   failures, timeouts and outages do not retry. Both decision requests cap
   output at 1,024 tokens (including reasoning on compatible endpoints).
   Typing refreshes stop when the decision finishes. Failure logs
@@ -199,22 +199,45 @@ See [.env.example](.env.example) for the documented list.
 
 ### Chime prompt caching
 
-Chime keeps its system prompt and tool schema fixed, with new conversation
-messages at the end. Compatible servers can reuse that prefix. The bot logs
-`chime prompt cache: X/Y input tokens reused` when usage includes cache counts;
-missing counts mean unknown, not a cache miss. Decisions themselves are never
-cached.
+When chime is enabled, decisions and replies share the exact system prompt,
+full conversation (including reasoning, tool calls/results, summary and
+attachments), and ordered tool definitions. Both use `tool_choice: "auto"`:
+changing this can change the server's rendered prompt. The decision adds a
+short instruction **after** that shared context; a reply uses the shared
+context directly. The chime tool is advertised during replies for matching
+schemas, but reply handling removes it before tool execution or history
+recording. A decision-only reply gets one repair with chime omitted; a second
+failure stops with an error instead of consuming tool rounds. Existing reply
+text and real tool calls are preserved. Decision calls never execute tools;
+only a single valid chime call is accepted. Unusable decisions get one repair
+with only the required chime tool. These exceptional repairs may lose cache
+reuse in exchange for reliable output. The decision and its instructions are never
+added to working conversation history. Mentions still bypass the decision.
+
+With no executable tools enabled, a reply receiving an explicit HTTP 400/422
+tool-compatibility rejection retries once without tool metadata. Other errors
+propagate, and configured executable tools are never silently disabled.
+Interruption signals apply to every repair/fallback; already executed tools
+are not replayed. Every raw request/result is archived and counted separately;
+crash recovery uses the accepted reply after virtual calls are removed, so
+rejected candidates cannot create duplicate rounds or mispaired tool results.
+
+Compatible endpoints can reuse the conversation prefix instead of processing
+it twice. The bot logs `chime prompt cache: X/Y input tokens reused` when usage
+includes cache counts; missing counts mean unknown, not a cache miss.
+Decisions themselves are never cached.
 
 [llama-server documents](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
-`cache_prompt` as enabled by default. Its `--cache-ram` and slot configuration
-control how cached prompts survive intervening requests; check your installed
-version before tuning them. Chime and reply prompts have different instructions
-and tool schemas, so reuse between those request types is limited. Edits and
-compaction also change prefixes. No server settings are changed by the bot.
+server prompt caching. Actual reuse depends on its version, chat template,
+model and available slot/cache state. Edits, compaction, attachment-window
+changes and intervening requests can reduce reuse. Matching request prefixes
+enables caching but cannot guarantee zero prompt reprocessing. No server
+settings are changed by the bot.
 
 Chime and compaction prompts can be overridden with `BOT_CHIME_PROMPT` and
 `CONTEXT_COMPACTION_PROMPT` in `.env`. Missing or blank values keep the built-in
-prompts. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
+prompts. `BOT_CHIME_PROMPT` supplies the trailing decision instruction; the
+shared identity comes from `MODEL_SYSTEM_PROMPT`. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
 to hide chime NO decisions in Discord while keeping their diagnostic logs
 (default: `true`). Restart the bot after changing these settings.
 

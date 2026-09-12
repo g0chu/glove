@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, chimeTranscript, endWithTrigger, prefixEndIndex, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
-import { decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
+import { buildChannelContext, endWithTrigger, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
+import { CHIME_SHARED_NOTE, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
+import { chimeReplyChat } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { ChannelActivity } from "./bot/quiet.js";
@@ -69,7 +70,7 @@ async function main(): Promise<void> {
     // events are durable; unfinished operations are identified on restart.
     log.error(error.message);
     process.exit(1);
-  });
+  }, true);
   log.info(`durable archive: ${cfg.model.archiveDir}`);
   if (archive.recoveredTail) log.warn(`quarantined incomplete archive tail: ${archive.recoveredTail}`);
   const incomplete = archive.incomplete();
@@ -101,6 +102,9 @@ async function main(): Promise<void> {
   for (const channelId of archivedContexts.keys()) {
     if (!catchupBoundaries.has(channelId)) catchupBoundaries.set(channelId, null);
   }
+  // Release startup-only copies once working contexts and cursors are restored.
+  savedContexts.clear();
+  archivedContexts.clear();
   // Persist the old boundary before any new gateway messages can advance
   // the observed cursor; a crash during catch-up must not skip the gap.
   for (const [channelId, after] of catchupBoundaries) archive.record("catchup.started", { channelId }, { after });
@@ -352,9 +356,10 @@ async function main(): Promise<void> {
         // summarizer is the exception — it takes no signal (it is context
         // maintenance, not the prompt being answered, and an aborted
         // summarization must not fall into the emergency-trim path).
-        const replyChat: ChatFn = tokens.track(
-          (msgs, _cbs, t, signal) =>
-            archiveChat(archive, { ...scope, purpose: "reply", round: rounds.length }, callModel)(
+        const sharedTools = cfg.discord.chimeEnabled ? chimeTools(tools.registry.specs()) : undefined;
+        const measuredReplyChat: ChatFn = tokens.track(
+          (msgs, _cbs, t, signal, options) =>
+            archiveChat(archive, { ...scope, purpose: cfg.discord.chimeEnabled ? "reply-candidate" : "reply", round: rounds.length }, callModel)(
               msgs,
               {
                 onDelta: (d) => writer.chunk(d),
@@ -362,8 +367,19 @@ async function main(): Promise<void> {
               },
               t,
               signal,
+              options,
             ),
         );
+        const guardedReplyChat = cfg.discord.chimeEnabled
+          ? chimeReplyChat(measuredReplyChat, () => writer.discard())
+          : measuredReplyChat;
+        const replyChat: ChatFn = async (...args) => {
+          const result = await guardedReplyChat(...args);
+          if (cfg.discord.chimeEnabled) {
+            archive.record("reply.accepted", { ...scope, purpose: "reply", round: rounds.length }, result);
+          }
+          return result;
+        };
         const plainChat: ChatFn = tokens.track((msgs, cbs, t, signal, options) =>
           archiveChat(archive, { ...scope, purpose: t?.some((tool) => tool.name === "chime") ? "chime" : "compaction" }, callModel)(msgs, cbs, t, signal, options));
         // The attempt's conversation, recorded when the attempt completes:
@@ -408,7 +424,7 @@ async function main(): Promise<void> {
           // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
           // note (listing only the enabled families) is added when any are
           // registered.
-          const systemPrompt = [cfg.model.systemPrompt, tools.systemNote]
+          const systemPrompt = [cfg.model.systemPrompt, tools.systemNote, cfg.discord.chimeEnabled ? CHIME_SHARED_NOTE : null]
             .filter((p): p is string => p !== null && p.trim().length > 0)
             .join("\n\n");
           // Shared by the first build and (after an overflow) the rebuild: same
@@ -431,12 +447,13 @@ async function main(): Promise<void> {
             // plain (tool-less) chat call over the old transcript.
             summarize: async (msgs) => (await plainChat(msgs)).content,
           };
-          const messages = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
+          let messages = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
           if (messages === null) {
             // Deleted while queued.
             log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
             return;
           }
+          messages = endWithTrigger(context, ctxOpts, messages, turn.id);
           if (turn.chime) {
             // A message that committed while the turn waited for stillness
             // (or while the context was being built) supersedes this chime:
@@ -450,32 +467,18 @@ async function main(): Promise<void> {
               );
               return;
             }
-            // A chime turn: the model decides whether to respond at all, by
-            // calling the chime tool (respond + reason) in one small call over
-            // the transcript (the reply's system prompt is not part of it).
-            // The trigger is the newest user message (the supersede check
-            // above), but a previous turn's reply can sit after it in the
-            // context — the cut keeps the transcript ending at the trigger,
-            // so "the newest message below" in the decision prompt is the
-            // trigger itself. NO posts the decision + reason as a one-line
-            // UI message (never tracked); null (a failed or broken decision)
-            // posts no message and records nothing. Typing is refreshed
-            // only while the decision call is running.
-            // The decision sees the conversation only: no tool results, no tool
-            // calls, no reasoning (a past turn's tooling is not what the
-            // decision is about, and it keeps the call small). The cut keeps
-            // the transcript ending at the trigger, so "the newest message
-            // below" in the decision prompt is the trigger itself.
+            // Both phases receive the same full context, including the system
+            // prompt, tool history, reasoning and attachments. Only the decision
+            // instruction is appended, keeping the conversation prefix reusable.
             const decisionOver = async (msgs: ChatMessage[]): Promise<ChimeDecision | null> => {
-              const cut = prefixEndIndex(context, ctxOpts, turn.id);
-              const prefix = cut !== null ? msgs.slice(0, cut) : msgs;
               return decideChime(
                 (m, tools, signal, options) => plainChat(m, undefined, tools, signal, options),
-                chimeTranscript(systemPrompt.trim().length > 0 ? prefix.slice(1) : prefix),
+                msgs,
                 attemptController.signal,
                 { sendTyping: () => textChannel.sendTyping(), intervalMs: cfg.discord.typingIntervalMs },
                 { channelId, messageId: turn.id },
                 cfg.discord.chimePrompt,
+                sharedTools,
               );
             };
             let decision: ChimeDecision | null;
@@ -528,7 +531,8 @@ async function main(): Promise<void> {
                 return;
               }
               try {
-                decision = await decisionOver(rebuilt);
+                messages = endWithTrigger(context, ctxOpts, rebuilt, turn.id);
+                decision = await decisionOver(messages);
               } catch (err2) {
                 if (isInterruptedError(err2)) throw err2;
                 log.warn(`chime decision in ${channelId} still overfilled after the shrink (${errMsg(err2)}); staying silent`);
@@ -585,7 +589,7 @@ async function main(): Promise<void> {
             // the end when the context outgrew it — a request ending with the
             // bot's own reply would be prefilled/echoed or rejected by
             // prefill-assistant endpoints; see endWithTrigger).
-            outcome = await runModel(endWithTrigger(context, ctxOpts, messages, turn.id));
+            outcome = await runModel(messages);
           } catch (err) {
             // The request did not fit the model's context: the endpoint rejected
             // it before generating. A summarizer run on the overfilled context

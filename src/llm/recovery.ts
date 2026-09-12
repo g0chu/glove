@@ -16,7 +16,7 @@ export function recoverTurns(archive: ConversationArchive, contexts: ChannelCont
   const pending = new Map(archive.incomplete().turns.map((record) => [record.scope.turnId!, record]));
   if (!pending.size) return 0;
   const evidence = new Map<string, ArchiveRecord[]>();
-  const relevant = new Set(["model.finished", "tool.started", "tool.finished", "round.finished", "discord.delivery"]);
+  const relevant = new Set(["model.finished", "reply.accepted", "tool.started", "tool.finished", "round.finished", "discord.delivery"]);
   for (const record of archive.records()) {
     const turnId = record.scope.turnId;
     if (!turnId || !pending.has(turnId) || !relevant.has(record.type)) continue;
@@ -35,7 +35,10 @@ export function recoverTurns(archive: ConversationArchive, contexts: ChannelCont
     const rows = evidence.get(turnId) ?? [];
     const rounds: RecoveredRound[] = [];
     let final: Parameters<ChannelContext["appendTurn"]>[1] | undefined;
-    const models = rows.filter((r) => r.type === "model.finished" && r.scope.purpose === "reply");
+    // Shared-schema replies can make multiple raw requests for one round.
+    // Only the accepted, virtual-tool-filtered result can start its tools.
+    // Legacy reply records remain recoverable; raw candidates stay archived.
+    const models = rows.filter((r) => (r.type === "model.finished" || r.type === "reply.accepted") && r.scope.purpose === "reply");
     for (const model of models) {
       const result = archive.readData<ChatResult>(model);
       const sameRound = rows.filter((r) => r.scope.attempt === model.scope.attempt && r.scope.round === model.scope.round);
