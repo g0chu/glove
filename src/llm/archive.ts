@@ -12,7 +12,7 @@ export interface ArchiveScope {
   requestId?: string;
   executionId?: string;
   round?: number;
-  purpose?: "reply" | "chime" | "compaction";
+  purpose?: "reply" | "reply-candidate" | "chime" | "compaction";
 }
 
 /** One committed journal record. Payloads live in immutable SHA-256 blobs. */
@@ -26,6 +26,10 @@ export interface ArchiveRecord {
   previous: string;
   hash: string;
 }
+
+// Only the deduplication accelerator is evictable; recovery IDs are durable state.
+const INDEXED_ENTRY_CACHE_LIMIT = 16_384;
+const RECOVERY_INDEX_MAX_BYTES = 64 * 1024 * 1024;
 
 function digest(bytes: string | Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
@@ -41,7 +45,8 @@ function syncDirectory(dir: string): void {
  * Payload and journal fsyncs finish before record() returns. Write failures
  * poison the instance: callers must stop, never execute unjournaled tools.
  * A torn final journal line is quarantined on open; other corruption fails
- * closed. No recovery operation invokes a model, tool, or Discord send.
+ * closed when verified. Fast recovery defers old blob checks until access.
+ * No recovery operation invokes a model, tool, or Discord send.
  */
 export class ConversationArchive {
   private fd = -1;
@@ -59,9 +64,10 @@ export class ConversationArchive {
   private readonly catchups = new Map<string, string | null>();
   private readonly recordedTurns = new Set<string>();
   private readonly indexedEntries = new Set<string>();
+  private recovered = false;
   readonly recoveredTail: string | null;
 
-  constructor(readonly directory: string, private readonly onFailure?: (error: Error) => void) {
+  constructor(readonly directory: string, private readonly onFailure?: (error: Error) => void, private readonly fastRecovery = false) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     fs.mkdirSync(path.join(directory, "blobs"), { recursive: true, mode: 0o700 });
     this.claim();
@@ -70,7 +76,10 @@ export class ConversationArchive {
       this.fd = fs.openSync(journal, "a+", 0o600);
       syncDirectory(directory);
       syncDirectory(path.dirname(path.resolve(directory)));
-      this.recoveredTail = this.recover();
+      const offset = this.fastRecovery ? this.loadIndex() : 0;
+      this.recoveredTail = this.recover(offset);
+      this.recovered = true;
+      if (this.fastRecovery) this.saveIndex();
     } catch (err) {
       this.close();
       throw err;
@@ -183,18 +192,22 @@ export class ConversationArchive {
       this.checkpoints.set(channelId, record.data);
       const ids = this.tracked.get(channelId) ?? new Set<string>();
       const stored = JSON.parse(this.readBlob(record.data).toString("utf8"));
-      const entries: ContextEntry[] = [];
+      const track = (entry: ContextEntry): void => {
+        for (const id of entry.ids) ids.add(id);
+        if (entry.turnId) this.recordedTurns.add(entry.turnId);
+      };
       if (stored.archiveFormat === "context-v1") {
         for (const hash of stored.entries as string[]) {
           const key = `${channelId}:${hash}`;
           if (this.indexedEntries.has(key)) continue;
-          entries.push(this.readData<ContextEntry>({ data: hash }));
+          track(this.readData<ContextEntry>({ data: hash }));
           this.indexedEntries.add(key);
+          if (this.indexedEntries.size > INDEXED_ENTRY_CACHE_LIMIT) {
+            this.indexedEntries.delete(this.indexedEntries.values().next().value!);
+          }
         }
-      } else entries.push(...stored.entries);
-      for (const entry of entries) {
-        for (const id of entry.ids) ids.add(id);
-        if (entry.turnId) this.recordedTurns.add(entry.turnId);
+      } else {
+        for (const entry of stored.entries as ContextEntry[]) track(entry);
       }
       this.tracked.set(channelId, ids);
     }
@@ -217,11 +230,86 @@ export class ConversationArchive {
     if (channelId && record.type === "catchup.finished") this.catchups.delete(channelId);
   }
 
-  private recover(): string | null {
+  // The disposable index caches derived state, never replaces journal evidence.
+  // Hash the entire indexed journal prefix so edits/truncation invalidate it.
+  private journalDigest(length: number): string {
+    const hash = createHash("sha256");
+    const buffer = Buffer.alloc(1024 * 1024);
+    for (let offset = 0; offset < length;) {
+      const n = fs.readSync(this.fd, buffer, 0, Math.min(buffer.length, length - offset), offset);
+      if (!n) throw new Error("archive journal truncated while reading recovery index");
+      hash.update(buffer.subarray(0, n));
+      offset += n;
+    }
+    return hash.digest("hex");
+  }
+
+  private indexState() {
+    return {
+      seq: this.seq, previous: this.previous,
+      checkpoints: [...this.checkpoints], cursors: [...this.cursors],
+      unfinished: [...this.unfinished], requests: [...this.requests], turns: [...this.turns],
+      attachments: [...this.attachments], catchups: [...this.catchups],
+      tracked: [...this.tracked].map(([id, ids]) => [id, [...ids]] as const),
+      recordedTurns: [...this.recordedTurns],
+    };
+  }
+
+  private loadIndex(): number {
+    try {
+      const file = path.join(this.directory, "recovery-index.json");
+      if (fs.statSync(file).size > RECOVERY_INDEX_MAX_BYTES) return 0;
+      const bytes = fs.readFileSync(file, "utf8");
+      // A hash line followed by JSON avoids an escaped second copy of the state.
+      const body = bytes.slice(65);
+      if (bytes[64] !== "\n" || digest(body) !== bytes.slice(0, 64)) return 0;
+      const { version, offset, journalHash, state } = JSON.parse(body) as {
+        version: number; offset: number; journalHash: string; state: ReturnType<ConversationArchive["indexState"]>;
+      };
+      if (version !== 1 || !Number.isSafeInteger(offset) || offset < 0 || offset > fs.fstatSync(this.fd).size ||
+        this.journalDigest(offset) !== journalHash) return 0;
+      // Construct everything before mutating live state: malformed caches fall back cleanly.
+      const maps = [new Map(state.checkpoints), new Map(state.cursors), new Map(state.unfinished),
+        new Map(state.requests), new Map(state.turns), new Map(state.attachments), new Map(state.catchups),
+        new Map(state.tracked.map(([id, ids]) => [id, new Set(ids)]))] as const;
+      const recordedTurns = new Set(state.recordedTurns);
+      if (!Number.isSafeInteger(state.seq) || state.seq < 0 || typeof state.previous !== "string") return 0;
+      const copy = <K, V>(target: Map<K, V>, source: Map<K, V>): void => {
+        for (const [key, value] of source) target.set(key, value);
+      };
+      copy(this.checkpoints, maps[0]); copy(this.cursors, maps[1]); copy(this.unfinished, maps[2]);
+      copy(this.requests, maps[3]); copy(this.turns, maps[4]); copy(this.attachments, maps[5]);
+      copy(this.catchups, maps[6]); copy(this.tracked, maps[7]);
+      for (const id of recordedTurns) this.recordedTurns.add(id);
+      this.seq = state.seq;
+      this.previous = state.previous;
+      return offset;
+    } catch { return 0; }
+  }
+
+  private saveIndex(): void {
+    const file = path.join(this.directory, "recovery-index.json");
+    const temp = `${file}.${randomUUID()}.tmp`;
+    try {
+      const offset = fs.fstatSync(this.fd).size;
+      const body = JSON.stringify({ version: 1, offset, journalHash: this.journalDigest(offset), state: this.indexState() });
+      if (Buffer.byteLength(body) + 65 > RECOVERY_INDEX_MAX_BYTES) return;
+      const fd = fs.openSync(temp, "wx", 0o600);
+      try { fs.writeFileSync(fd, digest(body) + "\n"); fs.writeFileSync(fd, body); fs.fsyncSync(fd); }
+      finally { fs.closeSync(fd); }
+      fs.renameSync(temp, file);
+      syncDirectory(this.directory);
+    } catch {
+      // Cache failure cannot compromise already-fsynced journal records.
+      try { fs.unlinkSync(temp); } catch { /* no temporary file */ }
+    }
+  }
+
+  private recover(offset = 0): string | null {
     const buf = Buffer.alloc(64 * 1024);
     let pending = Buffer.alloc(0);
-    let position = 0;
-    let committedBytes = 0;
+    let position = offset;
+    let committedBytes = offset;
     for (;;) {
       const n = fs.readSync(this.fd, buf, 0, buf.length, position);
       if (n === 0) break;
@@ -307,8 +395,19 @@ export class ConversationArchive {
 
   /** Close the writer and release this process's lock. All writes already fsynced. */
   close(): void {
+    if (this.fd >= 0 && this.fastRecovery && this.recovered && !this.failure) this.saveIndex();
     if (this.fd >= 0) fs.closeSync(this.fd);
     this.fd = -1;
+    this.checkpoints.clear();
+    this.cursors.clear();
+    this.unfinished.clear();
+    this.requests.clear();
+    this.turns.clear();
+    this.attachments.clear();
+    this.tracked.clear();
+    this.catchups.clear();
+    this.recordedTurns.clear();
+    this.indexedEntries.clear();
     const lock = path.join(this.directory, ".lock");
     if (fs.existsSync(lock) && fs.readFileSync(lock, "utf8") === this.owner) fs.unlinkSync(lock);
   }
