@@ -35,7 +35,8 @@ import { archiveAttachments } from "../src/bot/attachment-store.js";
 import { captureCatchup } from "../src/bot/catchup.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
-import { CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
+import { chimeReplyChat } from "../src/bot/chime-reply.js";
+import { chimeTools, CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
 import { InterruptedError, isInterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
@@ -43,7 +44,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, chimeTranscript, contextToMessages, endWithTrigger, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, contextToMessages, endWithTrigger, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -665,12 +666,13 @@ const ok = (name: string): void => {
   assert.equal(await decideChime(async () => ({ content: "NO chatter", toolCalls: [{ id: "t", name: "chime", arguments: "broken" }] }), transcript), null);
   ok("chime: unrelated tools, reasoning and text beside broken arguments never decide");
 
-  // Bounded recovery: the chime tool is required on both calls.
-  for (const first of ["empty", "invalid", "multiple"] as const) {
+  // The normal request shares schemas; a broken decision gets a required, chime-only repair.
+  for (const first of ["empty", "invalid", "multiple", "unrelated"] as const) {
     const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string; maxTokens?: number }> = [];
     const recovered = await decideChime(async (messages, tools, signal, options) => {
       requests.push({ messages, tools, choice: options?.toolChoice, maxTokens: options?.maxTokens });
       if (requests.length === 1) {
+        if (first === "unrelated") return { content: "", toolCalls: [{ id: "unrelated", name: "file_read", arguments: "{}" }] };
         if (first === "multiple") return { content: "", toolCalls: [
           { id: "1", name: "chime", arguments: '{"respond":true}' },
           { id: "2", name: "chime", arguments: '{"respond":false}' },
@@ -678,10 +680,11 @@ const ok = (name: string): void => {
         return { content: first === "empty" ? "" : "maybe", toolCalls: [] };
       }
       return { content: "", toolCalls: [{ id: "fixed", name: "chime", arguments: '{"respond":false,"reason":"chatter"}' }] };
-    }, transcript);
+    }, transcript, undefined, undefined, undefined, undefined, chimeTools([{ name: "file_read", description: "read", parameters: {} }]));
+    assert.deepEqual(requests[0].tools?.map(tool => tool.name), ["file_read", "chime"]);
     assert.deepEqual(recovered, { respond: false, reason: "chatter" });
     assert.equal(requests.length, 2);
-    assert.equal(requests[0].choice, "required");
+    assert.equal(requests[0].choice, "auto");
     assert.deepEqual(requests[1].tools, [CHIME_TOOL_SPEC]);
     assert.equal(requests[1].choice, "required");
     assert.equal(requests[0].maxTokens, CHIME_MAX_TOKENS);
@@ -704,11 +707,9 @@ const ok = (name: string): void => {
     }, transcript), err => err === failure);
     assert.equal(attempts, 2, "repair propagates interruption/overflow to the turn runner");
   }
-  ok("chime: required decisions repair once, reject conflicts, preserve the prefix and propagate cancellation/overflow");
+  ok("chime: validated decisions repair once, reject conflicts, preserve the prefix and propagate cancellation/overflow");
 
-  // The decision call is one request: system prompt first, then the
-  // transcript (which ends with the message to decide about), and the chime
-  // tool is on the wire.
+  // The decision instruction follows the shared context; chime is on the wire.
   let sent: ChatMessage[] = [];
   let sentTools: ToolSpec[] | undefined;
   const spying: ChimeChat = async (msgs, tools) => {
@@ -718,21 +719,21 @@ const ok = (name: string): void => {
   };
   assert.deepEqual(await decideChime(spying, transcript), { respond: false, reason: "chatter" });
   assert.equal(sent.length, transcript.length + 1);
-  assert.equal(sent[0].role, "system");
-  assert.equal(sent[0].content, CHIME_SYSTEM_PROMPT);
-  assert.deepEqual(sent.slice(1), transcript);
+  assert.equal(sent.at(-1)!.role, "user");
+  assert.equal(sent.at(-1)!.content, CHIME_SYSTEM_PROMPT);
+  assert.deepEqual(sent.slice(0, -1), transcript);
   assert.deepEqual(sentTools, [CHIME_TOOL_SPEC]);
-  ok("chime: the decision is one call (system prompt + transcript) with the chime tool on the wire");
+  ok("chime: the decision is one call (shared context + decision instruction) with the chime tool on the wire");
 
   let customCalls = 0;
   await decideChime(async (msgs) => {
-    assert.equal(msgs[0].content, "Custom chime\nSecond line");
+    assert.equal(msgs[transcript.length].content, "Custom chime\nSecond line");
     customCalls++;
     return { content: customCalls === 1 ? "invalid" : "NO chatter", toolCalls: [] };
   }, transcript, undefined, undefined, undefined, "Custom chime\nSecond line");
   assert.equal(customCalls, 2, "custom prompt also reaches the repair request");
   await decideChime(spying, transcript, undefined, undefined, undefined, "  ");
-  assert.equal(sent[0].content, CHIME_SYSTEM_PROMPT);
+  assert.equal(sent.at(-1)!.content, CHIME_SYSTEM_PROMPT);
 
   // The NO line posted to the channel: a UI line with the reason, truncated.
   assert.equal(formatChimeNo("just chatter"), "🔕 *chime: no — just chatter*");
@@ -777,6 +778,111 @@ const ok = (name: string): void => {
     );
   }
   ok("chime: a context-overflow rejection is re-thrown (the turn shrinks and retries once)");
+}
+
+// Shared tool schemas must not turn reply decisions into executable rounds.
+{
+  const trigger: ChatMessage[] = [{ role: "user", content: "Alice: @Glove should you respond?" }];
+  const decision = { id: "d", name: "chime", arguments: '{"respond":false,"reason":"quiet"}' };
+  const write = { id: "w", name: "write", arguments: "{}" };
+  for (const mixed of [false, true]) {
+    let requests = 0;
+    let executions = 0;
+    let repairs = 0;
+    let recorded = 0;
+    const registry = new ToolRegistry().register({ name: "write", description: "write", parameters: {} }, async () => {
+      executions++;
+      return "saved";
+    });
+    const messages = structuredClone(trigger);
+    const tokens = new TurnTokens();
+    const chat = chimeReplyChat(tokens.track(async (msgs, _cbs, tools) => {
+      requests++;
+      assert.ok(!msgs.some(m => m.toolCalls?.some(c => c.name === "chime")), "virtual decisions never enter history");
+      if (requests === 1) {
+        assert.deepEqual(tools?.map(t => t.name), ["write", "chime"]);
+        return { content: "", toolCalls: mixed ? [decision, write] : [decision], usage: { input: 10, output: 2 } };
+      }
+      if (!mixed && requests === 2) {
+        assert.deepEqual(tools, registry.specs(), "repair hides the virtual tool");
+        assert.deepEqual(msgs.slice(0, -1), trigger);
+        return { content: "", toolCalls: [write], usage: { input: 10, output: 2 } };
+      }
+      return { content: "saved your file", toolCalls: [], usage: { input: 10, output: 2 } };
+    }), async () => { repairs++; });
+    const outcome = await runToolTurn(messages, { registry, maxRounds: 1, chat,
+      onToolCalls: calls => { assert.deepEqual(calls, [write]); },
+      onRoundComplete: round => { recorded++; assert.deepEqual(round.calls, [write]); },
+    });
+    assert.equal(outcome.content, "saved your file");
+    assert.equal(outcome.exhausted, false);
+    assert.equal(executions, 1, "the real write executes exactly once");
+    assert.equal(recorded, 1);
+    assert.equal(outcome.toolRounds, 1, "virtual decisions consume no tool budget");
+    assert.equal(repairs, mixed ? 0 : 1);
+    assert.equal(tokens.calls, requests, "every repair is accounted separately");
+    assert.equal(tokens.input, requests * 10);
+    assert.equal(messages.length, 3, "only trigger and real tool round enter history");
+  }
+  ok("chime reply: decision-only and mixed calls never execute chime or replay real tools");
+
+  let requests = 0;
+  let repairs = 0;
+  const answerChat = chimeReplyChat(async () => {
+    requests++;
+    return { content: "Here is the answer", reasoning: "thinking", toolCalls: [decision] };
+  }, async () => { repairs++; });
+  assert.deepEqual(await answerChat(trigger), { content: "Here is the answer", reasoning: "thinking", toolCalls: [] });
+  assert.equal(requests, 1);
+  assert.equal(repairs, 0, "text already streamed is preserved without duplicate delivery");
+  requests = 0;
+  await assert.rejects(chimeReplyChat(async () => {
+    requests++;
+    return { content: "", toolCalls: [decision] };
+  })(trigger), /did not provide a reply/);
+  assert.equal(requests, 2, "a model ignoring repair cannot loop forever");
+  assert.deepEqual(trigger, [{ role: "user", content: "Alice: @Glove should you respond?" }]);
+  ok("chime reply: keeps existing answers, bounds failed repairs and never mutates the trigger");
+
+  const rejection = new Error("model endpoint returned HTTP 400 Bad Request: tools are not supported");
+  requests = 0;
+  const compatibilityChat = chimeReplyChat(async (_m, _c, tools) => {
+    requests++;
+    if (tools) throw rejection;
+    return { content: "mention answered", toolCalls: [] };
+  });
+  assert.equal((await compatibilityChat(trigger)).content, "mention answered");
+  assert.equal(requests, 2);
+  assert.equal((await compatibilityChat(trigger)).content, "mention answered");
+  assert.equal(requests, 3, "remember the rejection within this attempt");
+  requests = 0;
+  await assert.rejects(chimeReplyChat(async () => { requests++; throw rejection; })(trigger), err => err === rejection);
+  assert.equal(requests, 2, "compatibility fallback is bounded too");
+  ok("chime reply: tool-free endpoints can answer mentions with one compatibility fallback");
+
+  for (const failure of [
+    new InterruptedError(),
+    new Error("model request timed out"),
+    new Error("model endpoint returned HTTP 500: tools unsupported"),
+    new Error("model endpoint returned HTTP 401: tools unsupported"),
+    new Error("model endpoint returned HTTP 400: malformed message"),
+    new Error("model endpoint returned HTTP 400: tools unsupported; request (9000 tokens) exceeds the available context size (8000 tokens)"),
+  ]) {
+    requests = 0;
+    await assert.rejects(chimeReplyChat(async () => { requests++; throw failure; })(trigger), err => err === failure);
+    assert.equal(requests, 1, "only explicit tool compatibility failures are retried");
+    requests = 0;
+    await assert.rejects(chimeReplyChat(async () => {
+      if (++requests === 1) return { content: "", toolCalls: [decision] };
+      throw failure;
+    })(trigger), err => err === failure);
+    assert.equal(requests, 2, "repair errors propagate without further retries");
+  }
+  requests = 0;
+  await assert.rejects(chimeReplyChat(async () => { requests++; throw rejection; })(trigger,
+    undefined, [{ name: "write", description: "write", parameters: {} }]), err => err === rejection);
+  assert.equal(requests, 1, "never disable configured executable tools on a compatibility error");
+  ok("chime reply: cancellation, overflow, outages and configured tool failures propagate");
 }
 
 // ----------------------------------------------------------------- split --
@@ -2219,25 +2325,65 @@ const ok = (name: string): void => {
     fs.rmSync(pdir, { recursive: true, force: true });
   }
 
-  // The chime decision's transcript strips the model's internal machinery:
-  // no tool results, no tool calls, no reasoning, no calls-only assistant
-  // messages — the decision is about the conversation, not a past turn's
-  // tooling.
-  const chimeIn: ChatMessage[] = [
-    { role: "user", content: "Alice: what is in the file?" },
-    { role: "assistant", content: "let me check", reasoningContent: "checking", toolCalls: [{ id: "c", name: "file_read", arguments: "{}" }] },
-    { role: "tool", toolCallId: "c", name: "file_read", content: "secret" },
+  // Inspect actual serialized requests: all history and tool definitions
+  // must match before the decision-only suffix, even with multimodal data.
+  const sharedContext: ChatMessage[] = [
+    { role: "system", content: "Shared identity and tool guidance" },
+    { role: "user", content: "Summary: earlier conversation" },
+    { role: "assistant", content: "", reasoningContent: "checking", toolCalls: [{ id: "c", name: "file_read", arguments: "{}" }] },
+    { role: "tool", toolCallId: "c", name: "file_read", content: "file contents" },
     { role: "assistant", content: "it says 42", reasoningContent: "done" },
-    { role: "assistant", content: "" },
-    { role: "user", content: "Bob: nice" },
+    { role: "user", content: [{ type: "text", text: "Bob: nice\nFile: example.txt\n```\nhello\n```" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,aGVsbG8=" } }] },
   ];
-  assert.deepEqual(chimeTranscript(chimeIn), [
-    { role: "user", content: "Alice: what is in the file?" },
-    { role: "assistant", content: "let me check" },
-    { role: "assistant", content: "it says 42" },
-    { role: "user", content: "Bob: nice" },
-  ], "tool entries drop, calls and reasoning strip, calls-only assistants drop");
-  ok("chime: chimeTranscript strips the model's internal machinery from the decision transcript");
+  const originalContext = structuredClone(sharedContext);
+  const wireRequests: Array<{ messages: unknown[]; tools?: unknown[]; tool_choice?: string; max_tokens?: number }> = [];
+  const server = http.createServer(async (req, res) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    wireRequests.push(JSON.parse(body));
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/no-tools" && wireRequests.at(-1)!.tools) {
+      res.statusCode = 422;
+      res.end(JSON.stringify({ error: { message: "tools are not supported" } }));
+      return;
+    }
+    res.end(JSON.stringify({ choices: [{ message: wireRequests.length === 1 || req.url === "/decision-only"
+      ? { content: "", tool_calls: [{ id: "decision", type: "function", function: { name: "chime", arguments: '{"respond":true,"reason":"question"}' } }] }
+      : { content: "reply" } }] }));
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new LlmClient({ apiUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/chat/completions`, apiKey: "none", model: "local", stream: false, timeoutMs: 5000 });
+    const sharedTools = chimeTools([{ name: "file_read", description: "Read a file", parameters: { type: "object" } }]);
+    assert.equal((await decideChime((m, t, signal, options) => client.chat(m, undefined, t, signal, options),
+      sharedContext, undefined, undefined, undefined, undefined, sharedTools))?.respond, true);
+    await chimeReplyChat(client.chat.bind(client))(sharedContext, undefined, sharedTools.filter(tool => tool.name !== "chime"));
+    assert.deepEqual(wireRequests[0].messages.slice(0, -1), wireRequests[1].messages);
+    assert.deepEqual(wireRequests[0].tools, wireRequests[1].tools);
+    assert.equal(wireRequests[0].tool_choice, wireRequests[1].tool_choice);
+    assert.equal(wireRequests[0].max_tokens, CHIME_MAX_TOKENS);
+    assert.equal(wireRequests[1].max_tokens, undefined);
+    assert.deepEqual(sharedContext, originalContext, "decision does not mutate or persist its suffix");
+    const apiBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const toolFree = new LlmClient({ apiUrl: `${apiBase}/no-tools`, apiKey: "none", model: "local", stream: false, timeoutMs: 5000 });
+    const beforeFallback = wireRequests.length;
+    assert.equal((await chimeReplyChat(toolFree.chat.bind(toolFree))([{ role: "user", content: "@Glove hello" }])).content, "reply");
+    assert.equal(wireRequests.length, beforeFallback + 2);
+    assert.equal(wireRequests.at(-1)!.tools, undefined);
+    assert.equal(wireRequests.at(-1)!.tool_choice, undefined, "tool-free fallback omits both fields on HTTP");
+
+    const interrupted = new LlmClient({ apiUrl: `${apiBase}/decision-only`, apiKey: "none", model: "local", stream: false, timeoutMs: 5000 });
+    const ctrl = new AbortController();
+    const beforeRepair = wireRequests.length;
+    await assert.rejects(chimeReplyChat(interrupted.chat.bind(interrupted), async () => { ctrl.abort(); })(
+      sharedContext, undefined, undefined, ctrl.signal), InterruptedError);
+    assert.equal(wireRequests.length, beforeRepair + 1, "activity before a repair prevents any stale HTTP request");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  }
+  ok("chime: serialized decision and reply share full context, tools and tool choice");
 
   // prefixEndIndex counts tool entries the way contextToMessages renders
   // them (a tool entry renders with its result text; a calls-only assistant
@@ -5037,7 +5183,7 @@ const ok = (name: string): void => {
     null);
   const recoveryRequests = seenRequests.slice(requestStart).map(r => r.body as Record<string, unknown>);
   assert.equal(recoveryRequests.length, 1);
-  assert.equal(recoveryRequests[0].tool_choice, "required");
+  assert.equal(recoveryRequests[0].tool_choice, "auto");
   assert.equal(recoveryRequests[0].max_tokens, CHIME_MAX_TOKENS);
   ok("chime: real HTTP tool rejection stays silent without a text fallback");
 
@@ -5277,6 +5423,82 @@ const ok = (name: string): void => {
   ok("chime: typing starts and refreshes during decisions, stops on every outcome, and tolerates Discord errors");
 }
 
+// Recovery indexes are disposable; the journal remains authoritative.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-index-"));
+  const index = path.join(dir, "recovery-index.json");
+  const journal = path.join(dir, "events.jsonl");
+  let archive = new ConversationArchive(dir, undefined, true);
+  try {
+    const context = new ChannelContext();
+    context.pushUser("Alice", "retired", "100", 100, []);
+    context.appendTurn([], { content: "reply", ids: ["101"] }, "recorded");
+    archive.record("context.checkpoint", { channelId: "c" }, context.serialize());
+    context.reset();
+    archive.record("context.checkpoint", { channelId: "c" }, context.serialize());
+    archive.record("channel.deleted", { channelId: "gone" }, {});
+    archive.record("discord.message", { channelId: "c", messageId: "200" }, {});
+    archive.record("catchup.started", { channelId: "c" }, { after: "100" });
+    archive.record("turn.started", { turnId: "pending" }, {});
+    archive.record("tool.started", { executionId: "tool" }, {});
+    archive.record("model.started", { requestId: "request" }, {});
+    const blob = archive.putBlob(Buffer.from("attachment"));
+    archive.record("attachment.saved", {}, { url: "attachment-url", blob });
+    const cache = (archive as unknown as { indexedEntries: Set<string> }).indexedEntries;
+    for (let i = cache.size; i < 16_384; i++) cache.add(`evictable:${i}`);
+    const oldest = cache.values().next().value!;
+    context.pushUser("Bob", "new entry after cache fills", "201", 201, []);
+    archive.record("context.checkpoint", { channelId: "other" }, context.serialize());
+    assert.equal(cache.size, 16_384, "checkpoint deduplication cache stays bounded");
+    assert.equal(cache.has(oldest), false, "oldest cached hash is evictable");
+    assert.equal(archive.wasTracked("c", "100"), true, "cache eviction preserves retired IDs");
+    archive.close();
+    assert.equal(cache.size, 0, "close releases the deduplication cache");
+    assert.equal(archive.messageCursors().size, 0, "close releases recovery maps");
+    assert.equal(archive.incomplete().turns.length, 0);
+    const savedIndex = fs.readFileSync(index);
+    archive = new ConversationArchive(dir, undefined, true);
+    assert.equal(archive.wasTracked("c", "100"), true);
+    assert.equal(archive.hasRecordedTurn("recorded"), true);
+    assert.equal(archive.restoreContexts().get("c")?.entries.length, 0);
+    assert.equal(archive.restoreContexts().get("gone"), null);
+    assert.equal(archive.catchupCursors().get("c"), "100");
+    assert.equal(archive.attachment("attachment-url")?.toString(), "attachment");
+    assert.deepEqual(archive.incomplete().turns.map(r => r.scope.turnId), ["pending"]);
+    assert.deepEqual(archive.incomplete().requests.map(r => r.scope.requestId), ["request"]);
+    assert.deepEqual(archive.incomplete().tools.map(r => r.scope.executionId), ["tool"]);
+    archive.record("tool.finished", { executionId: "tool" }, {});
+    archive.record("discord.message", { channelId: "c", messageId: "300" }, {});
+    archive.close();
+    // Simulate a crash after appending records but before refreshing the cache.
+    fs.writeFileSync(index, savedIndex);
+    fs.appendFileSync(journal, '{"torn":');
+    archive = new ConversationArchive(dir, undefined, true);
+    assert.ok(archive.recoveredTail);
+    assert.equal(archive.incomplete().tools.length, 0);
+    assert.equal(archive.messageCursors().get("c"), "300");
+    archive.close();
+    const goodIndex = fs.readFileSync(index);
+    fs.writeFileSync(index, "broken cache");
+    archive = new ConversationArchive(dir, undefined, true);
+    assert.equal(archive.messageCursors().get("c"), "300", "damaged index falls back to full recovery");
+    archive.close();
+    const original = fs.readFileSync(journal, "utf8");
+    fs.writeFileSync(index, goodIndex);
+    fs.writeFileSync(journal, original.replace('"seq":1', '"seq":9'));
+    assert.throws(() => new ConversationArchive(dir, undefined, true), /corrupt/,
+      "changed indexed prefix invalidates the cache and fails closed");
+    fs.writeFileSync(journal, original);
+    // Old unused bytes are checked on access or exhaustive inspection, not warm startup.
+    fs.writeFileSync(path.join(dir, "blobs", blob), "damaged");
+    archive = new ConversationArchive(dir, undefined, true);
+    assert.throws(() => archive.attachment("attachment-url"), /corrupt/);
+    archive.close();
+    assert.throws(() => new ConversationArchive(dir), /corrupt/);
+    ok("archive: indexed recovery retains state, replays crash suffixes, quarantines tails and rejects changed journals");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
 // ------------------------------------------------------- durable archive --
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-"));
@@ -5482,6 +5704,47 @@ const ok = (name: string): void => {
     deleted.setMeasuredTokens(10);
     assert.equal(archive.restoreContexts().get("gone"), null, "late turn accounting cannot resurrect a deleted channel");
     ok("archive: crash recovery restores completed work once, labels uncertain tools, and respects clears/deletions");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-recover-chime-repair-"));
+  let archive = new ConversationArchive(dir);
+  try {
+    const store = new ChannelContextStore();
+    store.get("c").pushUser("Alice", "write once", "trigger", 100, []);
+    const scope = { channelId: "c", turnId: "repair", messageId: "trigger", attempt: 0, round: 0 };
+    archive.record("context.checkpoint", { channelId: "c" }, store.get("c").serialize());
+    archive.record("turn.started", scope, { id: "trigger", chime: false });
+    const decision = { id: "d", name: "chime", arguments: '{"respond":false}' };
+    const write = { id: "w", name: "write", arguments: "{}" };
+    let calls = 0;
+    const chat = chimeReplyChat(archiveChat(archive, { ...scope, purpose: "reply-candidate" }, async () => {
+      calls++;
+      return { content: "", toolCalls: calls === 1 ? [decision] : [decision, write] };
+    }));
+    const result = await chat([{ role: "user", content: "write once" }], undefined,
+      [{ name: "write", description: "write", parameters: {} }]);
+    archive.record("reply.accepted", { ...scope, purpose: "reply" }, result);
+    const observer = archiveTools(archive, scope);
+    observer.started(write, 0);
+    observer.finished({ role: "tool", name: "write", toolCallId: "w", content: "saved once" }, 0);
+    // Simulate a crash after the tool result, before the atomic turn checkpoint.
+    archive.close();
+    archive = new ConversationArchive(dir);
+    const restored = new ChannelContextStore();
+    for (const [id, data] of archive.restoreContexts()) if (data) restored.restore(id, data);
+    assert.equal(recoverTurns(archive, restored), 1);
+    const entries = restored.get("c").snapshot();
+    assert.deepEqual(entries[1].toolCalls, [write]);
+    assert.equal(entries[2].toolCallId, "w");
+    assert.equal(entries[2].content, "saved once");
+    assert.equal(entries.filter(e => e.role === "tool").length, 1, "no duplicated round or phantom chime result");
+    assert.equal(recoverTurns(archive, restored), 0);
+    assert.equal(calls, 2, "recovery never replays model calls");
+    assert.equal([...archive.records()].filter(r => r.type === "model.finished" && r.scope.purpose === "reply-candidate").length, 2,
+      "raw rejected and mixed responses remain in the durable archive");
+    ok("archive: reply repair recovery restores only accepted calls with correctly paired results");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 

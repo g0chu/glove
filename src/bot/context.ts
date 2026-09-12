@@ -223,10 +223,8 @@ export function syncMessageUpdate(
  * The exclusive end index of the prefix of the messages array that
  * contextToMessages produces which ends at the entry containing `entryId`
  * — the system prompt (when non-empty), the summary (when present), and
- * every rendered entry up to and including it. The chime transcript is cut
- * there so a message committed after the trigger (while the turn's context
- * was building) does not shift the decision target: the prompt's "the
- * newest message below" must be the trigger itself. Null when the entry is
+ * every rendered entry up to and including it. This locates the trigger
+ * so endWithTrigger can move it after any subsequently recorded replies. Null when the entry is
  * not in the context. Uses the same rendering rule as contextToMessages:
  * a user entry always renders (its name label alone), an assistant entry
  * renders when it has text (bot messages are posted without attachments, so
@@ -261,14 +259,6 @@ export function prefixEndIndex(
 }
 
 /**
- * The chime decision's view of a built turn context: the conversation
- * without the model's internal machinery — tool results drop out, assistant
- * messages lose their tool calls and reasoning, and an assistant message
- * that carried only calls (no text) drops out entirely. The decision is
- * about the newest message, not about a past turn's tooling, so the
- * transcript stays small and focused.
- */
-/**
  * The reply request must end with the trigger's user message. The trigger
  * is committed before its turn runs, but a turn's reply lands in the
  * context only when the turn ends — a message committed while the previous
@@ -293,12 +283,6 @@ export function endWithTrigger(
   const cut = prefixEndIndex(context, opts, triggerId);
   if (cut === null || cut >= messages.length) return messages;
   return [...messages.slice(0, cut - 1), ...messages.slice(cut), messages[cut - 1]];
-}
-
-export function chimeTranscript(messages: ChatMessage[]): ChatMessage[] {
-  return messages
-    .filter((m) => m.role !== "tool" && !(m.role === "assistant" && typeof m.content === "string" && m.content.length === 0))
-    .map((m) => (m.role === "assistant" ? { role: "assistant" as const, content: m.content } : m));
 }
 
 /**
