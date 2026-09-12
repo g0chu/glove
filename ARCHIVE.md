@@ -48,7 +48,28 @@ record is appended and synced. An archive write failure stops the bot instead of
 continuing with unrecorded model/tool work. Use a local filesystem with reliable
 `fsync` and atomic rename semantics; hardware/filesystem failures can still defeat
 software durability. The archive grows until explicitly purged; there is no
-automatic retention limit. Journal scanning on startup verifies recorded payloads.
+automatic retention limit.
+
+Bot startup uses a disposable, checksummed `recovery-index.json`. It verifies the
+entire indexed journal prefix with SHA-256, restores derived recovery state, then
+fully verifies and replays any newer records. The first startup (or a missing,
+damaged, incompatible, or invalidated index) performs the full scan. The index is
+saved atomically after successful recovery and on clean shutdown; after a crash,
+records since the last index are scanned again. Index write failures leave the
+durable journal intact and only affect startup speed.
+
+Warm startup does not reread every historical blob. Blobs are hash-verified when
+read, including restored working contexts and attachments. To check all recorded
+payloads and response/attachment bytes for disk corruption, stop the bot and run
+`npm run archive -- inspect`; CLI commands always use exhaustive recovery.
+The index can be removed while stopped to force a full startup verification.
+
+Journal hashing uses a fixed 1 MiB buffer. Checkpoint entries are indexed one at
+a time, with at most 16,384 entry hashes kept for deduplication; this accelerator
+is not persisted. Recovery indexes larger than 64 MiB are skipped. Closing the
+archive releases all in-memory indexes. Required retired-message IDs, recorded
+turn IDs, attachment references and recovery metadata still grow with history;
+dropping these would break recovery or revive cleared history.
 
 Only one process may own an archive. `.lock` records its PID and a unique owner ID.
 A dead PID's lock is reclaimed on restart. `.claim` serializes lock acquisition;
@@ -57,8 +78,9 @@ verify that no writer is running before manually removing `.claim`. A live or
 reused PID blocks acquisition rather than risking two writers.
 
 A partial final journal line is copied to a `torn-tail-*.bin` file, then removed
-from the active journal. Complete corrupt records or missing/corrupt referenced
-payloads fail startup without silently replacing history with an empty archive.
+from the active journal. Complete corrupt records fail startup; missing/corrupt referenced payloads fail
+when verified (during exhaustive recovery, suffix replay, or content access),
+without silently replacing history with an empty archive.
 Unreferenced blobs or temporary files from an interrupted write may remain.
 
 Startup reports unfinished requests, turns, and tool executions. Completed work
