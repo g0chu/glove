@@ -102,6 +102,8 @@ export interface LlmClientOptions {
   apiKey: string;
   model: string;
   stream: boolean;
+  /** llama-server compatibility: evaluate each prompt without reusing prior KV state. */
+  disablePromptCache?: boolean;
   timeoutMs: number;
 }
 
@@ -397,6 +399,9 @@ export class LlmClient {
       messages: messages.map(toWireMessage),
       stream: this.opts.stream,
     };
+    // Apply centrally to replies, tool rounds, chime/repair calls and summaries.
+    // Omit this nonstandard extension unless explicitly enabled.
+    if (this.opts.disablePromptCache) body.cache_prompt = false;
     if (options?.maxTokens !== undefined) body.max_tokens = options.maxTokens;
     if (tools && tools.length > 0) {
       body.tools = tools.map((t) => ({

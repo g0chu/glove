@@ -46,6 +46,8 @@ export interface ModelConfig {
   /** Max bytes per downloaded file attachment (bigger ones are skipped). */
   fileContentsMaxBytes: number;
   stream: boolean;
+  /** Send llama-server's cache_prompt=false on every request when enabled. */
+  disablePromptCache: boolean;
   systemPrompt: string;
   /** Last-N seed size / image window. */
   contextMaxMessages: number;
@@ -271,6 +273,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       enableFileContents: boolEnv("MODEL_ENABLE_FILE_CONTENTS", false),
       fileContentsMaxBytes: intEnv("MODEL_FILE_CONTENT_MAX_BYTES", 1_000_000, 1024),
       stream: boolEnv("MODEL_STREAM", true),
+      disablePromptCache: boolEnv("MODEL_DISABLE_PROMPT_CACHE", false),
       systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),
       compactionMaxTokens: 0, // filled in below (empty env = automatic budget)
