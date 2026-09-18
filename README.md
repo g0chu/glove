@@ -28,6 +28,24 @@ npm run dev            # or: npm run build && npm start
 
 ## Behavior
 
+For llama-server installations affected by [llama.cpp #24440](https://github.com/ggml-org/llama.cpp/issues/24440)
+(reported with Gemma 4, MTP and `-sm tensor`), set
+`MODEL_DISABLE_PROMPT_CACHE=true` in your environment and restart Glove.
+This sends llama-server's `cache_prompt: false` on every model request,
+including chime decisions/repairs, tool rounds, summaries and retries. It is
+a mitigation for reuse of stale KV/checkpoint state, not a verified fix for
+the upstream CUDA crash. Prompt processing will be slower. The default is
+`false`, which omits this llama-server extension for other providers.
+
+Avoid manually editing/regenerating old assistant or system messages on
+affected servers. Glove itself cannot guarantee an append-only request
+prefix: edits/deletes, compaction, reply formatting, chime calls and
+interrupted attempts can all change it, and channels share server slots.
+Discord's live reply edits update display text; disabling `MODEL_STREAM`
+does not prevent these request-prefix changes. If the crash persists with
+cache reuse disabled, use a server build/configuration verified to work
+without the affected tensor/MTP combination.
+
 - **Trigger:** the bot answers when @mentioned (replies to its messages
   count as mentions) in any text channel of `DISCORD_GUILD_ID` — or of any
   guild the bot is a member of when `DISCORD_GUILD_ID` is left empty (DMs

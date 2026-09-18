@@ -56,6 +56,7 @@ async function main(): Promise<void> {
     apiKey: cfg.model.apiKey,
     model: cfg.model.name,
     stream: cfg.model.stream,
+    disablePromptCache: cfg.model.disablePromptCache,
     timeoutMs: cfg.model.timeoutMs,
   });
   // The per-channel contexts are persisted to disk after every change (see
