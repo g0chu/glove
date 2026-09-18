@@ -93,6 +93,16 @@ const ok = (name: string): void => {
   assert.equal(config.discord.token, "tok");
   assert.equal(config.discord.guildId, "123");
   assert.equal(config.model.stream, false);
+  assert.equal(config.model.disablePromptCache, false);
+  for (const value of ["true", "false"]) {
+    const parsed = parseConfig({
+      DISCORD_TOKEN: "tok", MODEL_API_URL: "http://localhost/v1/chat/completions",
+      MODEL_DISABLE_PROMPT_CACHE: value,
+    });
+    assert.deepEqual(parsed.errors, []);
+    assert.equal(parsed.config.model.disablePromptCache, value === "true");
+  }
+  assert.ok(parseConfig({ MODEL_DISABLE_PROMPT_CACHE: "invalid" }).errors.some((e) => e.includes("MODEL_DISABLE_PROMPT_CACHE")));
   assert.equal(config.model.timeoutMs, 5000);
   assert.equal(config.model.contextMaxMessages, 7);
   assert.equal(config.model.apiKey, "k1");
@@ -4927,6 +4937,38 @@ const ok = (name: string): void => {
     stream: false,
   });
   ok("llm: non-streaming single reply");
+
+  // The compatibility flag must survive every request, including changed
+  // historical messages and per-call controls. Archive observers see it too.
+  for (const stream of [false, true]) {
+    const client = new LlmClient({
+      apiUrl: `${base}/v1/${stream ? "toolstream" : "nonstream"}`,
+      apiKey: "k", model: "m", stream, timeoutMs: 5000,
+      disablePromptCache: true,
+    });
+    for (const version of ["original", "edited"]) {
+      let observed: Record<string, unknown> | undefined;
+      await client.chat([
+        { role: "system", content: version },
+        { role: "assistant", content: version },
+        { role: "user", content: "continue" },
+      ], { onRequest: (body) => { observed = body; } }, [
+        { name: "test", description: "test tool", parameters: { type: "object" } },
+      ], undefined, { toolChoice: "required", maxTokens: 1024 });
+      const body = seenRequests.at(-1)!.body;
+      assert.equal(body.cache_prompt, false);
+      assert.equal(body.stream, stream);
+      assert.equal(body.tool_choice, "required");
+      assert.equal(body.max_tokens, 1024);
+      assert.deepEqual(observed, body);
+    }
+  }
+  await new LlmClient({
+    apiUrl: `${base}/v1/nonstream`, apiKey: "k", model: "m",
+    stream: false, timeoutMs: 5000, disablePromptCache: false,
+  }).chat([]);
+  assert.equal(Object.hasOwn(seenRequests.at(-1)!.body, "cache_prompt"), false);
+  ok("llm: prompt-cache compatibility covers changed history, streaming and archived requests");
 
   // Token usage: the endpoint's own counts, captured when the response
   // reports them — the usage object, llama.cpp's legacy top-level
