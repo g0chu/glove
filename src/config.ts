@@ -274,7 +274,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       fileContentsMaxBytes: intEnv("MODEL_FILE_CONTENT_MAX_BYTES", 1_000_000, 1024),
       stream: boolEnv("MODEL_STREAM", true),
       disablePromptCache: boolEnv("MODEL_DISABLE_PROMPT_CACHE", false),
-      systemPrompt: optional("MODEL_SYSTEM_PROMPT", ""),
+      systemPrompt: env.MODEL_SYSTEM_PROMPT ?? "",
       contextMaxMessages: intEnv("MODEL_CONTEXT_MAX_MESSAGES", 20, 1),
       compactionMaxTokens: 0, // filled in below (empty env = automatic budget)
       compactionAuto: false, // filled in below

@@ -215,13 +215,19 @@ See [.env.example](.env.example) for the documented list.
 | `npm run typecheck` | type-check without emitting |
 | `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file/shell/zim tools, LLM client incl. tool calls vs. a mock endpoint) |
 
-### Chime prompt caching
+### Shared prompts and caching
+
+Replies, chime decisions and compaction share `MODEL_SYSTEM_PROMPT` unchanged.
+No tool guidance or phase instructions are added to that master prompt.
+Requests preserve conversation order, including when a reply follows a queued
+trigger. Endpoints must support trailing system instructions and generating a
+new reply after assistant history without treating it as an assistant prefill.
 
 When chime is enabled, decisions and replies share the exact system prompt,
 full conversation (including reasoning, tool calls/results, summary and
 attachments), and ordered tool definitions. Both use `tool_choice: "auto"`:
 changing this can change the server's rendered prompt. The decision adds a
-short instruction **after** that shared context; a reply uses the shared
+short **system-role** instruction **after** that shared context; a reply uses the shared
 context directly. The chime tool is advertised during replies for matching
 schemas, but reply handling removes it before tool execution or history
 recording. A decision-only reply gets one repair with chime omitted; a second
@@ -240,6 +246,14 @@ are not replayed. Every raw request/result is archived and counted separately;
 crash recovery uses the accepted reply after virtual calls are removed, so
 rejected candidates cannot create duplicate rounds or mispaired tool results.
 
+Compaction also sends the full active context with the same ordered tool
+schemas and `tool_choice: "auto"`, followed by a system instruction specifying
+which older portion to summarize. Roles, reasoning, tool calls/results and
+attachments remain intact. Tools are never executed during compaction; a tool
+call is treated as a failed summary. Applying the summary still replaces older
+history, so the next request necessarily has a different prefix. Compaction
+instructions are not stored in working history.
+
 Compatible endpoints can reuse the conversation prefix instead of processing
 it twice. The bot logs `chime prompt cache: X/Y input tokens reused` when usage
 includes cache counts; missing counts mean unknown, not a cache miss.
@@ -255,7 +269,8 @@ settings are changed by the bot.
 Chime and compaction prompts can be overridden with `BOT_CHIME_PROMPT` and
 `CONTEXT_COMPACTION_PROMPT` in `.env`. Missing or blank values keep the built-in
 prompts. `BOT_CHIME_PROMPT` supplies the trailing decision instruction; the
-shared identity comes from `MODEL_SYSTEM_PROMPT`. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
+shared identity comes from `MODEL_SYSTEM_PROMPT`. `CONTEXT_COMPACTION_PROMPT`
+supplies the trailing summary instruction, never a replacement master prompt. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
 to hide chime NO decisions in Discord while keeping their diagnostic logs
 (default: `true`). Restart the bot after changing these settings.
 

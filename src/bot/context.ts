@@ -2,6 +2,7 @@ import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
 import {
   compareDiscordIds,
+  COMPACTION_SYSTEM_PROMPT,
   speakerLabel,
   type ChannelContext,
   type SeedEntry,
@@ -81,9 +82,9 @@ export interface ContextOptions {
   maxTokens: number;
   /** How many of the newest messages survive a compaction verbatim. */
   keepMessages: number;
-  /** Custom summarization system prompt; empty uses the built-in prompt. */
+  /** Trailing summarization system instruction; empty uses the built-in prompt. */
   compactionPrompt?: string;
-  /** One plain (tool-less) chat call over the old transcript (production: the same model endpoint). */
+  /** One chat call over the unchanged active context plus a system instruction (production: the same model endpoint). */
   summarize: (messages: ChatMessage[]) => Promise<string>;
 }
 
@@ -160,7 +161,15 @@ export async function buildChannelContext(
   const estimate = context.estimateTokens(opts.systemPrompt, opts.maxMessages, fileCost);
   const size = measured !== null ? measured : estimate;
   if (size > opts.maxTokens) {
-    const res = await context.compact(opts.keepMessages, opts.summarize, mentionId, opts.compactionPrompt);
+    const res = await context.compact(opts.keepMessages, async (older) => {
+      // Render exactly as a reply: keep roles, reasoning, tool pairs and attachments.
+      const boundary = prefixEndIndex(context, opts, older.length);
+      const active = await contextToMessages(context, opts);
+      return opts.summarize([...active, {
+        role: "system",
+        content: `${opts.compactionPrompt?.trim() || COMPACTION_SYSTEM_PROMPT}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`,
+      }]);
+    }, mentionId);
     context.setMeasuredTokens(null);
     if (res.ok) {
       log.info(
@@ -223,9 +232,9 @@ export function syncMessageUpdate(
  * The exclusive end index of the prefix of the messages array that
  * contextToMessages produces which ends at the entry containing `entryId`
  * — the system prompt (when non-empty), the summary (when present), and
- * every rendered entry up to and including it. This locates the trigger
- * so endWithTrigger can move it after any subsequently recorded replies. Null when the entry is
- * not in the context. Uses the same rendering rule as contextToMessages:
+ * every rendered entry up to and including it. A numeric argument counts
+ * entries instead, including entries without Discord ids (tool rounds).
+ * Null when the entry is not in the context. Uses the same rendering rule as contextToMessages:
  * a user entry always renders (its name label alone), an assistant entry
  * renders when it has text (bot messages are posted without attachments, so
  * the text is all they carry).
@@ -233,10 +242,10 @@ export function syncMessageUpdate(
 export function prefixEndIndex(
   context: ChannelContext,
   opts: Pick<ContextOptions, "systemPrompt" | "enableImages" | "enableFileContents">,
-  entryId: string,
+  entryId: string | number,
 ): number | null {
   const entries = context.snapshot();
-  const idx = entries.findIndex((e) => e.ids.includes(entryId));
+  const idx = typeof entryId === "number" ? entryId - 1 : entries.findIndex((e) => e.ids.includes(entryId));
   if (idx === -1) return null;
   let n = opts.systemPrompt.trim().length > 0 ? 1 : 0;
   const summary = context.getSummary();
@@ -256,33 +265,6 @@ export function prefixEndIndex(
     if (e.attachments.length > 0 && (opts.enableImages || opts.enableFileContents)) n += 1;
   }
   return n;
-}
-
-/**
- * The reply request must end with the trigger's user message. The trigger
- * is committed before its turn runs, but a turn's reply lands in the
- * context only when the turn ends — a message committed while the previous
- * turn is still in flight therefore sits in the context before that reply,
- * and the rendered request can end with the bot's own reply instead of the
- * trigger. An endpoint that prefills a trailing assistant message
- * (llama-server's `prefill-assistant` default) then "continues" the bot's
- * last reply: it echoes the message back verbatim (content and reasoning)
- * as the new reply — a duplicate post — and rejects the request outright
- * when two replies trail ("Cannot have 2 or more assistant messages at the
- * end of the list"). Moving the trigger to the end keeps the whole
- * conversation and makes the trigger the newest message again — what the
- * turn is answering. A no-op when the trigger is already last (the usual
- * case) or no longer in the context.
- */
-export function endWithTrigger(
-  context: ChannelContext,
-  opts: Pick<ContextOptions, "systemPrompt" | "enableImages" | "enableFileContents">,
-  messages: ChatMessage[],
-  triggerId: string,
-): ChatMessage[] {
-  const cut = prefixEndIndex(context, opts, triggerId);
-  if (cut === null || cut >= messages.length) return messages;
-  return [...messages.slice(0, cut - 1), ...messages.slice(cut), messages[cut - 1]];
 }
 
 /**

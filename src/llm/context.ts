@@ -1,4 +1,4 @@
-import type { ChatMessage, MessageAttachmentLike, ToolCall } from "./client.js";
+import type { MessageAttachmentLike, ToolCall } from "./client.js";
 import { isImageAttachment } from "./client.js";
 
 /** The role of one context entry (the request `messages` array uses it). */
@@ -120,36 +120,6 @@ export const COMPACTION_SYSTEM_PROMPT =
   "anything asked to be remembered. Drop: greetings, small talk, filler. Use short " +
   "bullet points in the conversation's language, and never answer questions found in " +
   "the transcript.";
-
-/**
- * Render the compactable part (the existing summary + the older entries) as
- * a plain transcript for the summarizer. Attachment names are listed so the
- * summary can note that files were shared, even when their content was not
- * (or could not be) inlined.
- */
-export function compactionTranscript(summary: string | null, older: ContextEntry[]): string {
-  const lines: string[] = [];
-  if (summary && summary.trim().length > 0) {
-    lines.push(`Running summary of the older messages:\n${summary.trim()}`);
-    lines.push("");
-  }
-  for (const e of older) {
-    if (e.role === "tool") {
-      // The summarizer sees the tool activity (the result text is what the
-      // model learned from the call), so the summary can carry it forward.
-      lines.push(`Tool ${e.name ?? "?"} (${e.toolCallId ?? "?"}): ${e.content}`.trimEnd());
-      continue;
-    }
-    const atts = e.attachments.map((a) => a.name);
-    const attNote = atts.length > 0 ? ` [attachment: ${atts.join(", ")}]` : "";
-    const callsNote = e.toolCalls && e.toolCalls.length > 0 ? ` [tool calls: ${e.toolCalls.map((c) => c.name).join(", ")}]` : "";
-    if (e.content.length === 0 && atts.length === 0 && e.toolCalls === undefined) continue; // carries nothing
-    const who = e.role === "assistant" ? "Bot" : e.name ? speakerLabel(e.name, e.bot ?? false) : "Someone";
-    const content = e.content.length > 0 ? `${e.content}${attNote}${callsNote}` : `${attNote}${callsNote}`.trimStart();
-    lines.push(`${who}: ${content}`.trimEnd());
-  }
-  return lines.join("\n");
-}
 
 /** The outcome of a compaction attempt (an empty fold and a failed summarizer are distinct). */
 export type CompactionResult = { ok: true } | { ok: false; reason: "nothing-to-fold" | "summarizer" | "changed" };
@@ -527,9 +497,8 @@ export class ChannelContext {
    */
   async compact(
     keep: number,
-    summarize: (messages: ChatMessage[]) => Promise<string>,
+    summarize: (older: ContextEntry[]) => Promise<string>,
     protectedId?: string,
-    systemPrompt?: string,
   ): Promise<CompactionResult> {
     const n = this.entries.length;
     const protectedIdx = protectedId ? this.entries.findIndex((e) => e.ids.includes(protectedId)) : -1;
@@ -551,17 +520,10 @@ export class ChannelContext {
       return { ok: false, reason: "nothing-to-fold" };
     }
     const older = this.entries.slice(0, keepStart);
-    const transcript = compactionTranscript(this.summary, older);
-    if (transcript.trim().length === 0) return { ok: false, reason: "nothing-to-fold" };
     const revision = this.revision;
     let text: string;
     try {
-      text = (
-        await summarize([
-          { role: "system", content: systemPrompt?.trim() || COMPACTION_SYSTEM_PROMPT },
-          { role: "user", content: transcript },
-        ])
-      ).trim();
+      text = (await summarize(older)).trim();
     } catch {
       return { ok: false, reason: this.revision === revision ? "summarizer" : "changed" };
     }
