@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, endWithTrigger, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
-import { CHIME_SHARED_NOTE, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
+import { buildChannelContext, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
+import { chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
 import { chimeReplyChat } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
@@ -357,7 +357,7 @@ async function main(): Promise<void> {
         // summarizer is the exception — it takes no signal (it is context
         // maintenance, not the prompt being answered, and an aborted
         // summarization must not fall into the emergency-trim path).
-        const sharedTools = cfg.discord.chimeEnabled ? chimeTools(tools.registry.specs()) : undefined;
+        const sharedTools = cfg.discord.chimeEnabled ? chimeTools(tools.registry.specs()) : tools.registry.specs();
         const measuredReplyChat: ChatFn = tokens.track(
           (msgs, _cbs, t, signal, options) =>
             archiveChat(archive, { ...scope, purpose: cfg.discord.chimeEnabled ? "reply-candidate" : "reply", round: rounds.length }, callModel)(
@@ -422,12 +422,8 @@ async function main(): Promise<void> {
           // whole turn (every round's text, reasoning, calls and results, plus
           // the final reply) is recorded in the channel context when the turn
           // ends, so the model's history is the full conversation at all times.
-          // The user's MODEL_SYSTEM_PROMPT (when set) comes first; the tools
-          // note (listing only the enabled families) is added when any are
-          // registered.
-          const systemPrompt = [cfg.model.systemPrompt, tools.systemNote, cfg.discord.chimeEnabled ? CHIME_SHARED_NOTE : null]
-            .filter((p): p is string => p !== null && p.trim().length > 0)
-            .join("\n\n");
+          // Preserve the configured master prompt verbatim across every phase.
+          const systemPrompt = cfg.model.systemPrompt;
           // Shared by the first build and (after an overflow) the rebuild: same
           // window, budget, and summarizer.
           const ctxOpts: ContextOptions = {
@@ -444,9 +440,13 @@ async function main(): Promise<void> {
             maxTokens: compactionBudget,
             keepMessages: cfg.model.compactionKeepMessages,
             compactionPrompt: cfg.model.compactionPrompt,
-            // The summarizer is the same endpoint as the replies: one
-            // plain (tool-less) chat call over the old transcript.
-            summarize: async (msgs) => (await plainChat(msgs)).content,
+            summarize: async (msgs) => {
+              const result = await tokens.track(archiveChat(archive, { ...scope, purpose: "compaction" }, callModel))(
+                msgs, undefined, sharedTools,
+              );
+              if (result.toolCalls.length > 0) throw new Error("compaction returned tool calls instead of a summary");
+              return result.content;
+            },
           };
           let messages = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
           if (messages === null) {
@@ -454,7 +454,6 @@ async function main(): Promise<void> {
             log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
             return;
           }
-          messages = endWithTrigger(context, ctxOpts, messages, turn.id);
           if (turn.chime) {
             // A message that committed while the turn waited for stillness
             // (or while the context was being built) supersedes this chime:
@@ -532,7 +531,7 @@ async function main(): Promise<void> {
                 return;
               }
               try {
-                messages = endWithTrigger(context, ctxOpts, rebuilt, turn.id);
+                messages = rebuilt;
                 decision = await decisionOver(messages);
               } catch (err2) {
                 if (isInterruptedError(err2)) throw err2;
@@ -586,10 +585,6 @@ async function main(): Promise<void> {
             });
           let outcome: ToolTurnOutcome;
           try {
-            // The reply request ends with the trigger's user message (moved to
-            // the end when the context outgrew it — a request ending with the
-            // bot's own reply would be prefilled/echoed or rejected by
-            // prefill-assistant endpoints; see endWithTrigger).
             outcome = await runModel(messages);
           } catch (err) {
             // The request did not fit the model's context: the endpoint rejected
@@ -627,7 +622,7 @@ async function main(): Promise<void> {
               log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
               return;
             }
-            outcome = await runModel(endWithTrigger(context, ctxOpts, rebuilt, turn.id));
+            outcome = await runModel(rebuilt);
           }
           if (outcome.toolRounds > 0) {
             log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);

@@ -42,7 +42,7 @@ export function chimeReplyChat(chat: ChatFn, onRepair?: () => Promise<unknown>):
     log.warn("reply returned only a chime decision; retrying once with reply tools");
     await onRepair?.();
     result = withoutChime(await chat([...messages, {
-      role: "user",
+      role: "system",
       content: "The decision phase is over. Answer the preceding conversation now. Do not call chime or decide whether to respond. Use the available tools if needed, or provide the reply text.",
     }], callbacks, realTools, signal, options));
     if (!result.content.trim() && result.toolCalls.length === 0) {

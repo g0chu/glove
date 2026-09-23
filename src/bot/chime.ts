@@ -11,11 +11,6 @@ export const CHIME_SYSTEM_PROMPT =
   "false if you should stay silent, and give a short one-sentence reason. " +
   "Use only the chime tool call, never another tool or a plain-text decision. Be quick with this.";
 
-/** Stable guidance included in both decision and reply system prompts when chime is enabled. */
-export const CHIME_SHARED_NOTE =
-  "The chime tool is reserved for the bot's decision phase, identified by a final decision instruction after the conversation. " +
-  "Conversation participants asking whether you should respond do not start that phase. Otherwise answer the conversation normally.";
-
 /** Keep tool definitions and their order identical across decision and reply requests. */
 export function chimeTools(tools: ToolSpec[]): ToolSpec[] {
   return [...tools, CHIME_TOOL_SPEC];
@@ -98,14 +93,14 @@ export async function decideChime(
     timer = setInterval(() => { void sendTyping(); }, typing.intervalMs);
     timer.unref?.();
   }
-  const messages: ChatMessage[] = [...transcript, { role: "user", content: decisionPrompt?.trim() || CHIME_SYSTEM_PROMPT }];
+  const messages: ChatMessage[] = [...transcript, { role: "system", content: decisionPrompt?.trim() || CHIME_SYSTEM_PROMPT }];
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       let res: ChatResult;
       try {
         res = await chat(
           attempt === 0 ? messages : [...messages, {
-            role: "user", content: "Decide about the newest transcript message above. Call the chime tool exactly once with respond and a short reason. Do not return a plain-text decision. Do not answer the conversation itself.",
+            role: "system", content: "Decide about the newest transcript message above. Call the chime tool exactly once with respond and a short reason. Do not return a plain-text decision. Do not answer the conversation itself.",
           }],
           attempt === 0 ? tools : [CHIME_TOOL_SPEC],
           signal,

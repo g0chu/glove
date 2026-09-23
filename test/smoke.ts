@@ -44,7 +44,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, contextToMessages, endWithTrigger, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, contextToMessages, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -132,6 +132,9 @@ const ok = (name: string): void => {
   assert.equal(customPrompts.config.discord.showChimeNo, false);
   assert.equal(customPrompts.config.discord.chimePrompt, "Custom chime\nSecond line");
   assert.equal(customPrompts.config.model.compactionPrompt, "Custom summary");
+  const masterWhitespace = parseConfig({ DISCORD_TOKEN: "token", MODEL_API_URL: "http://localhost/chat", MODEL_SYSTEM_PROMPT: "  master\nexact  " });
+  assert.deepEqual(masterWhitespace.errors, []);
+  assert.equal(masterWhitespace.config.model.systemPrompt, "  master\nexact  ");
   assert.ok(parseConfig({ BOT_CHIME_SHOW_NO: "invalid" }).errors.some((e) => e.includes("BOT_CHIME_SHOW_NO")));
   ok("config: parses valid env and applies defaults");
 
@@ -729,7 +732,7 @@ const ok = (name: string): void => {
   };
   assert.deepEqual(await decideChime(spying, transcript), { respond: false, reason: "chatter" });
   assert.equal(sent.length, transcript.length + 1);
-  assert.equal(sent.at(-1)!.role, "user");
+  assert.equal(sent.at(-1)!.role, "system");
   assert.equal(sent.at(-1)!.content, CHIME_SYSTEM_PROMPT);
   assert.deepEqual(sent.slice(0, -1), transcript);
   assert.deepEqual(sentTools, [CHIME_TOOL_SPEC]);
@@ -1525,69 +1528,35 @@ const ok = (name: string): void => {
     ok("chime transcript: prefixEndIndex cuts the transcript at the trigger (summary kept, newer entries excluded)");
   }
 
-  // endWithTrigger: the reply request must end with the trigger's user
-  // message. A message committed while the previous turn is still in
-  // flight lands in the context before that turn's reply, so the context
-  // can end with the bot's own reply — in that shape a prefill-assistant
-  // endpoint (llama-server's default) "continues" the trailing assistant
-  // message, echoing it back verbatim as the new reply (the duplicate
-  // post) or rejecting the request outright when two replies trail
-  // ("Cannot have 2 or more assistant messages at the end of the list").
-  // The trigger moves to the end; the rest keeps its order; a trigger that
-  // is already last is a no-op (same array back).
+  // Rendering never moves a trigger around a subsequently completed reply.
   {
-    const etstore = new ChannelContext();
-    etstore.pushUser("Alice", "the trigger", "et-trig", 1, []);
-    etstore.pushUser("Bob", "committed while the turn built", "et-later", 2, []);
-    etstore.pushAssistant("the previous reply", ["et-a1"]);
-    const etopts: Parameters<typeof endWithTrigger>[1] = {
-      systemPrompt: "sys",
-      enableImages: false,
-      enableFileContents: false,
+    const ordered = new ChannelContext();
+    ordered.seeded = true;
+    ordered.pushUser("Alice", "trigger", "ordered-trigger", 1, []);
+    ordered.appendTurn([{
+      content: "checking", reasoning: "think", ids: [],
+      calls: [{ id: "ordered-call", name: "file_read", arguments: "{}" }],
+      results: [{ role: "tool", toolCallId: "ordered-call", name: "file_read", content: "result" }],
+    }], { content: "previous reply", ids: [] });
+    ordered.pushUser("Bob", "newest", "ordered-newest", 2, []);
+    const opts = {
+      botId: "bot", botName: "Bot", systemPrompt: "  Master\nunchanged  ", maxMessages: 20,
+      enableImages: false, imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024,
+      maxTokens: 1, keepMessages: 1,
+      summarize: async (messages: ChatMessage[]): Promise<string> => {
+        assert.deepEqual(messages.slice(0, -1), expected);
+        assert.equal(messages.at(-1)!.role, "system");
+        assert.ok(String(messages.at(-1)!.content).includes("before message 5"));
+        return "summary";
+      },
     };
-    const etrender: Parameters<typeof contextToMessages>[1] = {
-      ...etopts,
-      maxMessages: 10,
-      imagesMaxBytes: 1024,
-      fileContentsMaxBytes: 1024,
-    };
-    const etmsgs = await contextToMessages(etstore, etrender);
-    assert.equal(String(etmsgs[etmsgs.length - 1].content), "the previous reply", "the context ends with the bot's reply");
-    const etmoved = endWithTrigger(etstore, etopts, etmsgs, "et-trig");
-    assert.deepEqual(
-      etmoved.map((m) => [m.role, String(m.content)]),
-      [
-        ["system", "sys"],
-        ["user", "Bob: committed while the turn built"],
-        ["assistant", "the previous reply"],
-        ["user", "Alice: the trigger"],
-      ],
-      "the trigger moves to the end, the rest keeps its order",
-    );
-    assert.equal(etmoved[etmoved.length - 1].role, "user", "the request ends with the trigger's user message");
-    assert.notEqual(etmoved, etmsgs, "a new array is returned (the original is untouched)");
-    assert.equal(String(etmsgs[etmsgs.length - 1].content), "the previous reply", "the original array keeps its shape");
-    // Two trailing replies (the [A, A] shape the server rejects): the move
-    // fixes it the same way — the request ends with the trigger.
-    const et2store = new ChannelContext();
-    et2store.pushUser("Alice", "the trigger", "et2-trig", 1, []);
-    et2store.pushAssistant("first reply", ["et2-a1"]);
-    et2store.pushAssistant("second reply", ["et2-a2"]);
-    const et2msgs = await contextToMessages(et2store, etrender);
-    assert.equal(String(et2msgs[et2msgs.length - 2].content), "first reply", "two trailing assistants");
-    assert.equal(String(et2msgs[et2msgs.length - 1].content), "second reply");
-    const et2moved = endWithTrigger(et2store, etopts, et2msgs, "et2-trig");
-    assert.equal(et2moved[et2moved.length - 1].role, "user", "two trailing replies -> the request ends with the trigger");
-    assert.equal(String(et2moved[et2moved.length - 1].content), "Alice: the trigger");
-    // The usual case: the trigger is already the last entry — a no-op.
-    const et3store = new ChannelContext();
-    et3store.pushUser("Alice", "the trigger", "et3-trig", 1, []);
-    const et3msgs = await contextToMessages(et3store, etrender);
-    assert.equal(endWithTrigger(et3store, etopts, et3msgs, "et3-trig"), et3msgs, "trigger already last -> the same array back");
-    // A trigger that is no longer in the context: unchanged (the caller
-    // skips the turn).
-    assert.equal(endWithTrigger(et3store, etopts, et3msgs, "et3-gone"), et3msgs, "absent trigger -> unchanged");
-    ok("context: endWithTrigger moves the trigger to the end (no trailing assistant reply)");
+    const expected = await contextToMessages(ordered, opts);
+    assert.equal(expected[0].content, opts.systemPrompt);
+    assert.equal(expected[1].content, "Alice: trigger");
+    assert.equal(expected[2].reasoningContent, "think");
+    assert.equal(expected[3].role, "tool");
+    await buildChannelContext(noFetch, ordered, "ordered-newest", opts);
+    ok("context: compaction preserves master prompt, entry order, reasoning and tool pairs without Discord ids");
   }
 
   // A single tracked reply grouped with a tracked multi-chunk reply (the
@@ -1654,7 +1623,7 @@ const ok = (name: string): void => {
   let summaryRequest: ChatMessage[] | null = null;
   const summarize = async (msgs: ChatMessage[]): Promise<string> => {
     summaryRequest = msgs;
-    seenTranscripts.push(String(msgs[1].content));
+    seenTranscripts.push(msgs.slice(0, -1).map(m => String(m.content)).join("\n"));
     return "they discussed the launch plan";
   };
   const cOpts = {
@@ -1670,6 +1639,7 @@ const ok = (name: string): void => {
     keepMessages: 3,
     summarize,
   };
+  const originalPrefix = await contextToMessages(cstore, cOpts);
   const cres = await buildChannelContext(noFetch, cstore, "m1", cOpts);
   assert.deepEqual(cres, [
     { role: "system", content: "sys" },
@@ -1682,10 +1652,13 @@ const ok = (name: string): void => {
   assert.equal(cstore.length, 3, "only the newest 3 entries survive");
   assert.equal(seenTranscripts.length, 1, "one summarization call");
   assert.equal(summaryRequest![0].role, "system");
-  assert.equal(summaryRequest![0].content, COMPACTION_SYSTEM_PROMPT, "plain (tool-less) summarization request");
+  assert.deepEqual(summaryRequest!.slice(0, -1), originalPrefix, "compaction preserves the entire reply prefix");
+  assert.equal(summaryRequest!.at(-1)!.role, "system");
+  assert.ok(String(summaryRequest!.at(-1)!.content).startsWith(COMPACTION_SYSTEM_PROMPT));
+  assert.ok(String(summaryRequest!.at(-1)!.content).includes("before message 7"), "fold boundary excludes retained entries");
   const transcript = seenTranscripts[0];
   assert.ok(transcript.includes("P1: old message 1"), "oldest messages in the transcript");
-  assert.ok(!transcript.includes("old message 7"), "kept messages are not re-summarized");
+  assert.ok(transcript.includes("old message 7"), "kept messages remain in the request prefix");
   ok("compaction: old messages become a summary, newest kept verbatim");
 
   const customStore = new ChannelContext();
@@ -1694,7 +1667,9 @@ const ok = (name: string): void => {
   await buildChannelContext(noFetch, customStore, "custom-new", {
     ...cOpts, keepMessages: 1, maxTokens: 1, compactionPrompt: "Custom summary",
     summarize: async (msgs) => {
-      assert.equal(msgs[0].content, "Custom summary");
+      assert.equal(msgs[0].content, "sys");
+      assert.equal(msgs.at(-1)!.role, "system");
+      assert.ok(String(msgs.at(-1)!.content).startsWith("Custom summary"));
       return "custom summary result";
     },
   });
@@ -1704,7 +1679,7 @@ const ok = (name: string): void => {
   cstore.pushUser("Bob", "more talk", "m2", 10000, []);
   const cres2 = await buildChannelContext(noFetch, cstore, "m2", cOpts);
   assert.equal(seenTranscripts.length, 2, "second compaction runs");
-  assert.ok(seenTranscripts[1].includes("Running summary of the older messages:"), "previous summary folded in");
+  assert.ok(seenTranscripts[1].includes("Summary of the earlier messages in this channel"), "previous summary folded in");
   assert.ok(seenTranscripts[1].includes("they discussed the launch plan"));
   assert.ok(seenTranscripts[1].includes("P7: old message 7"), "now-old messages summarized");
   assert.deepEqual(
@@ -5358,6 +5333,7 @@ const ok = (name: string): void => {
       fileContentsMaxBytes: 1024, maxTokens: 1, keepMessages: 1,
       summarize: () => new Promise<string>((yes, no) => { resolve = yes; reject = no; }),
     });
+    await ticks();
     if (mutation === "clear") {
       context.reset();
       context.pushUser("User", "new conversation", "5", 5, []);
