@@ -280,3 +280,12 @@ to hide chime NO decisions in Discord while keeping their diagnostic logs
 A new human message mentioning the bot interrupts its active model request immediately, including streamed reasoning and response generation. A pending edit containing a human mention does the same. The partial reply is withdrawn; after stabilization, the newer mention's turn rebuilds the prompt from the updated conversation. Ordinary messages and typing retain the prefill-only interruption behavior described above. Tools that have not started are skipped; already-running tools finish and their results are retained before the newer turn runs, without replaying them.
 
 The stability gate commits pending messages in Discord snowflake order within each channel. A newer stable mention waits for earlier pending messages to finish stabilizing, so their final content precedes it in the prompt. Other channels remain independent. Deleting an earlier pending message releases stable messages behind it; clearing a channel or shutting down discards all its pending messages.
+
+Before each mention or chime attempt, the bot waits for `DISCORD_MESSAGE_STABLE_MS`
+without messages, edits, deletions, or typing from other users/bots. It then fetches
+fresh Discord history, paginating new-message gaps and reconciling the latest 100
+tracked user messages for edits and confirmed deletions. Activity during the fetch
+discards that snapshot; discovered changes restart the quiet wait before rebuilding
+the prompt. Refresh failures stop the attempt rather than answer from stale history.
+The bot’s own activity is excluded. Ordinary activity after generation starts still
+allows that generation to finish; human mentions retain their immediate interruption.
