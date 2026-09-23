@@ -1,5 +1,5 @@
 import type { MessageAttachmentLike, ToolCall } from "./client.js";
-import { isImageAttachment } from "./client.js";
+import { isImageAttachment, isInterruptedError } from "./client.js";
 
 /** The role of one context entry (the request `messages` array uses it). */
 export type Role = "user" | "assistant" | "tool";
@@ -524,7 +524,8 @@ export class ChannelContext {
     let text: string;
     try {
       text = (await summarize(older)).trim();
-    } catch {
+    } catch (err) {
+      if (isInterruptedError(err)) throw err;
       return { ok: false, reason: this.revision === revision ? "summarizer" : "changed" };
     }
     // Never apply a snapshot over a clear, edit, deletion, or newer arrival.

@@ -6,10 +6,11 @@ import { chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bo
 import { chimeReplyChat } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
+import { fetchFreshMessages } from "./bot/refresh.js";
 import { ChannelActivity } from "./bot/quiet.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMention } from "./bot/router.js";
 import { ResponseWriter, SAFE_MENTIONS, type PostedReply } from "./bot/writer.js";
-import { LlmClient, isInterruptedError, type ChatMessage } from "./llm/client.js";
+import { LlmClient, InterruptedError, isInterruptedError, type ChatMessage } from "./llm/client.js";
 import { ChatPersistence } from "./llm/persist.js";
 import { ConversationArchive } from "./llm/archive.js";
 import { archiveChat } from "./llm/archived-chat.js";
@@ -18,6 +19,7 @@ import { captureCatchup } from "./bot/catchup.js";
 import { archiveTools } from "./tools/archive.js";
 import { recoverTurns } from "./llm/recovery.js";
 import {
+  compareDiscordIds,
   ChannelContextStore,
   contextWindowFromOverflowError,
   isContextOverflowError,
@@ -325,6 +327,7 @@ async function main(): Promise<void> {
         const scope = { channelId, turnId, messageId: turn.id, attempt };
         const callModel: ChatFn = (msgs, cbs, t, signal, options) => {
           if (stopping) throw new Error("bot is shutting down");
+          if (attemptController.signal.aborted) throw new InterruptedError();
           return llm.chat(msgs, cbs, t, signal, { ...options, interruptSignal: signal ? mentionController.signal : undefined });
         };
         // Per-attempt state: a fresh writer (a previous attempt's partial
@@ -354,9 +357,8 @@ async function main(): Promise<void> {
         // the in-flight call while its prompt is still being processed
         // (after the first token the call runs to completion) and dooms the
         // next one (it fails at once at the entry check). The compaction
-        // summarizer is the exception — it takes no signal (it is context
-        // maintenance, not the prompt being answered, and an aborted
-        // summarization must not fall into the emergency-trim path).
+        // summarizer shares the signal; interrupted compaction propagates
+        // without falling into the emergency-trim path.
         const sharedTools = cfg.discord.chimeEnabled ? chimeTools(tools.registry.specs()) : tools.registry.specs();
         const measuredReplyChat: ChatFn = tokens.track(
           (msgs, _cbs, t, signal, options) =>
@@ -392,20 +394,39 @@ async function main(): Promise<void> {
         const rounds: ToolRound[] = [];
         const roundSettled: Array<PostedReply | null> = [];
         try {
-          if (turn.chime) {
-            // A chime turn decides over a still conversation: before
-            // deciding, it waits for complete stillness — no activity in
-            // the channel for the stability window, the window restarting
-            // on every new change (a new message, an edit, a typing
-            // indicator). Any activity cancels the pending decision and the
-            // wait starts over, so a burst of messages settles into one
-            // decision over what was actually said, not one decision per
-            // partial message. The attempt's watch is already armed:
-            // activity during the wait aborts the not-yet-started attempt,
-            // and the interrupt path below retries the decision from the
-            // still state (a fresh attempt, a fresh context).
-            await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
+          // Every attempt, including mentions, starts from a quiet REST snapshot.
+          await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
+          if (attemptController.signal.aborted) throw new InterruptedError();
+          const trackedIds = context.snapshot().filter((e) => e.role === "user").slice(-100).flatMap((e) => e.ids);
+          const newestTrackedId = [...trackedIds].sort(compareDiscordIds).at(-1);
+          const fresh = await fetchFreshMessages(trackedIds,
+            async (before) => [...(await textChannel.messages.fetch({ limit: 100, before, cache: false })).values()],
+            (id) => textChannel.messages.fetch({ message: id, force: true, cache: false }), attemptController.signal);
+          // A gateway event wins over every observation in an in-flight snapshot.
+          if (attemptController.signal.aborted) throw new InterruptedError();
+          for (const id of fresh.deleted) {
+            archive.record("discord.deleted", { channelId, messageId: id }, { source: "refresh" });
+            gate.drop(id);
+            context.removeById(id);
+            channelActivity.note(channelId);
           }
+          const refreshBot = client.user;
+          if (!refreshBot) return;
+          for (const message of fresh.messages) {
+            if (!isTrackable(message, refreshBot.id, cfg.discord.guildId)) continue;
+            archiveMessage(message, "refresh");
+            if (context.has(message.id)) {
+              const previous = JSON.stringify(context.find(message.id));
+              syncMessageUpdate(context, message, refreshBot.id, refreshBot.username);
+              if (previous !== JSON.stringify(context.find(message.id))) channelActivity.note(channelId);
+            } else if (newestTrackedId && compareDiscordIds(message.id, newestTrackedId) > 0 &&
+                !gate.isPending(message.id) && !archive.wasTracked(channelId, message.id) &&
+                (context.getClearedAt() === null || message.createdTimestamp > context.getClearedAt()!)) {
+              gate.arrive(message);
+              channelActivity.note(channelId, !message.author.bot && isMentionOf(message, refreshBot.id));
+            }
+          }
+          if (attemptController.signal.aborted) throw new InterruptedError();
           // Build the context before the typing indicator starts: it is a
           // channel fetch (+ image downloads, + one summarization call when the
           // context compacts), not the reply generation itself.
@@ -442,7 +463,7 @@ async function main(): Promise<void> {
             compactionPrompt: cfg.model.compactionPrompt,
             summarize: async (msgs) => {
               const result = await tokens.track(archiveChat(archive, { ...scope, purpose: "compaction" }, callModel))(
-                msgs, undefined, sharedTools,
+                msgs, undefined, sharedTools, attemptController.signal,
               );
               if (result.toolCalls.length > 0) throw new Error("compaction returned tool calls instead of a summary");
               return result.content;
@@ -1012,6 +1033,7 @@ async function main(): Promise<void> {
     if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
       liveMessageIds.add(message.id);
       archive.record("discord.deleted", { channelId, messageId: message.id }, {});
+      if (message.author?.id !== client.user?.id) channelActivity.note(channelId);
     }
     gate.drop(message.id);
     conversationFor(channelId)?.removeById(message.id);
@@ -1024,6 +1046,7 @@ async function main(): Promise<void> {
       if (channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || channel.guildId === cfg.discord.guildId)) {
         liveMessageIds.add(m.id);
         archive.record("discord.deleted", { channelId: channel.id, messageId: m.id }, { bulk: true });
+        if (m.author?.id !== client.user?.id) channelActivity.note(channel.id);
       }
       gate.drop(m.id);
       conv?.removeById(m.id);

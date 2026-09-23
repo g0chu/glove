@@ -1,3 +1,4 @@
+import { fetchFreshMessages } from "../src/bot/refresh.js";
 /**
  * Smoke tests: config parsing, the stability gate (a message commits once
  * it has been unchanged for the window), code-fence-aware chunk splitting,
@@ -545,6 +546,33 @@ const ok = (name: string): void => {
     assert.deepEqual(fired, ["a"], "cleared messages never commit");
   }
   ok("gate: per-message commits; clearChannel/clear forget pending messages without committing");
+}
+
+// Fresh REST observations include gaps, edits, and confirmed deletions.
+{
+  const pages: Array<string | undefined> = [];
+  const fresh = await fetchFreshMessages(["1", "2", "3"], async (before) => {
+    pages.push(before);
+    return before ? [{ id: "3", content: "edited" }] :
+      Array.from({ length: 100 }, (_, i) => ({ id: String(103 - i), content: "new" }));
+  }, async (id) => {
+    if (id === "1") throw Object.assign(new Error("unknown message"), { code: 10008 });
+    return { id, content: "older edit" };
+  });
+  assert.deepEqual(pages, [undefined, "4"]);
+  assert.deepEqual(fresh.deleted, ["1"]);
+  assert.equal(fresh.messages[0].content, "older edit");
+  assert.equal(fresh.messages[1].content, "edited");
+  assert.equal(fresh.messages.length, 102);
+  await assert.rejects(fetchFreshMessages(["1"], async () => [], async () => {
+    throw Object.assign(new Error("forbidden"), { code: 50013 });
+  }), /forbidden/);
+  const abort = new AbortController();
+  await assert.rejects(fetchFreshMessages([], async () => {
+    abort.abort();
+    return [{ id: "1" }];
+  }, async (id) => ({ id }), abort.signal), InterruptedError);
+  ok("refresh: paginates gaps, reconciles edits/deletes, rejects failures and activity during fetch");
 }
 
 // ----------------------------------------------------------------- quiet --
@@ -5320,6 +5348,21 @@ const ok = (name: string): void => {
 }
 
 // ---------------------------------------------------- regression fixes --
+{
+  const context = new ChannelContext();
+  context.seeded = true;
+  for (let i = 1; i <= 4; i++) context.pushUser("User", "old text ".repeat(20), String(i), i, []);
+  const expected = context.serialize();
+  await assert.rejects(buildChannelContext({} as GuildTextBasedChannel, context, "4", {
+    botId: "bot", botName: "Bot", systemPrompt: "", maxMessages: 20,
+    enableImages: false, imagesMaxBytes: 1024, enableFileContents: false,
+    fileContentsMaxBytes: 1024, maxTokens: 1, keepMessages: 1,
+    summarize: async () => { throw new InterruptedError(); },
+  }), InterruptedError);
+  assert.deepEqual(context.serialize(), expected);
+  ok("compaction: activity interruption preserves history without emergency trimming");
+}
+
 {
   for (const mutation of ["clear", "delete", "edit", "arrival", "failure"] as const) {
     const context = new ChannelContext();
