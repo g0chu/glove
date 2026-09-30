@@ -91,7 +91,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(zim);
     registerZimTools(registry, zim);
     bullets.push(
-      "- wikipedia_search, wikipedia_read: offline Wikipedia title/path search and paginated text. Choose mode intro, sections, section or full; query finds targeted excerpts.",
+      "- wikipedia_search, wikipedia_intro, wikipedia_sections, wikipedia_section, wikipedia_read: search offline Wikipedia, get introductions, list headings, read a section or paginated article text; query finds targeted excerpts.",
     );
     rules.push("Cite Wikipedia article titles when you use wikipedia_read.");
   }
@@ -109,7 +109,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(vault);
     registerVaultTools(registry, vault);
     bullets.push(
-      "- vault_search, vault_read, vault_links: offline Wikipedia title/text search, paginated markdown and outgoing links. Choose mode intro, sections, section or full; query finds targeted excerpts.",
+      "- vault_search, vault_intro, vault_sections, vault_section, vault_read, vault_links: search offline Wikipedia, get introductions, list headings, read a section or paginated markdown, and follow outgoing links; query finds targeted excerpts.",
     );
     rules.push("Cite the vault note titles when you use vault_read.");
   }

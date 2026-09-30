@@ -3654,7 +3654,7 @@ const ok = (name: string): void => {
   });
   assert.deepEqual(zimErrs, []);
   const zimOnly = buildTools(zimCfg);
-  assert.equal(zimOnly.registry.size, 2);
+  assert.equal(zimOnly.registry.size, 5);
   assert.ok(zimOnly.systemNote?.includes("wikipedia_search"));
   assert.ok(zimOnly.systemNote?.includes("wikipedia_read"));
   assert.ok(!zimOnly.systemNote?.includes("web_search"), "web tools not advertised");
@@ -3670,7 +3670,7 @@ const ok = (name: string): void => {
   });
   assert.deepEqual(vaultOnlyErrs, []);
   const vaultOnly = buildTools(vaultOnlyCfg);
-  assert.equal(vaultOnly.registry.size, 3);
+  assert.equal(vaultOnly.registry.size, 6);
   for (const name of ["vault_search", "vault_read", "vault_links"]) {
     assert.ok(vaultOnly.systemNote?.includes(name), `the note advertises ${name}`);
   }
@@ -3687,7 +3687,7 @@ const ok = (name: string): void => {
   });
   assert.deepEqual(allErrs, []);
   const all = buildTools(allCfg);
-  assert.equal(all.registry.size, 11);
+  assert.equal(all.registry.size, 17);
   for (const name of [
     "web_search",
     "web_fetch",
@@ -4453,7 +4453,7 @@ const ok = (name: string): void => {
     const tools = new ZimTools({ file: zimFile, maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000 });
     const registry = new ToolRegistry();
     registerZimTools(registry, tools);
-    assert.equal(registry.size, 2);
+    assert.equal(registry.size, 5);
     assert.ok(registry.has("wikipedia_search"));
     assert.ok(registry.has("wikipedia_read"));
     const results = await executeToolCalls(registry, [
@@ -4467,8 +4467,8 @@ const ok = (name: string): void => {
     assert.ok(results[1].content.startsWith("Wikipedia: Albert Einstein"), results[1].content);
     assert.ok(results[1].content.includes("theoretical physicist"));
     const browseResults = await executeToolCalls(registry, [
-      { id: "zb1", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"outline"}' },
-      { id: "zb2", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","section":"1","query":"RELATIVITY","max_chars":80}' },
+      { id: "zb1", name: "wikipedia_sections", arguments: '{"title":"Albert Einstein"}' },
+      { id: "zb2", name: "wikipedia_section", arguments: '{"title":"Albert Einstein","section":"1","query":"RELATIVITY","max_chars":80}' },
       { id: "zb3", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","offset":20,"max_chars":10}' },
       { id: "zb4", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"invalid"}' },
     ]);
@@ -4478,9 +4478,9 @@ const ok = (name: string): void => {
     assert.ok(browseResults[2].content.includes("next offset 30"));
     assert.ok(browseResults[3].content.startsWith("Error:"));
     const explicitModes = await executeToolCalls(registry, [
-      { id: "zi", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"intro"}' },
-      { id: "zs", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"sections"}' },
-      { id: "zt", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"section","section":"1"}' },
+      { id: "zi", name: "wikipedia_intro", arguments: '{"title":"Albert Einstein"}' },
+      { id: "zs", name: "wikipedia_sections", arguments: '{"title":"Albert Einstein"}' },
+      { id: "zt", name: "wikipedia_section", arguments: '{"title":"Albert Einstein","section":"1"}' },
     ]);
     assert.ok(explicitModes[0].content.includes("theoretical physicist"));
     assert.equal(explicitModes[1].content, browseResults[0].content);
@@ -4586,8 +4586,8 @@ const ok = (name: string): void => {
     const browseRegistry = new ToolRegistry();
     registerVaultTools(browseRegistry, tools);
     const browseResults = await executeToolCalls(browseRegistry, [
-      { id: "vb1", name: "vault_read", arguments: '{"note":"Browse","mode":"outline"}' },
-      { id: "vb2", name: "vault_read", arguments: '{"note":"Browse","section":"Discovery","max_chars":100}' },
+      { id: "vb1", name: "vault_sections", arguments: '{"note":"Browse"}' },
+      { id: "vb2", name: "vault_section", arguments: '{"note":"Browse","section":"Discovery","max_chars":100}' },
       { id: "vb3", name: "vault_read", arguments: '{"note":"Browse","query":"RARE"}' },
     ]);
     assert.ok(browseResults[0].content.includes("2: ### Discovery"));
@@ -4621,10 +4621,10 @@ const ok = (name: string): void => {
     assert.throws(() => browseWiki(titled, { mode: "section" }, 100), /requires a section/);
     assert.throws(() => browseWiki(titled, { mode: "intro", section: "History" }, 100), /cannot select/);
     const explicitModes = await executeToolCalls(browseRegistry, [
-      { id: "intro", name: "vault_read", arguments: '{"note":"Browse","mode":"intro"}' },
-      { id: "sections", name: "vault_read", arguments: '{"note":"Browse","mode":"sections"}' },
-      { id: "section", name: "vault_read", arguments: '{"note":"Browse","mode":"section","section":"Discovery"}' },
-      { id: "missing", name: "vault_read", arguments: '{"note":"Browse","mode":"section"}' },
+      { id: "intro", name: "vault_intro", arguments: '{"note":"Browse"}' },
+      { id: "sections", name: "vault_sections", arguments: '{"note":"Browse"}' },
+      { id: "section", name: "vault_section", arguments: '{"note":"Browse","section":"Discovery"}' },
+      { id: "missing", name: "vault_section", arguments: '{"note":"Browse"}' },
     ]);
     assert.ok(explicitModes[0].content.includes("Lead text") && !explicitModes[0].content.includes("Rare discovery"));
     assert.ok(explicitModes[1].content.includes("2: ### Discovery"));
@@ -4710,14 +4710,14 @@ const ok = (name: string): void => {
     // -- registry + executor wiring (errors surface as tool results)
     const registry = new ToolRegistry();
     registerVaultTools(registry, tools);
-    assert.equal(registry.size, 3);
+    assert.equal(registry.size, 6);
     const res = await executeToolCalls(registry, [
       { id: "v1", name: "vault_search", arguments: JSON.stringify({ query: "zeppelinite", max_results: 3 }) },
       { id: "v2", name: "vault_read", arguments: JSON.stringify({ note: "A B", mode: "weird" }) },
       { id: "v3", name: "vault_links", arguments: JSON.stringify({ note: "Aardvark" }) },
     ]);
     assert.ok(res[0].content.includes("- Quantum Zzz"), res[0].content);
-    assert.ok(res[1].content.startsWith("Error:") && res[1].content.includes('must be "full", "abstract" or "outline"'), res[1].content);
+    assert.ok(res[1].content.startsWith("Error:") && res[1].content.includes('unsupported argument "mode"'), res[1].content);
     assert.ok(res[2].content.includes("no [[wikilinks]]"), res[2].content);
     const broken = new VaultTools({ dir: "/nonexistent/vault-dir", maxResults: 8, scanBudgetMs: 5000, maxTextChars: 2000 });
     const brokenReg = new ToolRegistry().register(VAULT_SEARCH_SPEC, (args) => broken.search(argString(args, "query"), 5));
@@ -6604,7 +6604,7 @@ const ok = (name: string): void => {
   const cfg = parseConfig({ DISCORD_TOKEN: "test", MODEL_API_URL: "http://localhost", WEBTOOLS_ENABLED: "true", FILETOOLS_ENABLED: "true", SHELLTOOLS_ENABLED: "true", ZIMTOOLS_ENABLED: "true", ZIM_FILE: "/tmp/wiki.zim", VAULTTOOLS_ENABLED: "true", VAULT_DIR: "/tmp/vault", MEMORYTOOLS_ENABLED: "true" }).config;
   const setup = buildTools(cfg);
   const specs = chimeTools(setup.registry.specs());
-  assert.equal(specs.length, 13);
+  assert.equal(specs.length, 19);
   assert.equal(new Set(specs.map((spec) => spec.name)).size, specs.length);
   for (const spec of specs) {
     const schema = spec.parameters as { type: string; properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
@@ -6613,11 +6613,18 @@ const ok = (name: string): void => {
     assert.ok(spec.description.length > 0, spec.name);
     for (const name of schema.required) assert.ok(Object.hasOwn(schema.properties, name), `${spec.name}.${name}`);
   }
-  for (const name of ["wikipedia_read", "vault_read"]) {
-    const modes = (specs.find((spec) => spec.name === name)!.parameters as { properties: { mode: { enum: string[] } } }).properties.mode.enum;
-    for (const mode of ["intro", "sections", "section", "full"]) assert.ok(modes.includes(mode));
+  for (const prefix of ["wikipedia", "vault"]) {
+    for (const operation of ["read", "intro", "sections", "section"]) {
+      const spec = specs.find((spec) => spec.name === `${prefix}_${operation}`)!;
+      const schema = spec.parameters as { properties: Record<string, unknown>; required: string[] };
+      assert.ok(spec);
+      assert.ok(!Object.hasOwn(schema.properties, "mode"));
+      assert.equal(Object.hasOwn(schema.properties, "section"), operation === "section");
+      assert.equal(schema.required.includes("section"), operation === "section");
+      assert.equal(Object.hasOwn(schema.properties, "query"), operation !== "sections");
+    }
   }
-  ok("tool schema audit: all 13 tools have unique names, object schemas, valid required fields and explicit Wikipedia modes");
+  ok("tool schema audit: all 19 tools have unique names, object schemas, valid required fields and dedicated Wikipedia operations");
 }
 
 console.log(`\n${checks} check groups passed`);
