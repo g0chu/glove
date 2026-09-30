@@ -393,6 +393,7 @@ const ok = (name: string): void => {
   assert.equal(replaceMentionText("  <@bot1>  ", "bot1", "Glove"), "@Glove", "a bare mention leaves just the name (trimmed)");
   assert.equal(replaceMentionText("<@bot1> and <@bot1> again", "bot1", "Glove"), "@Glove and @Glove again", "every mention is replaced");
   assert.equal(replaceMentionText("<@user1> hello", "bot1", "Glove"), "<@user1> hello", "other users' mentions are untouched");
+  assert.equal(replaceMentionText("hi <@123> and <@!456>", "bot1", "Glove", new Map([["123", "Alice"], ["456", "Bobby"]])), "hi @Alice and @Bobby", "mentioned users resolve to their names");
   assert.equal(replaceMentionText("hello", "bot1", "Glove"), "hello", "no mention: unchanged (still trimmed)");
   ok("router: replaceMentionText replaces the bot's mention with its Discord name (@Name)");
 }

@@ -43,12 +43,20 @@ export function isMentionOf(message: Message, botId: string): boolean {
  * mentioned, only see the rest of the message.
  */
 export function replaceMention(message: Message, botId: string, botName: string): string {
-  return replaceMentionText(message.content, botId, botName);
+  const names = new Map<string, string>();
+  for (const user of message.mentions.users.values()) {
+    names.set(user.id, message.mentions.members?.get(user.id)?.displayName ?? user.username);
+  }
+  names.set(botId, botName);
+  return replaceMentionText(message.content, botId, botName, names);
 }
 
 /** The replaceMention transform on a bare content string (fetched messages, tests). */
-export function replaceMentionText(text: string, botId: string, botName: string): string {
-  return text.replace(new RegExp(`<@!?${botId}>`, "g"), `@${botName}`).trim();
+export function replaceMentionText(text: string, botId: string, botName: string, names?: ReadonlyMap<string, string>): string {
+  return text.replace(/<@!?([A-Za-z0-9-]+)>/g, (mention, id: string) => {
+    const name = id === botId ? botName : names?.get(id);
+    return name === undefined ? mention : `@${name}`;
+  }).trim();
 }
 
 /**

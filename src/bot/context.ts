@@ -30,6 +30,8 @@ export interface MessageLike extends ReactionMessage {
   content: string;
   /** The display name is the guild nickname when set, else the global username. */
   author: { id: string; bot: boolean; name: string };
+  /** Mentioned user IDs mapped to the name shown in this guild. */
+  mentionNames?: ReadonlyMap<string, string>;
   /** A Collection (discord.js) or a plain array — both expose `.values()`. */
   attachments: { values(): Iterable<MessageAttachmentLike> };
   /** The Discord createdTimestamp (the startup seed merges by it). */
@@ -46,6 +48,10 @@ export function toMessageLike(m: Message): MessageLike {
     id: m.id,
     content: m.content,
     author: { id: m.author.id, bot: m.author.bot, name: m.member?.displayName ?? m.author.username },
+    mentionNames: new Map([...(m.mentions?.users.values() ?? [])].map((user) => [
+      user.id,
+      m.mentions?.members?.get(user.id)?.displayName ?? user.username,
+    ])),
     attachments: m.attachments,
     reactions: m.reactions,
     createdTimestamp: m.createdTimestamp,
@@ -208,7 +214,7 @@ export async function buildChannelContext(
  */
 export function syncMessageUpdate(
   context: ChannelContext,
-  message: { id: string; content: string; attachments: { values(): Iterable<MessageAttachmentLike> } } & ReactionMessage,
+  message: { id: string; content: string; attachments: { values(): Iterable<MessageAttachmentLike> }; mentions?: { users: { values(): Iterable<{ id: string; username: string }> }; members: { get(id: string): { displayName: string } | undefined } | null } } & ReactionMessage,
   botId: string,
   botName: string,
 ): void {
@@ -216,7 +222,10 @@ export function syncMessageUpdate(
   if (!entry) return; // not in this channel's context
   if (message.reactions) context.updateReactions(message.id, snapshotReactions(message));
   if (entry.ids.length === 1) {
-    const newContent = replaceMentionText(message.content, botId, botName);
+    const mentionNames = message.mentions
+      ? new Map([...message.mentions.users.values()].map((user) => [user.id, message.mentions!.members?.get(user.id)?.displayName ?? user.username]))
+      : undefined;
+    const newContent = replaceMentionText(message.content, botId, botName, mentionNames);
     const echoed = entry.chunks?.length === 1 && entry.chunks[0] === message.content;
     if (!echoed && newContent !== entry.content) context.updateContent(message.id, newContent);
     context.updateAttachments(
@@ -302,7 +311,7 @@ export function toSeedEntry(m: MessageLike, botId: string, botName: string): See
     id: m.id,
     ts: m.createdTimestamp,
     role: m.author.id === botId ? "assistant" : "user",
-    content: replaceMentionText(m.content, botId, botName),
+    content: replaceMentionText(m.content, botId, botName, m.mentionNames),
     attachments: [...m.attachments.values()],
   };
   const reactions = snapshotReactions(m);
