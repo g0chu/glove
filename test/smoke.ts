@@ -1,3 +1,4 @@
+import { browseWiki } from "../src/tools/wiki.js";
 import { snapshotReactions, reactionImageUrl, fetchReactionImage } from "../src/bot/reactions.js";
 import { createDiscordClient } from "../src/bot/client.js";
 import { GatewayIntentBits, Partials } from "discord.js";
@@ -4408,6 +4409,18 @@ const ok = (name: string): void => {
     assert.ok(results[0].content.includes("wikipedia_read"), "suggests the read tool");
     assert.ok(results[1].content.startsWith("Wikipedia: Albert Einstein"), results[1].content);
     assert.ok(results[1].content.includes("theoretical physicist"));
+    const browseResults = await executeToolCalls(registry, [
+      { id: "zb1", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"outline"}' },
+      { id: "zb2", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","section":"1","query":"RELATIVITY","max_chars":80}' },
+      { id: "zb3", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","offset":20,"max_chars":10}' },
+      { id: "zb4", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"invalid"}' },
+    ]);
+    assert.ok(browseResults[0].content.includes("1: # Albert Einstein"));
+    assert.ok(!browseResults[0].content.includes("theoretical physicist"));
+    assert.ok(browseResults[1].content.includes("match ") && browseResults[1].content.includes("relativity"));
+    assert.ok(browseResults[2].content.includes("next offset 30"));
+    assert.ok(browseResults[3].content.startsWith("Error:"));
+    ok("zim tools: outline, section search, bounded pagination and validation");
     const broken = new ZimTools({ file: path.join(zimDir, "missing.zim"), maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000 });
     await assert.rejects(broken.search("x", 5), /cannot open/);
     // The no-match hint only suggests web_search when the web family is
@@ -4503,6 +4516,30 @@ const ok = (name: string): void => {
     };
     const tools = new VaultTools({ dir: vaultDir, maxResults: 8, scanBudgetMs: 5000, maxTextChars: 2000, bodyScan: fakeBody });
 
+    const article = "Lead text\n## History\n" + "x".repeat(2500) + "\n### Discovery\nRare discovery here.\n## Present\nCurrent text\n```md\n## Fake heading\n```\n";
+    await fs.promises.writeFile(path.join(vaultDir, "Browse.md"), article);
+    const browseRegistry = new ToolRegistry();
+    registerVaultTools(browseRegistry, tools);
+    const browseResults = await executeToolCalls(browseRegistry, [
+      { id: "vb1", name: "vault_read", arguments: '{"note":"Browse","mode":"outline"}' },
+      { id: "vb2", name: "vault_read", arguments: '{"note":"Browse","section":"Discovery","max_chars":100}' },
+      { id: "vb3", name: "vault_read", arguments: '{"note":"Browse","query":"RARE"}' },
+    ]);
+    assert.ok(browseResults[0].content.includes("2: ### Discovery"));
+    assert.ok(!browseResults[0].content.includes("Fake heading"));
+    assert.ok(browseResults[1].content.includes("Rare discovery here."));
+    assert.ok(!browseResults[1].content.includes("Current text"));
+    assert.ok(browseResults[2].content.includes("Rare discovery here."));
+    const outline = browseWiki(article, { mode: "outline" }, 2000);
+    assert.ok(outline.includes("3: ## Present"));
+    assert.ok(browseWiki(article, { section: "lead" }, 100).includes("Lead text"));
+    assert.ok(browseWiki(article, { section: "1", offset: 2500 }, 100).includes("Rare discovery"));
+    assert.ok(browseWiki(article, { query: "absent" }, 100).includes("No matches"));
+    assert.ok(browseWiki(article, { offset: article.length }, 100).includes("end of text"));
+    assert.throws(() => browseWiki("## Same\na\n## Same\nb", { section: "Same" }, 100), /ambiguous/);
+    assert.throws(() => browseWiki(article, { section: "missing" }, 100), /section not found/);
+    ok("vault browsing: sections beyond output cap, excerpts, fenced headings, lead and pagination");
+
     // -- title search: exact (case- and space/underscore-insensitive), prefix, substring
     const ein = await tools.search("EINSTEIN", 5);
     assert.ok(ein.includes("Offline Wikipedia vault (7 notes)"), ein);
@@ -4588,7 +4625,7 @@ const ok = (name: string): void => {
       { id: "v3", name: "vault_links", arguments: JSON.stringify({ note: "Aardvark" }) },
     ]);
     assert.ok(res[0].content.includes("- Quantum Zzz"), res[0].content);
-    assert.ok(res[1].content.startsWith("Error:") && res[1].content.includes('must be "full" or "abstract"'), res[1].content);
+    assert.ok(res[1].content.startsWith("Error:") && res[1].content.includes('must be "full", "abstract" or "outline"'), res[1].content);
     assert.ok(res[2].content.includes("no [[wikilinks]]"), res[2].content);
     const broken = new VaultTools({ dir: "/nonexistent/vault-dir", maxResults: 8, scanBudgetMs: 5000, maxTextChars: 2000 });
     const brokenReg = new ToolRegistry().register(VAULT_SEARCH_SPEC, (args) => broken.search(argString(args, "query"), 5));

@@ -7,6 +7,7 @@
  */
 import type { ToolSpec } from "../llm/client.js";
 import { ToolRegistry, argString, argInt } from "./executor.js";
+import { browseWiki, wikiReadOptions, WIKI_READ_PROPERTIES, type WikiReadOptions } from "./wiki.js";
 import { ZimReader } from "./zim/reader.js";
 
 export interface ZimToolsOptions {
@@ -62,12 +63,15 @@ export class ZimTools {
   }
 
   /** Read one article's text by exact title (or wiki-style path). */
-  async read(title: string): Promise<string> {
+  async read(title: string, options?: WikiReadOptions): Promise<string> {
     const reader = await this.reader();
-    const art = await reader.read(title, this.opts.maxTextChars);
+    const art = await reader.read(title, options ? Number.MAX_SAFE_INTEGER : this.opts.maxTextChars);
     const note = art.truncated ? " [truncated]" : "";
-    return `Wikipedia: ${art.title} (local archive, ${Math.ceil(art.bytes / 1024)} KB HTML)${note}\n\n${art.text}`;
+    return `Wikipedia: ${art.title} (local archive, ${Math.ceil(art.bytes / 1024)} KB HTML)${note}\n\n${options ? browseWiki(art.text, options, this.opts.maxTextChars) : art.text}`;
   }
+
+  /** Configured output ceiling for browsing reads. */
+  get maxReadChars(): number { return this.opts.maxTextChars; }
 
   /** Close the archive (wired into shutdown); later calls reopen it. */
   abort(): void {
@@ -95,10 +99,11 @@ export const ZIM_SEARCH_SPEC: ToolSpec = {
 export const ZIM_READ_SPEC: ToolSpec = {
   name: "wikipedia_read",
   description:
-    "Read an article from the local offline Wikipedia archive by exact title, as returned by wikipedia_search (spaces or wiki-style underscores both work). Returns the article as plain text (references and navigation dropped, headings marked with #); very long articles are truncated.",
+    "Read an article from the local offline Wikipedia archive by exact title, as returned by wikipedia_search (spaces or wiki-style underscores both work). Returns the article as plain text (references and navigation dropped, headings marked with #); Use mode outline to discover sections, section to read one, query to find short excerpts, and offset/max_chars to paginate. Prefer targeted reads to avoid filling context.",
   parameters: {
     type: "object",
     properties: {
+      ...WIKI_READ_PROPERTIES,
       title: { type: "string", description: "The exact article title (e.g. \"Albert Einstein\") or wiki path (e.g. \"Albert_Einstein\")." },
     },
     required: ["title"],
@@ -109,5 +114,5 @@ export const ZIM_READ_SPEC: ToolSpec = {
 /** Register the ZIM tools on a registry, bound to one ZimTools. */
 export function registerZimTools(registry: ToolRegistry, tools: ZimTools): void {
   registry.register(ZIM_SEARCH_SPEC, (args) => tools.search(argString(args, "query"), argInt(args, "max_results", 5, 1, 10)));
-  registry.register(ZIM_READ_SPEC, (args) => tools.read(argString(args, "title")));
+  registry.register(ZIM_READ_SPEC, (args) => tools.read(argString(args, "title"), wikiReadOptions(args, tools.maxReadChars)));
 }
