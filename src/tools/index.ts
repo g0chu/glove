@@ -1,4 +1,5 @@
 import type { Config } from "../config.js";
+import { MemoryTools, registerMemoryTools } from "./memorytools.js";
 import { ToolRegistry } from "./executor.js";
 import { FileTools, registerFileTools } from "./filetools.js";
 import { ShellTools, registerShellTools } from "./shelltools.js";
@@ -90,7 +91,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(zim);
     registerZimTools(registry, zim);
     bullets.push(
-      "- wikipedia_search, wikipedia_read: offline Wikipedia title/path search and paginated text. Use outline, section or query for targeted reads.",
+      "- wikipedia_search, wikipedia_read: offline Wikipedia title/path search and paginated text. Choose mode intro, sections, section or full; query finds targeted excerpts.",
     );
     rules.push("Cite Wikipedia article titles when you use wikipedia_read.");
   }
@@ -108,9 +109,15 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(vault);
     registerVaultTools(registry, vault);
     bullets.push(
-      "- vault_search, vault_read, vault_links: offline Wikipedia title/text search, paginated markdown and outgoing links. Use outline, section or query for targeted reads.",
+      "- vault_search, vault_read, vault_links: offline Wikipedia title/text search, paginated markdown and outgoing links. Choose mode intro, sections, section or full; query finds targeted excerpts.",
     );
     rules.push("Cite the vault note titles when you use vault_read.");
+  }
+  if (cfg.tools.memory.enabled) {
+    const memory = new MemoryTools(cfg.tools.memory.file, cfg.tools.memory.maxBytes, cfg.tools.maxResultChars);
+    registerMemoryTools(registry, memory);
+    bullets.push("- memory: save, read, search, list or delete persistent named notes shared across bot conversations.");
+    rules.push("Search relevant memory before relying on remembered facts; include user/channel identity in note keys when appropriate.");
   }
   const systemNote = bullets.length
     ? [

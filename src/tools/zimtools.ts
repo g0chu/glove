@@ -59,7 +59,7 @@ export class ZimTools {
       return `${i + 1}. ${r.title}${nsNote}${redir}`;
     });
     const head = `Local Wikipedia (offline archive) — ${results.length} match(es) for "${query}"${partial ? " (scan was time-limited; refine the query for more)" : ""}:`;
-    return `${head}\n${lines.join("\n")}\nUse wikipedia_read with the exact title to read one.`;
+    return `${head}\n${lines.join("\n")}\nUse wikipedia_read with the exact title and mode intro for its introduction, mode sections to list headings, or mode section with a section ID to read its text.`;
   }
 
   /** Read one article's text by exact title (or wiki-style path). */
@@ -87,7 +87,7 @@ export const ZIM_SEARCH_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", maxLength: 256, description: "An article title or part of one (e.g. \"Albert Einstein\", \"relativity\")." },
+      query: { type: "string", minLength: 1, maxLength: 256, description: "An article title or part of one (e.g. \"Albert Einstein\", \"relativity\")." },
       max_results: { type: "integer", minimum: 1, maximum: 10, default: 5, description: "Requested results (default 5); clamped to 1-10 and the configured cap." },
     },
     required: ["query"],
@@ -97,12 +97,12 @@ export const ZIM_SEARCH_SPEC: ToolSpec = {
 
 export const ZIM_READ_SPEC: ToolSpec = {
   name: "wikipedia_read",
-  description: "Read offline Wikipedia as paginated plain text, with references/navigation removed. Resolves redirects; accepts exact titles or wiki paths with spaces/underscores. Use outline, section or query for targeted reads. Cite the article title.",
+  description: "Read offline Wikipedia as paginated plain text, with references/navigation removed. Resolves redirects; accepts exact titles or wiki paths with spaces/underscores. Choose mode intro for the page introduction, sections for section IDs/headings, section with a section ID/heading for its text, or full for the article. offset/max_chars paginate; query finds excerpts in selected text. Cite the article title.",
   parameters: {
     type: "object",
     properties: {
       ...WIKI_READ_PROPERTIES,
-      title: { type: "string", description: "The exact article title (e.g. \"Albert Einstein\") or wiki path (e.g. \"Albert_Einstein\")." },
+      title: { type: "string", minLength: 1, description: "The exact article title (e.g. \"Albert Einstein\") or wiki path (e.g. \"Albert_Einstein\")." },
     },
     required: ["title"],
     additionalProperties: false,

@@ -1,4 +1,6 @@
+import { MemoryTools, registerMemoryTools } from "../src/tools/memorytools.js";
 import { FileTools, registerFileTools } from "../src/tools/filetools.js";
+import { articleText } from "../src/tools/zim/text.js";
 import { browseWiki } from "../src/tools/wiki.js";
 import { snapshotReactions, reactionImageUrl, fetchReactionImage } from "../src/bot/reactions.js";
 import { createDiscordClient } from "../src/bot/client.js";
@@ -61,10 +63,11 @@ import { buildTools } from "../src/tools/index.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
 import { FetchCache } from "../src/tools/web/cache.js";
 import { extractTitle, extractContent } from "../src/tools/web/extract.js";
-import { searchDuckDuckGo } from "../src/tools/web/search.js";
+import { WebTools, registerWebTools } from "../src/tools/webtools.js";
+import { searchDuckDuckGo, unwrapDdgHref } from "../src/tools/web/search.js";
 import { resolveInWorkspace } from "../src/tools/file/paths.js";
 import * as fileOps from "../src/tools/file/ops.js";
-import { ShellTools } from "../src/tools/shelltools.js";
+import { ShellTools, runShellCommand } from "../src/tools/shelltools.js";
 import { ZimReader } from "../src/tools/zim/reader.js";
 import { ZimTools, registerZimTools } from "../src/tools/zimtools.js";
 import { VaultTools, registerVaultTools, VAULT_SEARCH_SPEC } from "../src/tools/vaulttools.js";
@@ -3459,6 +3462,10 @@ const ok = (name: string): void => {
   assert.equal(argInt({ n: 99 }, "n", 5, 1, 10), 10, "clamped to max");
   assert.equal(argInt({}, "n", 5, 1, 10), 5, "default");
   assert.throws(() => argInt({ n: "x" }, "n", 5, 1, 10), /integer/);
+  assert.equal(argInt({ n: "3" }, "n", 5, 1, 10), 3);
+  for (const value of [true, [], [2], "", Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => argInt({ n: value }, "n", 5, 1, 10), /integer/);
+  }
   ok("executor: arg parsing and clamping");
 
   const order: string[] = [];
@@ -3967,7 +3974,22 @@ const ok = (name: string): void => {
     /HTTP 503/,
   );
   await assert.rejects(searchDuckDuckGo("  ", 5, { fetchImpl: ddg, timeoutMs: 1000 }), /must not be empty/i);
-  ok("web search: DDG rows normalized, redirect links unwrapped, capped, errors");
+  assert.equal(unwrapDdgHref("https://notduckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com"), "https://notduckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com");
+  let searchSignal: AbortSignal | undefined;
+  const web = new WebTools({ timeoutMs: 1000, fetchMaxBytes: 1000, maxRedirects: 1, cacheTtlMs: 0, cacheMaxEntries: 1, searchMaxResults: 5, maxResultChars: 1000,
+    searchFetch: async (_url, init) => {
+      searchSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        searchSignal!.addEventListener("abort", () => reject(new Error("search cancelled")), { once: true });
+      });
+    },
+  });
+  const interruptedSearch = web.search("cats", 5);
+  const searchRejected = assert.rejects(interruptedSearch, /search cancelled/);
+  web.abort();
+  await searchRejected;
+  assert.equal(searchSignal?.aborted, true);
+  ok("web search: DDG rows normalized, redirect links unwrapped, capped, errors and shutdown cancellation");
 }
 
 // ------------------------------------------------------------ file tools --
@@ -4078,7 +4100,18 @@ const ok = (name: string): void => {
     assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "\t");
     assert.ok((await call("file_write", { path: "exact.txt", content: 123 })).startsWith("Error:"));
     assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "\t");
-    ok("file tool arguments: preserve exact whitespace and support empty writes/deletions");
+    assert.ok((await call("file_write", { path: "unexpected.txt", content: "test", create_dirs: "true" })).startsWith("Error:"));
+    assert.equal(fs.existsSync(path.join(ws, "unexpected.txt")), false);
+    assert.ok((await call("file_edit", { path: "exact.txt", old_text: "\t", new_text: "changed", replace_all: "true" })).startsWith("Error:"));
+    assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "\t");
+    fs.writeFileSync(path.join(ws, "paged.txt"), "x".repeat(3000));
+    const cappedFile = new FileTools({ workspace: ws, readMaxBytes: 3000, writeMaxBytes: 3000, maxResultChars: 1000 });
+    const firstPage = await cappedFile.read("paged.txt");
+    const nextOffset = Number(/read on with offset (\d+)/.exec(firstPage)![1]);
+    assert.equal(firstPage.split(":\n")[1].length, nextOffset, "continuation follows all visible bytes");
+    assert.ok(firstPage.length <= 1000);
+    assert.ok((await cappedFile.read("paged.txt", nextOffset)).includes(`bytes ${nextOffset}-`));
+    ok("file tool arguments: exact whitespace, empty changes, boolean validation and visible pagination");
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
@@ -4111,7 +4144,11 @@ const ok = (name: string): void => {
 
     const flood = await tools.exec("yes | head -c 100000", 10);
     assert.ok(flood.includes("output exceeded the 1000 byte cap (killed)"), flood);
-    ok("shell: output cap kills a chatty command, partial output returned");
+    const combined = await runShellCommand("head -c 700 /dev/zero; head -c 700 /dev/zero >&2", ws, 2000, 1000);
+    assert.equal(combined.capped, true);
+    assert.equal(combined.timedOut, false);
+    assert.ok(Buffer.byteLength(combined.stdout) + Buffer.byteLength(combined.stderr) <= 1000);
+    ok("shell: combined stdout/stderr cap kills a chatty command, partial output returned");
 
     const noWs = new ShellTools({ cwd: path.join(ws, "nope"), timeoutMs: 1000, maxOutputBytes: 1000, maxResultChars: 50_000 });
     await assert.rejects(noWs.exec("true", 5), /does not exist/);
@@ -4440,6 +4477,14 @@ const ok = (name: string): void => {
     assert.ok(browseResults[1].content.includes("match ") && browseResults[1].content.includes("relativity"));
     assert.ok(browseResults[2].content.includes("next offset 30"));
     assert.ok(browseResults[3].content.startsWith("Error:"));
+    const explicitModes = await executeToolCalls(registry, [
+      { id: "zi", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"intro"}' },
+      { id: "zs", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"sections"}' },
+      { id: "zt", name: "wikipedia_read", arguments: '{"title":"Albert Einstein","mode":"section","section":"1"}' },
+    ]);
+    assert.ok(explicitModes[0].content.includes("theoretical physicist"));
+    assert.equal(explicitModes[1].content, browseResults[0].content);
+    assert.ok(explicitModes[2].content.includes("theoretical physicist"));
     ok("zim tools: outline, section search, bounded pagination and validation");
     const broken = new ZimTools({ file: path.join(zimDir, "missing.zim"), maxResults: 8, scanBudgetMs: 5000, maxTextChars: 10_000 });
     await assert.rejects(broken.search("x", 5), /cannot open/);
@@ -4558,6 +4603,33 @@ const ok = (name: string): void => {
     assert.ok(browseWiki(article, { offset: article.length }, 100).includes("end of text"));
     assert.throws(() => browseWiki("## Same\na\n## Same\nb", { section: "Same" }, 100), /ambiguous/);
     assert.throws(() => browseWiki(article, { section: "missing" }, 100), /section not found/);
+    assert.equal(browseWiki(article, { mode: "sections" }, 2000), outline);
+    const parentOnly = articleText("<article><h2>Parent</h2><h3>Child</h3><p>Child content</p><h2>Empty</h2><h3>Also empty</h3></article>");
+    assert.ok(parentOnly.includes("## Parent") && parentOnly.includes("### Child"));
+    assert.ok(!parentOnly.includes("Empty") && !parentOnly.includes("Also empty"));
+    assert.ok(browseWiki(parentOnly, { section: "Parent" }, 1000).includes("Child content"));
+    const numericHeading = browseWiki("## First\nfirst content\n## 1\nsecond content", { mode: "section", section: "1" }, 1000);
+    assert.ok(numericHeading.includes("first content") && !numericHeading.includes("second content"));
+    const titled = "# Example\n" + "intro ".repeat(250) + "\n## History\nHistorical text\n### Detail\nNested text\n## Today\nCurrent text";
+    const intro = browseWiki(titled, { mode: "intro", maxChars: 2000 }, 2000);
+    assert.ok(intro.includes("intro ".repeat(200)), "intro is not a fixed 1000-character abstract");
+    assert.ok(!intro.includes("Historical text"));
+    assert.equal(intro, browseWiki(titled, { section: "lead", maxChars: 2000 }, 2000));
+    const sectionText = browseWiki(titled, { mode: "section", section: "History" }, 2000);
+    assert.ok(sectionText.includes("Historical text") && sectionText.includes("Nested text"));
+    assert.ok(!sectionText.includes("Current text"));
+    assert.throws(() => browseWiki(titled, { mode: "section" }, 100), /requires a section/);
+    assert.throws(() => browseWiki(titled, { mode: "intro", section: "History" }, 100), /cannot select/);
+    const explicitModes = await executeToolCalls(browseRegistry, [
+      { id: "intro", name: "vault_read", arguments: '{"note":"Browse","mode":"intro"}' },
+      { id: "sections", name: "vault_read", arguments: '{"note":"Browse","mode":"sections"}' },
+      { id: "section", name: "vault_read", arguments: '{"note":"Browse","mode":"section","section":"Discovery"}' },
+      { id: "missing", name: "vault_read", arguments: '{"note":"Browse","mode":"section"}' },
+    ]);
+    assert.ok(explicitModes[0].content.includes("Lead text") && !explicitModes[0].content.includes("Rare discovery"));
+    assert.ok(explicitModes[1].content.includes("2: ### Discovery"));
+    assert.ok(explicitModes[2].content.includes("Rare discovery"));
+    assert.ok(explicitModes[3].content.startsWith("Error:"));
     ok("vault browsing: sections beyond output cap, excerpts, fenced headings, lead and pagination");
 
     // -- title search: exact (case- and space/underscore-insensitive), prefix, substring
@@ -4661,7 +4733,7 @@ const ok = (name: string): void => {
     const rgScript = path.join(vaultDir, "fake-rg.sh");
     fs.writeFileSync(
       rgScript,
-      "#!/bin/sh\nq=\"$6\"; dir=\"$7\"\nfind \"$dir\" -name '*.md' -type f | while IFS= read -r f; do\n  grep -q -i -F -- \"$q\" \"$f\" 2>/dev/null && printf '%s\\n' \"$f\"\ndone\nexit 0\n",
+      "#!/bin/sh\nq=\"$8\"; dir=\"$9\"\nfind \"$dir\" -name '*.md' -type f | while IFS= read -r f; do\n  grep -q -i -F -- \"$q\" \"$f\" 2>/dev/null && printf '%s\\0' \"$f\"\ndone\nexit 0\n",
     );
     fs.chmodSync(rgScript, 0o755);
     assert.deepEqual(await scanBody(vaultDir, "zeppelinite", 5000, 5, { rgPath: rgScript }), {
@@ -4669,6 +4741,8 @@ const ok = (name: string): void => {
       partial: false,
       engine: "rg",
     });
+    await fs.promises.writeFile(path.join(vaultDir, "Dash.md"), "--literal-option");
+    assert.deepEqual((await scanBody(vaultDir, "--literal-option", 5000, 5, { rgPath: rgScript })).files, ["Dash"]);
     const fallback = await scanBody(vaultDir, "zeppelinite", 5000, 5, { rgPath: "/nonexistent/rg" });
     assert.equal(fallback.engine, "js", "a missing ripgrep falls back to the js scan");
     assert.deepEqual(fallback.files, ["Quantum Zzz"]);
@@ -6482,6 +6556,68 @@ const ok = (name: string): void => {
   assert.equal(await fetchReactionImage(snapshot[0], 4, async () => new Response(png)), null);
   assert.equal(await fetchReactionImage(snapshot[0], 100, async () => new Response("not a PNG")), null);
   ok("reactions: names, counts, historical messages, reply chunks, images, limits and restart persistence");
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-memory-"));
+  const file = path.join(dir, "nested", "notes.json");
+  try {
+    const memory = new MemoryTools(file, 1024, 1000);
+    assert.equal(await memory.run("list"), "[]");
+    await Promise.all([memory.run("save", "alice", "Likes TEA"), memory.run("save", "bob", "Likes coffee")]);
+    const memoryRegistry = new ToolRegistry();
+    registerMemoryTools(memoryRegistry, memory);
+    const malformedMemory = await executeToolCalls(memoryRegistry, [
+      { id: "m1", name: "memory", arguments: '{"action":"save","key":"alice","content":123}' },
+      { id: "m2", name: "memory", arguments: '{"action":"invalid"}' },
+      { id: "m3", name: "memory", arguments: '{"action":"save","key":"alice"}' },
+    ]);
+    assert.ok(malformedMemory.every((result) => result.content.startsWith("Error:")));
+    const restored = new MemoryTools(file, 1024, 1000);
+    assert.deepEqual(JSON.parse(await restored.run("list")), ["alice", "bob"]);
+    assert.deepEqual(JSON.parse(await restored.run("search", undefined, undefined, "tea")), [{ key: "alice", content: "Likes TEA" }]);
+    await restored.run("save", "alice", "Likes water");
+    assert.equal(JSON.parse(await restored.run("read", "alice")).content, "Likes water");
+    await assert.rejects(restored.run("save", "large", "x".repeat(2000)), /byte cap/);
+    assert.deepEqual(JSON.parse(await restored.run("list")), ["alice", "bob"]);
+    await restored.run("save", "__proto__", "safe key");
+    assert.equal(JSON.parse(await restored.run("read", "__proto__")).content, "safe key");
+    await restored.run("delete", "alice");
+    assert.equal(await restored.run("read", "alice"), "Memory not found.");
+    await assert.rejects(restored.run("save", "missing"), /content/);
+    await assert.rejects(restored.run("search"), /query/);
+    await assert.rejects(restored.run("invalid"), /unknown/);
+    fs.writeFileSync(file, "broken");
+    await assert.rejects(restored.run("save", "new", "value"));
+    assert.equal(fs.readFileSync(file, "utf8"), "broken");
+    const cfg = parseConfig({ DISCORD_TOKEN: "test", MODEL_API_URL: "http://localhost", MEMORYTOOLS_ENABLED: "true", MEMORYTOOLS_FILE: file }).config;
+    assert(buildTools(cfg).registry.has("memory"));
+    cfg.tools.memory.enabled = false;
+    assert(!buildTools(cfg).registry.has("memory"));
+    ok("memory: persistence, concurrent writes, search, overwrite, delete, caps and corrupt-store protection");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+{
+  const cfg = parseConfig({ DISCORD_TOKEN: "test", MODEL_API_URL: "http://localhost", WEBTOOLS_ENABLED: "true", FILETOOLS_ENABLED: "true", SHELLTOOLS_ENABLED: "true", ZIMTOOLS_ENABLED: "true", ZIM_FILE: "/tmp/wiki.zim", VAULTTOOLS_ENABLED: "true", VAULT_DIR: "/tmp/vault", MEMORYTOOLS_ENABLED: "true" }).config;
+  const setup = buildTools(cfg);
+  const specs = chimeTools(setup.registry.specs());
+  assert.equal(specs.length, 13);
+  assert.equal(new Set(specs.map((spec) => spec.name)).size, specs.length);
+  for (const spec of specs) {
+    const schema = spec.parameters as { type: string; properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
+    assert.equal(schema.type, "object", spec.name);
+    assert.equal(schema.additionalProperties, false, spec.name);
+    assert.ok(spec.description.length > 0, spec.name);
+    for (const name of schema.required) assert.ok(Object.hasOwn(schema.properties, name), `${spec.name}.${name}`);
+  }
+  for (const name of ["wikipedia_read", "vault_read"]) {
+    const modes = (specs.find((spec) => spec.name === name)!.parameters as { properties: { mode: { enum: string[] } } }).properties.mode.enum;
+    for (const mode of ["intro", "sections", "section", "full"]) assert.ok(modes.includes(mode));
+  }
+  ok("tool schema audit: all 13 tools have unique names, object schemas, valid required fields and explicit Wikipedia modes");
 }
 
 console.log(`\n${checks} check groups passed`);

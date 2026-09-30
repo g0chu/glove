@@ -60,10 +60,18 @@ export class WebTools {
   /** Search the web; returns a formatted result list for the model. */
   async search(query: string, maxResults: number): Promise<string> {
     const limit = Math.min(maxResults, this.opts.searchMaxResults);
-    const results = await searchDuckDuckGo(query, limit, {
-      fetchImpl: this.opts.searchFetch,
-      timeoutMs: this.opts.timeoutMs,
-    });
+    const controller = new AbortController();
+    this.active.add(controller);
+    let results;
+    try {
+      results = await searchDuckDuckGo(query, limit, {
+        fetchImpl: this.opts.searchFetch,
+        timeoutMs: this.opts.timeoutMs,
+        signal: controller.signal,
+      });
+    } finally {
+      this.active.delete(controller);
+    }
     if (results.length === 0) return this.cap(`No web search results for "${query}".`);
     const lines = results.map((r, i) =>
       `${i + 1}. ${asString(r.title).trim()}\n   ${asString(r.url).trim()}\n   ${asString(r.snippet).trim()}`
@@ -109,7 +117,7 @@ export class WebTools {
     }
   }
 
-  /** Cancel all in-flight fetches (graceful shutdown). */
+  /** Cancel all in-flight searches and fetches (graceful shutdown). */
   abort(): void {
     for (const c of this.active) {
       try {
@@ -141,7 +149,7 @@ export const WEB_SEARCH_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", description: "The search query." },
+      query: { type: "string", minLength: 1, description: "The search query." },
       max_results: { type: "integer", minimum: 1, maximum: 10, default: 5, description: "Requested results (default 5); clamped to 1-10 and the configured cap." },
     },
     required: ["query"],
@@ -155,7 +163,7 @@ export const WEB_FETCH_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      url: { type: "string", description: "Absolute http(s) URL of the page to fetch." },
+      url: { type: "string", minLength: 1, description: "Absolute http(s) URL of the page to fetch." },
     },
     required: ["url"],
     additionalProperties: false,

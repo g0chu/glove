@@ -44,7 +44,7 @@ export function unwrapDdgHref(href: string): string {
   if (h.startsWith("//")) h = `https:${h}`;
   try {
     const u = new URL(h, "https://duckduckgo.com/");
-    if (u.hostname.endsWith("duckduckgo.com") && (u.pathname === "/l/" || u.pathname === "/l")) {
+    if ((u.hostname === "duckduckgo.com" || u.hostname.endsWith(".duckduckgo.com")) && (u.pathname === "/l/" || u.pathname === "/l")) {
       const uddg = u.searchParams.get("uddg");
       if (uddg) return uddg;
     }
@@ -65,7 +65,7 @@ function hasClass(el: { attrs: Record<string, string> }, name: string): boolean 
 export async function searchDuckDuckGo(
   query: string,
   maxResults: number,
-  opts: { fetchImpl?: SearchFetch; timeoutMs?: number } = {},
+  opts: { fetchImpl?: SearchFetch; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<SearchResult[]> {
   if (!query.trim()) throw new ToolError("query must not be empty");
   const limit = Math.max(1, Math.floor(maxResults));
@@ -77,7 +77,9 @@ export async function searchDuckDuckGo(
       Accept: "text/html,application/xhtml+xml,*/*;q=0.8",
       "Accept-Language": "en",
     },
-    signal: AbortSignal.timeout(opts.timeoutMs ?? 15_000),
+    signal: opts.signal
+      ? AbortSignal.any([opts.signal, AbortSignal.timeout(opts.timeoutMs ?? 15_000)])
+      : AbortSignal.timeout(opts.timeoutMs ?? 15_000),
   });
   if (!res.ok) {
     throw new ToolError(`web search failed: HTTP ${res.status} from DuckDuckGo`);

@@ -111,8 +111,8 @@ export function argInt(
 ): number {
   const v = args[key];
   if (v === undefined || v === null) return dflt;
-  const n = typeof v === "number" ? v : Number(v);
-  if (!Number.isFinite(n) || !Number.isInteger(n)) {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() ? Number(v) : NaN;
+  if (!Number.isSafeInteger(n)) {
     throw new Error(`argument "${key}" must be an integer (got ${String(v)})`);
   }
   return Math.min(max, Math.max(min, n));

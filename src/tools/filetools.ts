@@ -12,6 +12,7 @@ function argPresentString(args: Record<string, unknown>, key: string): string {
 }
 
 function asBool(v: unknown): boolean {
+  if (v !== undefined && typeof v !== "boolean") throw new Error("boolean argument must be true or false");
   return v === true;
 }
 
@@ -40,7 +41,12 @@ export class FileTools {
 
   /** Read a text file (with offset/limit for large files). */
   async read(path: string, offset?: number, limit?: number): Promise<string> {
-    const data = await readFile(this.opts.workspace, path, offset ?? 0, limit, this.opts.readMaxBytes);
+    // Bound the byte window before reading so the displayed continuation
+    // never skips content removed by the smaller character-result cap.
+    const resultBudget = this.opts.maxResultChars - path.length - 300;
+    if (resultBudget < 1) throw new Error("path is too long for the tool result cap");
+    const readBudget = Math.min(this.opts.readMaxBytes, resultBudget);
+    const data = await readFile(this.opts.workspace, path, offset ?? 0, limit, readBudget);
     const more = data.truncated ? ` (more content follows — read on with offset ${data.offset + data.bytesRead})` : "";
     return this.cap(`File "${path}" (bytes ${data.offset}-${data.offset + data.bytesRead} of ${data.size}${more}):\n${data.content}`);
   }
@@ -72,11 +78,11 @@ export class FileTools {
 /** OpenAI-compatible function specs for the file tools. */
 export const FILE_READ_SPEC: ToolSpec = {
   name: "file_read",
-  description: "Read a workspace text file using byte offset/limit. Returns the byte range and file size; output may be truncated. Use smaller windows if needed. Binary-looking files are rejected.",
+  description: "Read a workspace text file using byte offset/limit. Returns the byte range and file size; the byte window is reduced to fit the configured result cap, so continuation offsets follow visible content. Use smaller windows if needed. Binary-looking files are rejected.",
   parameters: {
     type: "object",
     properties: {
-      path: { type: "string", description: "File path relative to the workspace root." },
+      path: { type: "string", minLength: 1, description: "File path relative to the workspace root." },
       offset: { type: "integer", minimum: 0, maximum: 100_000_000, default: 0, description: "Zero-based byte offset (default 0; clamped to 0-100000000)." },
       limit: { type: "integer", minimum: 0, maximum: 1_000_000, description: "Bytes to read; omitted or 0 uses the configured cap. Clamped to 0-1000000 and the configured cap." },
     },
@@ -91,7 +97,7 @@ export const FILE_WRITE_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      path: { type: "string", description: "File path relative to the workspace root." },
+      path: { type: "string", minLength: 1, description: "File path relative to the workspace root." },
       content: { type: "string", description: "Complete content, preserving whitespace; empty string creates or clears a file." },
       create_dirs: { type: "boolean", default: false, description: "Create missing parent directories (default false)." },
     },
@@ -106,7 +112,7 @@ export const FILE_EDIT_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      path: { type: "string", description: "File path relative to the workspace root." },
+      path: { type: "string", minLength: 1, description: "File path relative to the workspace root." },
       old_text: { type: "string", minLength: 1, description: "Nonempty existing text, including leading/trailing whitespace." },
       new_text: { type: "string", description: "Exact replacement text; empty string deletes the match." },
       replace_all: { type: "boolean", default: false, description: "Replace every occurrence instead of just the first (default false)." },
