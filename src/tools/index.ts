@@ -73,7 +73,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(shell);
     registerShellTools(registry, shell);
     bullets.push(
-      "- shell_exec: run a shell command in the bot's file workspace via /bin/sh (returns the exit code plus stdout and stderr, capped). Use for what the file tools cannot do: running programs, git, package managers, scripts.",
+      "- shell_exec: run /bin/sh on the host, starting in the workspace; returns capped output and exit status.",
     );
     rules.push("shell_exec is not sandboxed: prefer read-only or workspace-local commands and never run destructive commands without the user asking.");
   }
@@ -90,7 +90,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(zim);
     registerZimTools(registry, zim);
     bullets.push(
-      "- wikipedia_search, wikipedia_read: an offline Wikipedia archive on this machine (no internet needed) — search article titles, then use wikipedia_read mode outline, section, query and offset/max_chars for targeted excerpts. Prefer it for established facts: people, places, events, science topics.",
+      "- wikipedia_search, wikipedia_read: offline Wikipedia title/path search and paginated text. Use outline, section or query for targeted reads.",
     );
     rules.push("Cite Wikipedia article titles when you use wikipedia_read.");
   }
@@ -108,7 +108,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(vault);
     registerVaultTools(registry, vault);
     bullets.push(
-      "- vault_search, vault_read, vault_links: an offline Wikipedia vault of markdown notes on this machine (no internet needed) — search note titles and bodies, browse a note with vault_read mode outline, section, query and offset/max_chars, list a note's [[wikilinks]] and follow them. Prefer it for established facts: people, places, events, science topics.",
+      "- vault_search, vault_read, vault_links: offline Wikipedia title/text search, paginated markdown and outgoing links. Use outline, section or query for targeted reads.",
     );
     rules.push("Cite the vault note titles when you use vault_read.");
   }

@@ -145,13 +145,12 @@ export class ShellTools {
 /** OpenAI-compatible function spec for the shell tool. */
 export const SHELL_EXEC_SPEC: ToolSpec = {
   name: "shell_exec",
-  description:
-    "Run a shell command on the bot's host via /bin/sh, in the bot's file workspace (the directory the file tools operate in). Returns the exit code plus stdout and stderr (capped; a command that exceeds the cap or its deadline is killed and the partial output is still returned). Use it for what the file tools cannot do: running programs, git, package managers, scripts. Commands are not sandboxed — prefer read-only or workspace-local commands, and never run destructive commands without the user asking.",
+  description: "Run /bin/sh on the bot host with the workspace as its initial directory. Returns exit status, stdout and stderr; deadline or output overflow kills the command and returns partial output. Not sandboxed: prefer read-only or workspace-local commands; destructive actions require the user to ask.",
   parameters: {
     type: "object",
     properties: {
-      command: { type: "string", description: "The command line to run (executed by /bin/sh, so pipes, && and redirects work)." },
-      timeout_s: { type: "integer", description: "Deadline for the command, in seconds (defaults to and is clamped by the bot's configured cap)." },
+      command: { type: "string", description: "Shell command; pipes, redirects and && are supported." },
+      timeout_s: { type: "integer", minimum: 1, description: "Deadline in seconds (minimum 1; defaults to and is clamped to the configured cap)." },
     },
     required: ["command"],
     additionalProperties: false,

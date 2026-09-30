@@ -137,13 +137,12 @@ export class WebTools {
 /** OpenAI-compatible function specs for the web tools. */
 export const WEB_SEARCH_SPEC: ToolSpec = {
   name: "web_search",
-  description:
-    "Search the web (DuckDuckGo). Returns a list of results, each with a title, URL, and snippet. Use it to find current information, sources, or candidate pages to read with web_fetch.",
+  description: "Search DuckDuckGo for sources or current information. Returns titles, URLs and snippets, with capped output. Use web_fetch to read a result; cite sources used.",
   parameters: {
     type: "object",
     properties: {
       query: { type: "string", description: "The search query." },
-      max_results: { type: "integer", description: "How many results to return (1-10, default 5)." },
+      max_results: { type: "integer", minimum: 1, maximum: 10, default: 5, description: "Requested results (default 5); clamped to 1-10 and the configured cap." },
     },
     required: ["query"],
     additionalProperties: false,
@@ -152,8 +151,7 @@ export const WEB_SEARCH_SPEC: ToolSpec = {
 
 export const WEB_FETCH_SPEC: ToolSpec = {
   name: "web_fetch",
-  description:
-    "Fetch a web page and return its main content as text (plus the title). JavaScript-heavy pages may come back incomplete (plain HTTP fetch, no browser rendering). Only use URLs from web_search results or that the user gave.",
+  description: "Fetch a public HTTP(S) page as title and extracted text. Follows redirects; size and output limits may truncate it. No JavaScript rendering. Use known URLs from the user or retrieved sources; private/internal addresses and URL credentials are blocked.",
   parameters: {
     type: "object",
     properties: {

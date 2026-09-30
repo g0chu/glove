@@ -1,3 +1,4 @@
+import { FileTools, registerFileTools } from "../src/tools/filetools.js";
 import { browseWiki } from "../src/tools/wiki.js";
 import { snapshotReactions, reactionImageUrl, fetchReactionImage } from "../src/bot/reactions.js";
 import { createDiscordClient } from "../src/bot/client.js";
@@ -4059,6 +4060,25 @@ const ok = (name: string): void => {
     await assert.rejects(fileOps.editFile(ws, "ecap.txt", "ab", "a".repeat(11), false, 1000, 10), /write cap/);
     assert.equal(fs.readFileSync(path.join(ws, "ecap.txt"), "utf8"), "ab", "rejected edit leaves the file untouched");
     ok("file edit: exact span, replace_all, empty new_text, caps, errors");
+
+    const registry = new ToolRegistry();
+    registerFileTools(registry, new FileTools({ workspace: ws, readMaxBytes: 1000, writeMaxBytes: 1000, maxResultChars: 2000 }));
+    const call = async (name: string, args: Record<string, unknown>): Promise<string> =>
+      (await executeToolCalls(registry, [{ id: name, name, arguments: JSON.stringify(args) }]))[0].content;
+    assert.ok((await call("file_write", { path: "exact.txt", content: "  first\n  second\n" })).startsWith("Wrote"));
+    assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "  first\n  second\n");
+    assert.ok((await call("file_edit", { path: "exact.txt", old_text: "  first\n", new_text: "" })).startsWith("Replaced"));
+    assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "  second\n");
+    assert.ok((await call("file_write", { path: "exact.txt", content: "" })).startsWith("Wrote"));
+    assert.equal(fs.statSync(path.join(ws, "exact.txt")).size, 0);
+    assert.ok((await call("file_write", { path: "exact.txt", content: " \n" })).startsWith("Wrote"));
+    assert.ok((await call("file_edit", { path: "exact.txt", old_text: " \n", new_text: "\t" })).startsWith("Replaced"));
+    assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "\t");
+    assert.ok((await call("file_edit", { path: "exact.txt", old_text: "", new_text: "x" })).startsWith("Error:"));
+    assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "\t");
+    assert.ok((await call("file_write", { path: "exact.txt", content: 123 })).startsWith("Error:"));
+    assert.equal(fs.readFileSync(path.join(ws, "exact.txt"), "utf8"), "\t");
+    ok("file tool arguments: preserve exact whitespace and support empty writes/deletions");
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
     fs.rmSync(outside, { recursive: true, force: true });
