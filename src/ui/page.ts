@@ -2,12 +2,14 @@
 export function renderPage(nonce: string): string {
   return String.raw`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Glove · API Inspector</title>
-<style nonce="${nonce}
-">
+<style nonce="${nonce}">
 :root{color-scheme:dark;--bg:#0b1017;--panel:#101823;--border:#243041;--muted:#8d9bb0;--text:#e2eaf5;--mint:#76e1bc;--blue:#90b6ff}
 *{box-sizing:border-box}
 body{margin:0;background:radial-gradient(ellipse at 80% 0%,#15273a 0,transparent 45%),var(--bg);color:var(--text);font:14px/1.6 system-ui,sans-serif}
 button,input{font:inherit}
+.controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.controls label{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text)}
+.controls input{width:auto;margin:0;accent-color:var(--mint)}
 button{cursor:pointer}
 button:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--mint);outline-offset:3px}
 header{padding:23px 32px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px}
@@ -87,13 +89,13 @@ main{padding:20px}
 </style></head><body>
 <header><div class="logo" aria-hidden="true">↗</div><div><h1>Glove <span class="brand-suffix">/ API Inspector</span></h1><div class="subtitle">A window into your model conversations</div></div><div class="live"><span class="dot"></span><span id="connection" role="status">Connecting</span></div></header>
 <div class="shell"><aside><div class="aside-head"><span class="eyebrow">Request timeline</span><span class="eyebrow" id="count"></span></div><input id="search" aria-label="Filter requests" placeholder="Search channel, purpose, status…"><div id="list"></div><button id="more" class="secondary" hidden>Load earlier requests</button></aside>
-<main><div id="error" class="error" role="alert" hidden></div><div id="empty" class="empty"><div class="empty-icon">⌘</div><b>Every exchange, in view.</b>Select a request to explore its input and output.<br>New interactions appear here automatically.</div><div id="detail" hidden><div class="eyebrow">Chat Completions · request detail</div><div class="detail-head"><h2 id="title"></h2><span id="state" class="badge"></span></div><div id="meta" class="meta"></div><div class="panels">
-<section class="panel"><div class="panel-head"><span class="number">01</span><b>Input</b><span class="size" id="input-size"></span></div><div class="toolbar" id="input-toolbar"><button data-view="messages" class="active">Messages</button><button data-view="json">JSON</button><button data-view="raw">Raw</button><span class="spacer"></span><button data-action="copy">Copy</button><button data-action="download">↓ Save</button></div><div id="input" class="body"></div></section>
-<section class="panel output"><div class="panel-head"><span class="number">02</span><b>Output</b><span class="size" id="output-size"></span></div><div class="toolbar" id="output-toolbar"><button data-view="readable" class="active">Readable</button><button data-view="json">JSON</button><button data-view="raw">Raw stream</button><span class="spacer"></span><button data-action="copy">Copy</button><button data-action="download">↓ Save</button></div><div id="output" class="body"></div></section>
-</div><div class="foot"><span>Read-only archive · refreshes every 2 seconds · authorization headers excluded</span><span id="request-id"></span></div></div></main></div>
+<main><div class="toolbar controls"><label><input id="live" type="checkbox" checked>Live updates</label><label><input id="follow" type="checkbox" checked>Follow newest request</label><button id="refresh" type="button">Refresh now</button><span class="subtitle">Live captures update every 0.5s; pause to inspect.</span></div><div id="error" class="error" role="alert" hidden></div><div id="empty" class="empty"><div class="empty-icon">⌘</div><b>Every exchange, in view.</b>Select a request to explore its input and output.<br>Live mode follows new requests automatically.</div><div id="detail" hidden><div class="eyebrow">Chat Completions · request detail</div><div class="detail-head"><h2 id="title"></h2><span id="state" class="badge"></span></div><div id="meta" class="meta"></div><div class="panels">
+<section class="panel"><div class="panel-head"><span class="number">01</span><b>Request → API</b><span class="size" id="input-size"></span></div><div class="toolbar" id="input-toolbar"><button data-view="json" class="active">JSON</button><button data-view="messages">Prompt</button><button data-view="raw">Raw</button><span class="spacer"></span><button data-action="copy">Copy</button><button data-action="download">↓ Save</button></div><div id="input" class="body"></div></section>
+<section class="panel output"><div class="panel-head"><span class="number">02</span><b>Response ← API</b><span class="size" id="output-size"></span></div><div class="toolbar" id="output-toolbar"><button data-view="raw" class="active">Raw bytes / SSE</button><button data-view="json">JSON</button><button data-view="readable">Output</button><span class="spacer"></span><button data-action="copy">Copy</button><button data-action="download">↓ Save</button></div><div id="output" class="body"></div></section>
+</div><div class="foot"><span>Read-only archive · live updates optional · authorization headers excluded</span><span id="request-id"></span></div></div></main></div>
 <script nonce="${nonce}">
 const $ = id => document.getElementById(id);
-let items = [], selected = null, detail = null, next = null, inputView = 'messages', outputView = 'readable', generation = 0, busy = false, searchTimer;
+let items = [], selected = null, detail = null, next = null, inputView = 'json', outputView = 'raw', generation = 0, busy = false, searchTimer, filterRevision = 0;
 function node(tag, text, cls) { const e = document.createElement(tag); if (text !== undefined)
     e.textContent = text; if (cls)
     e.className = cls; return e; }
@@ -115,7 +117,7 @@ function timeline() { const root = $('list'); root.replaceChildren(); $('count')
     const top = node('div', undefined, 'request-top');
     top.append(node('span', item.scope.purpose || 'reply'), node('span', item.state, 'badge ' + item.state));
     b.append(top, node('small', new Date(item.time).toLocaleString()), node('small', 'Channel ' + (item.scope.channelId || '—')), node('code', item.id.slice(0, 18) + '…'));
-    b.onclick = () => select(item.id);
+    b.onclick = () => { $('follow').checked = false; select(item.id); };
     root.append(b);
 } }
 async function select(id) { selected = id; detail = null; const token = ++generation; timeline(); $('empty').hidden = false; $('empty').replaceChildren(node('b', 'Loading interaction…')); $('detail').hidden = true; try {
@@ -134,12 +136,22 @@ function chip(label, value) { const c = node('div', label, 'chip'); c.append(nod
 function render() { if (!detail)
     return; $('empty').hidden = true; $('detail').hidden = false; $('title').textContent = (detail.scope.purpose || 'reply').replace(/-/g, ' ') + ' interaction'; $('state').textContent = detail.state; $('state').className = 'badge ' + detail.state; const meta = $('meta'); meta.replaceChildren(chip('Channel', detail.scope.channelId || '—'), chip('Time', new Date(detail.time).toLocaleString()), chip('HTTP', event('model.status')?.status || '—'), chip('Model', event('model.request')?.model || '—')); if (detail.scope.round !== undefined)
     meta.append(chip('Round', detail.scope.round)); if (event('model.finished')?.usage)
-    meta.append(chip('Usage', json(event('model.finished').usage))); $('request-id').textContent = detail.id; $('input-size').textContent = new TextEncoder().encode(JSON.stringify(event('model.request') || {})).length.toLocaleString() + ' bytes'; $('output-size').textContent = detail.responseBytes.toLocaleString() + ' bytes'; renderInput(); renderOutput(); }
-function renderInput() { const root = $('input'); root.replaceChildren(); const request = event('model.request'); if (!request) {
+    meta.append(chip('Usage', json(event('model.finished').usage))); $('request-id').textContent = detail.id; $('input-size').textContent = detail.requestBytes.toLocaleString() + ' bytes'; $('output-size').textContent = detail.responseBytes.toLocaleString() + ' bytes'; renderInput(); renderOutput(); }
+function preservePanel(id, draw) {
+    const root = $(id), top = root.scrollTop;
+    const atEnd = root.scrollHeight - root.clientHeight - top < 24;
+    const expanded = Array.from(root.querySelectorAll('details')).map(d => d.open);
+    draw();
+    root.querySelectorAll('details').forEach((d, i) => { if (i < expanded.length) d.open = expanded[i]; });
+    root.scrollTop = id === 'output' && $('live').checked && atEnd ? root.scrollHeight : top;
+}
+function renderInput() { preservePanel('input', drawInput); }
+function renderOutput() { preservePanel('output', drawOutput); }
+function drawInput() { const root = $('input'); root.replaceChildren(); const request = event('model.request'); if (!request) {
     root.append(node('div', 'The request body was not sent or captured.', 'subtitle'));
     return;
 } if (inputView === 'raw')
-    root.append(code(JSON.stringify(request), false));
+    root.append(code(detail.rawRequest, false));
 else if (inputView === 'json')
     root.append(code(request));
 else {
@@ -163,7 +175,7 @@ else {
         root.append(d);
     }
 } }
-function renderOutput() { const root = $('output'); root.replaceChildren(); const result = event('model.finished'), failed = event('model.failed'); if (failed)
+function drawOutput() { const root = $('output'); root.replaceChildren(); const result = event('model.finished'), failed = event('model.failed'); if (failed)
     root.append(node('div', failed.error, 'error')); if (outputView === 'raw') {
     root.append(code(detail.rawResponse || 'No response bytes captured yet.', false));
     return;
@@ -182,25 +194,40 @@ function renderOutput() { const root = $('output'); root.replaceChildren(); cons
     }
     return;
 } let content = result?.content || '', reasoning = result?.reasoning || '', calls = result?.toolCalls || []; if (!result) {
-    for (const line of detail.rawResponse.split(/\r?\n/)) {
-        if (!line.startsWith('data:'))
-            continue;
-        try {
-            const part = JSON.parse(line.slice(5));
-            const delta = part.choices?.[0]?.delta;
-            content += delta?.content || '';
-            reasoning += delta?.reasoning_content || delta?.reasoning || '';
+    const partialCalls = new Map();
+    function consume(message, delta) {
+        content += message?.content || '';
+        reasoning += message?.reasoning_content || message?.reasoning || '';
+        for (const [i, call] of (message?.tool_calls || []).entries()) {
+            const index = call.index ?? i;
+            const previous = partialCalls.get(index) || { id: '', type: 'function', function: { name: '', arguments: '' } };
+            if (call.id) previous.id = call.id;
+            if (call.type) previous.type = call.type;
+            for (const key of ['name', 'arguments']) {
+                const value = call.function?.[key];
+                if (typeof value === 'string') previous.function[key] = delta ? previous.function[key] + value : value;
+            }
+            partialCalls.set(index, previous);
         }
-        catch { }
     }
+    try { consume(JSON.parse(detail.rawResponse).choices?.[0]?.message, false); }
+    catch {
+        for (const line of detail.rawResponse.split(/\r?\n/)) {
+            if (!line.startsWith('data:')) continue;
+            try { consume(JSON.parse(line.slice(5)).choices?.[0]?.delta, true); }
+            catch { } // Incomplete frames remain visible in the raw view.
+        }
+    }
+    calls = Array.from(partialCalls.values());
 } if (reasoning) {
     const d = node('details', undefined, 'message');
+    d.open = true;
     d.append(node('summary', 'Reasoning'), code(reasoning, false));
     root.append(d);
 } if (content)
     root.append(node('div', 'Assistant response', 'section-label'), node('div', content, 'prose')); if (calls.length)
     root.append(node('div', 'Tool calls', 'section-label'), code(calls)); if (!content && !reasoning && !calls.length)
-    root.append(node('div', detail.state === 'pending' ? 'Waiting for response…' : 'No assistant text. Inspect JSON or raw bytes for the complete exchange.', 'subtitle')); if (result) {
+    root.append(node('div', detail.state === 'pending' ? 'Prompt sent · waiting for the API to generate output…' : 'No assistant text. Inspect JSON or raw bytes for the complete exchange.', 'subtitle')); if (result) {
     const extra = { ...result };
     delete extra.content;
     delete extra.reasoning;
@@ -219,7 +246,7 @@ for (const side of ['input', 'output']) {
             t.classList.toggle('active', t === b);
         side === 'input' ? renderInput() : renderOutput();
         return;
-    } const text = side === 'input' ? JSON.stringify(event('model.request') || {}) : detail.rawResponse; if (b.dataset.action === 'copy') {
+    } const text = side === 'input' ? detail.rawRequest : detail.rawResponse; if (b.dataset.action === 'copy') {
         try {
             await navigator.clipboard.writeText(text);
             b.textContent = 'Copied';
@@ -239,13 +266,13 @@ for (const side of ['input', 'output']) {
         setTimeout(() => URL.revokeObjectURL(url), 1000);
     } };
 }
-async function refresh(append = false) { if (busy)
-    return; busy = true; const token = generation, query = $('search').value; try {
+async function refresh(append = false, automatic = false) { if (busy)
+    return; busy = true; let token = generation; const revision = filterRevision, query = $('search').value; try {
     const page = await api('/api/requests?q=' + encodeURIComponent(query) + (append && next ? '&before=' + next : ''));
-    if (query !== $('search').value)
+    if (revision !== filterRevision || (automatic && (token !== generation || !$('live').checked)))
         return;
     if (append)
-        items.push(...page.items);
+        items.push(...page.items.filter(n => !items.some(i => i.id === n.id)));
     else {
         const older = items.filter(i => !page.items.some(n => n.id === i.id));
         items = page.items.concat(older);
@@ -255,17 +282,22 @@ async function refresh(append = false) { if (busy)
     if (append)
         next = page.next;
     timeline();
+    if ($('follow').checked && page.items.length && selected !== page.items[0].id && !append && token === generation) {
+        await select(page.items[0].id);
+        token = generation;
+    }
     if (selected && token === generation) {
         const current = items.find(i => i.id === selected);
         if (!detail || detail.state === 'pending' || current?.updated !== detail.updated) {
             const d = await api('/api/requests/' + encodeURIComponent(selected));
-            if (token === generation) {
+            if (token === generation && revision === filterRevision) {
                 detail = d;
                 render();
             }
         }
     }
-    $('connection').textContent = 'Live · 2s refresh';
+    if (automatic && token !== generation) return;
+    $('connection').textContent = $('live').checked ? 'Live · 0.5s refresh' : 'Paused';
     $('error').hidden = true;
 }
 catch (e) {
@@ -273,11 +305,18 @@ catch (e) {
 }
 finally {
     busy = false;
+    if (revision !== filterRevision) refresh();
 } }
-$('search').oninput = () => { clearTimeout(searchTimer); items = []; next = null; searchTimer = setTimeout(() => refresh(), 200); };
+$('search').oninput = () => { clearTimeout(searchTimer); filterRevision++; items = []; next = null; searchTimer = setTimeout(() => refresh(), 200); };
 $('more').onclick = () => refresh(true);
+$('live').onchange = () => {
+    generation++; // Discard in-flight automatic detail updates when pausing.
+    $('connection').textContent = $('live').checked ? 'Connecting' : 'Paused';
+    if ($('live').checked) refresh(false, true);
+};
+$('follow').onchange = () => { if ($('follow').checked) refresh(); };
+$('refresh').onclick = () => refresh();
 refresh();
-setInterval(() => { if (!document.hidden)
-    refresh(); }, 2000);
+setInterval(() => { if ($('live').checked && !document.hidden) refresh(false, true); }, 500);
 </script></body></html>`;
 }
