@@ -201,6 +201,14 @@ in `.env` and restart the bot.
 - Per-tool caps (fetch size, redirect hops, cache, search result caps,
   workspace limits, …) are in `.env.example` and have sensible defaults.
 
+## API inspector
+
+Run `npm run ui`, then open **http://127.0.0.1:3210**. The read-only web UI can run alongside the bot or browse its history while it is stopped. It reads `CHATS_ARCHIVE_DIR` from `.env` (default `./data/archive`) without acquiring the bot's archive lock. No Discord token or model connection is needed to run the UI. Set `WEB_UI_PORT` to change its port; after a build, run `node dist/ui-cli.js` instead.
+
+The dark request timeline refreshes every two seconds and filters by channel ID, request ID, purpose or status. Select an interaction to inspect its input messages, reasoning, tool schemas/calls, request JSON, normalized output, HTTP status and exact captured response body. Replies, chime decisions, repair attempts and compaction calls appear separately, including failed and unfinished requests. JSON views highlight syntax; raw views preserve SSE frames and partial responses. Copy or save either body; response downloads preserve the captured bytes exactly.
+
+The UI binds only to `127.0.0.1` and does not load external assets. Conversation content is visible to anyone who can access that local address; authorization headers are never archived or displayed. A pending request from an earlier bot session remains marked pending because the archive has no completion for it. Raw input is the serialized request body; raw output is the captured response body, not HTTP headers. Image data remains text and is never loaded into the page. Large bodies are loaded only when selected. Restart the UI after replacing or purging its archive.
+
 ## Configuration
 
 See [.env.example](.env.example) for the documented list.
@@ -212,6 +220,7 @@ See [.env.example](.env.example) for the documented list.
 | `npm run dev` | run from source with tsx |
 | `npm run build` | compile TypeScript to `dist/` |
 | `npm start` | run the compiled bot |
+| `npm run ui` | open the local API interaction inspector at http://127.0.0.1:3210 |
 | `npm run typecheck` | type-check without emitting |
 | `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file/shell/zim tools, LLM client incl. tool calls vs. a mock endpoint) |
 
