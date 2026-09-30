@@ -39,7 +39,7 @@ the upstream CUDA crash. Prompt processing will be slower. The default is
 
 Avoid manually editing/regenerating old assistant or system messages on
 affected servers. Glove itself cannot guarantee an append-only request
-prefix: edits/deletes, compaction, reply formatting, chime calls and
+prefix: edits/deletes, compaction, chime calls and
 interrupted attempts can all change it, and channels share server slots.
 Discord's live reply edits update display text; disabling `MODEL_STREAM`
 does not prevent these request-prefix changes. If the crash persists with
@@ -59,7 +59,7 @@ without the affected tensor/MTP combination.
   bot shows a typing indicator while the model decides. YES runs a normal
   reply; NO optionally posts a short decision and reason. Only a `chime` tool
   call is accepted; plain text (including YES/NO and JSON) never decides.
-  An unusable decision gets one repair with only the required chime tool; HTTP
+  An unusable decision gets one repair with unchanged tool schemas and an extra instruction; HTTP
   failures, timeouts and outages do not retry. Both decision requests cap
   output at 1,024 tokens (including reasoning on compatible endpoints).
   Typing refreshes stop when the decision finishes. Failure logs
@@ -230,13 +230,13 @@ changing this can change the server's rendered prompt. The decision adds a
 short **system-role** instruction **after** that shared context; a reply uses the shared
 context directly. The chime tool is advertised during replies for matching
 schemas, but reply handling removes it before tool execution or history
-recording. A decision-only reply gets one repair with chime omitted; a second
+recording. A decision-only reply gets one repair with unchanged tool schemas; a second
 failure stops with an error instead of consuming tool rounds. Existing reply
 text and real tool calls are preserved. Decision calls never execute tools;
 only a single valid chime call is accepted. Unusable decisions get one repair
-with only the required chime tool. These exceptional repairs may lose cache
-reuse in exchange for reliable output. The decision and its instructions are never
-added to working conversation history. Mentions still bypass the decision.
+with the same tool schemas and `tool_choice: "auto"`, plus a trailing instruction.
+Repairs remain bounded to one retry and validate the result before accepting it.
+The decision and its instructions are never added to working conversation history. Mentions still bypass the decision.
 
 With no executable tools enabled, a reply receiving an explicit HTTP 400/422
 tool-compatibility rejection retries once without tool metadata. Other errors
@@ -257,11 +257,30 @@ instructions are not stored in working history.
 Compatible endpoints can reuse the conversation prefix instead of processing
 it twice. The bot logs `chime prompt cache: X/Y input tokens reused` when usage
 includes cache counts; missing counts mean unknown, not a cache miss.
+Per-turn logs also report cache reuse across all calls that provide cache counts.
 Decisions themselves are never cached.
+
+Attachment windows control initial admission. Once rendered, attachment text,
+image parts and skip notes are persisted unchanged until the message is edited,
+its attachments/settings change, or it leaves context through compaction, clear
+or deletion. Aging and signed CDN URL refreshes no longer rewrite old messages.
+This keeps admitted attachments in the token budget until compaction; download
+failure notes are also stable (edit or re-upload the message to retry).
+
+Original model text is retained separately from Discord's formatted delivery
+text, including across restart and crash recovery. Discord settle echoes preserve
+it; real edits replace it. Existing saved entries without original text continue
+using their stored text.
+
+The latest valid request measures each channel's context. Compaction and overflow
+recovery discard earlier measurements, including measurements arriving after a
+clear or edit. Turn-wide peak usage remains diagnostic; `/slots` usage is never
+assigned to a channel because the slot may belong to another conversation.
+Without attributable request usage the bot uses its context estimate.
 
 [llama-server documents](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 server prompt caching. Actual reuse depends on its version, chat template,
-model and available slot/cache state. Edits, compaction, attachment-window
+model and available slot/cache state. Real edits, compaction, configuration
 changes and intervening requests can reduce reuse. Matching request prefixes
 enables caching but cannot guarantee zero prompt reprocessing. No server
 settings are changed by the bot.

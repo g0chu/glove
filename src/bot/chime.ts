@@ -57,8 +57,8 @@ export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[], signal?: A
  * One chime decision: a validated tool call over the shared context in which the
  * model reports its answer as a call of the chime tool (respond + reason).
  * Plain-text decisions are rejected. An unusable answer gets one repair
- * with only the required chime tool and an appended instruction. This repair
- * prioritizes decision reliability over schema cache reuse. Endpoint failures stay silent.
+ * with the same schemas/choice and an appended instruction, preserving the
+ * shared prompt prefix. Endpoint failures stay silent.
  * Anything else — garbage, an empty answer, a call without a usable respond
  * flag after repair, or a failed call — is null: a broken decision must not make the bot
  * post an unasked-for reply. An interrupted call (the channel changed while
@@ -102,9 +102,9 @@ export async function decideChime(
           attempt === 0 ? messages : [...messages, {
             role: "system", content: "Decide about the newest transcript message above. Call the chime tool exactly once with respond and a short reason. Do not return a plain-text decision. Do not answer the conversation itself.",
           }],
-          attempt === 0 ? tools : [CHIME_TOOL_SPEC],
+          tools,
           signal,
-          { toolChoice: attempt === 0 ? "auto" : "required", maxTokens: CHIME_MAX_TOKENS },
+          { toolChoice: "auto", maxTokens: CHIME_MAX_TOKENS },
         );
       } catch (err) {
         if (isInterruptedError(err) || isContextOverflowError(err)) throw err;
@@ -116,7 +116,7 @@ export async function decideChime(
       }
       const decision = parseDecision(res, warn);
       if (decision !== null) return decision;
-      if (attempt === 0) warn("retrying unusable chime decision once with only the required chime tool");
+      if (attempt === 0) warn("retrying unusable chime decision once with the shared tool schemas");
     }
     return null;
   } finally {

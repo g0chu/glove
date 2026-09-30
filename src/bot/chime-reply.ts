@@ -37,14 +37,14 @@ export function chimeReplyChat(chat: ChatFn, onRepair?: () => Promise<unknown>):
     if (result.content.trim() || result.toolCalls.length > 0) return result;
 
     // A decision-only response is not an answer. Nothing has executed, so
-    // one repair is safe. Hide chime on this exceptional request to prevent
-    // an unknown-tool loop; normal requests retain the shared schemas.
+    // one repair is safe. Keep the schema prefix stable; validation below
+    // still rejects another decision-only response without executing it.
     log.warn("reply returned only a chime decision; retrying once with reply tools");
     await onRepair?.();
     result = withoutChime(await chat([...messages, {
       role: "system",
       content: "The decision phase is over. Answer the preceding conversation now. Do not call chime or decide whether to respond. Use the available tools if needed, or provide the reply text.",
-    }], callbacks, realTools, signal, options));
+    }], callbacks, chimeTools(executableTools), signal, options));
     if (!result.content.trim() && result.toolCalls.length === 0) {
       throw new Error("model did not provide a reply after the chime decision repair");
     }
