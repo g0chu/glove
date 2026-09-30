@@ -1,3 +1,4 @@
+import type { ReactionSnapshot } from "../bot/reactions.js";
 import type { ChatMessage, MessageAttachmentLike, ToolCall } from "./client.js";
 import { isImageAttachment, isInterruptedError } from "./client.js";
 
@@ -56,6 +57,10 @@ export interface ContextEntry {
   bot?: boolean;
   /** Attachment metadata; admitted attachments retain their first rendering until removed or edited. */
   attachments: MessageAttachmentLike[];
+  /** Reaction snapshots by Discord chunk id, including older messages. */
+  reactions?: Record<string, ReactionSnapshot[]>;
+  /** Frozen reaction images keyed by emoji identity and image settings. */
+  reactionImages?: Record<string, string | null>;
   /** The Discord createdTimestamp (keeps the startup seed chronological). */
   ts: number;
   /** The model's reasoning/thinking for an assistant entry, when the endpoint sent it. */
@@ -97,6 +102,10 @@ export interface SeedEntry {
   name?: string;
   bot?: boolean;
   attachments: MessageAttachmentLike[];
+  /** Reaction snapshots by Discord chunk id, including older messages. */
+  reactions?: Record<string, ReactionSnapshot[]>;
+  /** Frozen reaction images keyed by emoji identity and image settings. */
+  reactionImages?: Record<string, string | null>;
 }
 
 /**
@@ -329,6 +338,23 @@ export class ChannelContext {
     }
   }
 
+  /** Update reactions without changing original message text or attachment admission. */
+  updateReactions(messageId: string, reactions: ReactionSnapshot[]): void {
+    const entry = this.find(messageId);
+    if (!entry || JSON.stringify(entry.reactions?.[messageId] ?? []) === JSON.stringify(reactions)) return;
+    entry.reactions = { ...entry.reactions, [messageId]: reactions.map((r) => ({ ...r })) };
+    this.invalidateMeasurement();
+    this.changed();
+  }
+
+  /** Persist successful and failed emoji downloads to keep prompts stable across restarts. */
+  setReactionImage(entry: ContextEntry, key: string, image: string | null): void {
+    if (!this.entries.includes(entry) || Object.hasOwn(entry.reactionImages ?? {}, key)) return;
+    entry.reactionImages = { ...entry.reactionImages, [key]: image };
+    this.invalidateMeasurement();
+    this.changed();
+  }
+
   /** Replace one chunk of a chunked entry and re-derive its stored content. */
   updateChunk(messageId: string, chunkContent: string): void {
     const entry = this.find(messageId);
@@ -489,7 +515,7 @@ export class ChannelContext {
    * — see compareDiscordIds: same-millisecond messages must not keep the
    * API's newest-first order).
    */
-  seedFrom(seed: SeedEntry[], afterTs?: number): void {
+  seedFrom(seed: SeedEntry[], afterTs?: number, markSeeded = true): void {
     const known = new Set<string>();
     for (const e of this.entries) for (const id of e.ids) known.add(id);
     const merged: ContextEntry[] = [...this.entries];
@@ -504,6 +530,7 @@ export class ChannelContext {
         ts: s.ts,
         attachments: [...s.attachments],
       };
+      if (s.reactions !== undefined) entry.reactions = s.reactions;
       if (s.name !== undefined) entry.name = s.name;
       if (s.bot !== undefined) entry.bot = s.bot;
       merged.push(entry);
@@ -519,7 +546,7 @@ export class ChannelContext {
     groups.sort(([a], [b]) => a.ts - b.ts || compareDiscordIds(a.ids[0], b.ids[0]));
     this.entries.length = 0;
     this.entries.push(...groupConsecutiveReplies(groups.flat()));
-    this.seeded = true;
+    if (markSeeded) this.seeded = true;
     this.invalidateMeasurement();
     this.changed();
   }
@@ -543,6 +570,15 @@ export class ChannelContext {
       const e = this.entries[i];
       // The reasoning and the tool calls travel with the request, so they
       // count toward its size.
+      if (e.reactions) t += estimateTokens(JSON.stringify(e.reactions));
+      for (const reactions of Object.values(e.reactions ?? {})) {
+        for (const reaction of reactions) {
+          const prefix = JSON.stringify([reaction.id ?? reaction.emoji]).slice(0, -1) + ",";
+          if (Object.entries(e.reactionImages ?? {}).some(([key, image]) => key.startsWith(prefix) && image)) {
+            t += IMAGE_TOKEN_ESTIMATE;
+          }
+        }
+      }
       const calls = e.toolCalls !== undefined ? JSON.stringify(e.toolCalls).length : 0;
       t += Math.ceil(((e.modelContent ?? e.content).length + (e.reasoning?.length ?? 0) + calls) / 4);
       if (e.attachmentPrompt) {
@@ -716,6 +752,7 @@ function groupConsecutiveReplies(entries: ContextEntry[]): ContextEntry[] {
       prev.ids = [...prev.ids, ...e.ids];
       prev.chunks = [...(prev.chunks ?? [prevContent]), ...(e.chunks ?? [e.content])];
       prev.attachments = [...prev.attachments, ...e.attachments];
+      if (e.reactions) prev.reactions = { ...prev.reactions, ...e.reactions };
     } else {
       out.push(e);
     }
@@ -759,6 +796,20 @@ function sanitizeEntry(raw: unknown): ContextEntry | null {
       ? (e.attachments as MessageAttachmentLike[]).filter((a) => a !== null && typeof a === "object" && typeof a.url === "string")
       : [],
   };
+  if (e.reactions && typeof e.reactions === "object") {
+    entry.reactions = {};
+    for (const [id, values] of Object.entries(e.reactions)) {
+      if (!entry.ids.includes(id) || !Array.isArray(values)) continue;
+      entry.reactions[id] = values.filter((r): r is ReactionSnapshot => r &&
+        (r.id === null || (typeof r.id === "string" && /^\d+$/.test(r.id))) &&
+        typeof r.name === "string" && typeof r.emoji === "string" &&
+        Number.isSafeInteger(r.count) && r.count > 0);
+    }
+  }
+  if (e.reactionImages && typeof e.reactionImages === "object") {
+    entry.reactionImages = Object.fromEntries(Object.entries(e.reactionImages).filter(([, value]) =>
+      value === null || (typeof value === "string" && value.startsWith("data:image/png;base64,"))));
+  }
   if (Array.isArray(e.chunks) && e.chunks.every((c) => typeof c === "string")) entry.chunks = e.chunks as string[];
   if (typeof e.name === "string") entry.name = e.name;
   if (e.role === "assistant" && typeof e.modelContent === "string") entry.modelContent = e.modelContent;
