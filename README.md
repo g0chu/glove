@@ -156,13 +156,15 @@ The local `chime` schema is also shared by decision and reply requests.
   package managers, scripts. Commands are **not** sandboxed; a per-command
   deadline and an output cap keep a single call from hanging or flooding
   the context.
-- **wikipedia tools**: `wikipedia_search` and `wikipedia_read` over a local
+- **wikipedia tools**: `wikipedia_search`, `wikipedia_intro`, `wikipedia_sections`,
+  `wikipedia_section`, and `wikipedia_read` over a local
   **offline Wikipedia archive** (a ZIM file pointed to by `ZIM_FILE`, e.g.
   the en.wikipedia "all nopic" dump in `./workspace`). The reader works
   directly on the file using indexed path lookups and time-budgeted title scans. `wikipedia_read` returns the article as clean plain text
   (references, TOC and navigation dropped). Choose `intro`, `sections`,
   `section`, or `full` when reading.
-- **vault tools**: `vault_search`, `vault_read`, and `vault_links` browse
+- **vault tools**: `vault_search`, `vault_intro`, `vault_sections`, `vault_section`,
+  `vault_read`, and `vault_links` browse
   an offline Wikipedia markdown vault configured with `VAULT_DIR`. Read modes
   match the ZIM tools, and search also checks note contents.
 - **memory tool**: `memory` manages persistent named notes shared across
@@ -349,20 +351,19 @@ the prompt. Refresh failures stop the attempt rather than answer from stale hist
 The bot’s own activity is excluded. Channel activity cancels generation as well
 as prompt processing.
 
-Offline Wikipedia browsing: `wikipedia_read` and `vault_read` expose these choices:
+Offline Wikipedia browsing uses separate tools with no `mode` argument:
 
-- `mode: "intro"`: the page introduction before article sections, including a page title if present; paginate to read a long introduction.
-- `mode: "sections"`: section IDs and headings, without article body text.
-- `mode: "section", section: "2"`: one section and its subsections, by ID or exact heading.
-- `mode: "full"`: paginated article text (the default).
+- `wikipedia_intro` / `vault_intro`: the introduction before article sections.
+- `wikipedia_sections` / `vault_sections`: section IDs and headings, without body text.
+- `wikipedia_section` / `vault_section`: one section and its subsections; requires `section` (an ID or exact heading).
+- `wikipedia_read` / `vault_read`: paginated article text, with optional `query` for literal matching excerpts.
 
-For example, call `wikipedia_read({"title":"Albert Einstein","mode":"sections"})`,
-then `wikipedia_read({"title":"Albert Einstein","mode":"section","section":"2"})`.
-`outline` remains an alias for `sections`; legacy `abstract` returns a 1000-character prefix.
- Pass
-`section` (an ID or exact heading; `lead` selects introductory text) to read only
-that section and its subsections. Pass `query` for case-insensitive literal matches
-with short surrounding excerpts. `offset` and `max_chars` paginate the selected
+For example, call `wikipedia_sections({"title":"Albert Einstein"})`,
+then `wikipedia_section({"title":"Albert Einstein","section":"2"})`.
+The vault tools use `note` instead of `title`. Introduction and section tools also
+accept `query` to find excerpts in their selected text. Legacy `mode` arguments
+are rejected; choose the corresponding tool instead.
+`offset` and `max_chars` paginate the selected
 text; responses report the next offset when more remains. Reads default to 3000
 characters, capped by `TOOLS_MAX_RESULT_CHARS`. Sections and matches remain
 accessible beyond that cap. Outlines are paginated too; their offsets refer to

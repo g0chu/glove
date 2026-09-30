@@ -20,7 +20,7 @@ import {
   extractWikilinks,
   type VaultCorpus,
 } from "./vault/corpus.js";
-import { browseWiki, wikiReadOptions, WIKI_READ_PROPERTIES, type WikiReadOptions } from "./wiki.js";
+import { browseWiki, wikiToolOptions, wikiToolSpec, WIKI_OPERATIONS, type WikiReadOptions } from "./wiki.js";
 import { scanBody, type BodyScanOptions } from "./vault/body.js";
 
 /** How much of a note's body "abstract" mode returns (chars). */
@@ -106,7 +106,7 @@ export class VaultTools {
       `${corpus.source === "listing" ? ", no title index yet" : ""}) — matches for "${query}":`;
     const partial =
       titles.partial || bodies.partial ? " (scan was time-limited; refine the query for more)" : "";
-    return `${head}${partial}\n${lines.join("\n")}\nUse vault_read with the exact title (or file) to read one.`;
+    return `${head}${partial}\n${lines.join("\n")}\nUse vault_intro for an introduction, vault_sections to list headings, vault_section for one section, or vault_read for paginated text; pass the exact title or file stem.`;
   }
 
   /**
@@ -225,19 +225,7 @@ export const VAULT_SEARCH_SPEC: ToolSpec = {
   },
 };
 
-export const VAULT_READ_SPEC: ToolSpec = {
-  name: "vault_read",
-  description: "Read an offline Wikipedia note as paginated markdown. Resolves file stems first, then exact titles (case/space/underscore-insensitive); ambiguous titles require a listed file stem. Flat note names only; path separators and '..' are rejected. Frontmatter is omitted except in abstract mode. Choose mode intro for introductory text, sections for heading IDs, section with an ID/heading for its text, or full for the article. offset/max_chars paginate; query finds excerpts. Cite the note title.",
-  parameters: {
-    type: "object",
-    properties: {
-      note: { type: "string", minLength: 1, description: "The exact note title (e.g. \"Albert Einstein\") or file stem." },
-      ...WIKI_READ_PROPERTIES,
-    },
-    required: ["note"],
-    additionalProperties: false,
-  },
-};
+export const VAULT_READ_SPEC: ToolSpec = wikiToolSpec("vault", "note", "read", "Offline Wikipedia markdown; accepts a flat file stem or exact title, with ambiguous titles requiring a file stem. Frontmatter is omitted.");
 
 export const VAULT_LINKS_SPEC: ToolSpec = {
   name: "vault_links",
@@ -255,9 +243,9 @@ export const VAULT_LINKS_SPEC: ToolSpec = {
 /** Register the vault tools on a registry, bound to one VaultTools. */
 export function registerVaultTools(registry: ToolRegistry, tools: VaultTools): void {
   registry.register(VAULT_SEARCH_SPEC, (args) => tools.search(argString(args, "query"), argInt(args, "max_results", 5, 1, 10)));
-  registry.register(VAULT_READ_SPEC, (args) => {
-    const options = wikiReadOptions(args, tools.maxReadChars);
-    return tools.read(argString(args, "note"), options.mode === "abstract" ? "abstract" : "full", options);
-  });
+  for (const operation of WIKI_OPERATIONS) {
+    const spec = wikiToolSpec("vault", "note", operation, "Offline Wikipedia markdown; accepts a flat file stem or exact title, with ambiguous titles requiring a file stem. Frontmatter is omitted.");
+    registry.register(spec, (args) => tools.read(argString(args, "note"), "full", wikiToolOptions(args, tools.maxReadChars, "note", operation)));
+  }
   registry.register(VAULT_LINKS_SPEC, (args) => tools.links(argString(args, "note")));
 }

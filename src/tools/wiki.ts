@@ -1,4 +1,5 @@
 /** Shared, bounded browsing of rendered offline Wikipedia articles. */
+import type { ToolSpec } from "../llm/client.js";
 import { argInt, argOptionalString } from "./executor.js";
 import { lower1 } from "./vault/corpus.js";
 
@@ -116,4 +117,38 @@ function page(text: string, offset: number, budget: number): string {
   if (offset >= text.length) return `[end of text; ${text.length} characters]`;
   return `[characters ${offset}-${end} of ${text.length}]\n${text.slice(offset, end)}` +
     (end < text.length ? `\n[truncated; next offset ${end}]` : "\n[end of text]");
+}
+
+/** Dedicated browsing operations; modes stay internal to the renderer. */
+export const WIKI_OPERATIONS = ["read", "intro", "sections", "section"] as const;
+
+/** Build a mode-free schema for one Wikipedia browsing operation. */
+export function wikiToolSpec(prefix: string, key: string, operation: typeof WIKI_OPERATIONS[number], source: string): ToolSpec {
+  const properties: Record<string, unknown> = {
+    [key]: { type: "string", minLength: 1, description: "Exact article title or backend article identifier." },
+    offset: WIKI_READ_PROPERTIES.offset,
+    max_chars: WIKI_READ_PROPERTIES.max_chars,
+  };
+  if (operation !== "sections") properties.query = WIKI_READ_PROPERTIES.query;
+  if (operation === "section") properties.section = WIKI_READ_PROPERTIES.section;
+  const descriptions = {
+    read: "Read paginated article text; query returns matching excerpts.",
+    intro: "Get only the page introduction before article sections; query returns matching excerpts.",
+    sections: "List section IDs and headings without article body text. Use the section tool to read one.",
+    section: "Read one section and its subsections by ID or exact heading; query returns matching excerpts.",
+  };
+  return {
+    name: `${prefix}_${operation}`,
+    description: `${source} ${descriptions[operation]} offset/max_chars paginate. Cite the article title.`,
+    parameters: { type: "object", properties, required: operation === "section" ? [key, "section"] : [key], additionalProperties: false },
+  };
+}
+
+/** Validate arguments and apply the operation selected by the tool name. */
+export function wikiToolOptions(args: Record<string, unknown>, cap: number, key: string, operation: typeof WIKI_OPERATIONS[number]): WikiReadOptions {
+  const allowed = [key, "offset", "max_chars", ...(operation !== "sections" ? ["query"] : []), ...(operation === "section" ? ["section"] : [])];
+  for (const name of Object.keys(args)) {
+    if (!allowed.includes(name)) throw new Error(`unsupported argument "${name}"; choose the dedicated Wikipedia tool`);
+  }
+  return wikiReadOptions({ ...args, mode: operation === "read" ? "full" : operation }, cap);
 }

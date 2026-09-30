@@ -7,7 +7,7 @@
  */
 import type { ToolSpec } from "../llm/client.js";
 import { ToolRegistry, argString, argInt } from "./executor.js";
-import { browseWiki, wikiReadOptions, WIKI_READ_PROPERTIES, type WikiReadOptions } from "./wiki.js";
+import { browseWiki, wikiToolOptions, wikiToolSpec, WIKI_OPERATIONS, type WikiReadOptions } from "./wiki.js";
 import { ZimReader } from "./zim/reader.js";
 
 export interface ZimToolsOptions {
@@ -59,7 +59,7 @@ export class ZimTools {
       return `${i + 1}. ${r.title}${nsNote}${redir}`;
     });
     const head = `Local Wikipedia (offline archive) — ${results.length} match(es) for "${query}"${partial ? " (scan was time-limited; refine the query for more)" : ""}:`;
-    return `${head}\n${lines.join("\n")}\nUse wikipedia_read with the exact title and mode intro for its introduction, mode sections to list headings, or mode section with a section ID to read its text.`;
+    return `${head}\n${lines.join("\n")}\nUse wikipedia_intro for its introduction, wikipedia_sections to list headings, wikipedia_section with a section ID to read its text, or wikipedia_read for paginated article text.`;
   }
 
   /** Read one article's text by exact title (or wiki-style path). */
@@ -95,22 +95,13 @@ export const ZIM_SEARCH_SPEC: ToolSpec = {
   },
 };
 
-export const ZIM_READ_SPEC: ToolSpec = {
-  name: "wikipedia_read",
-  description: "Read offline Wikipedia as paginated plain text, with references/navigation removed. Resolves redirects; accepts exact titles or wiki paths with spaces/underscores. Choose mode intro for the page introduction, sections for section IDs/headings, section with a section ID/heading for its text, or full for the article. offset/max_chars paginate; query finds excerpts in selected text. Cite the article title.",
-  parameters: {
-    type: "object",
-    properties: {
-      ...WIKI_READ_PROPERTIES,
-      title: { type: "string", minLength: 1, description: "The exact article title (e.g. \"Albert Einstein\") or wiki path (e.g. \"Albert_Einstein\")." },
-    },
-    required: ["title"],
-    additionalProperties: false,
-  },
-};
+export const ZIM_READ_SPEC: ToolSpec = wikiToolSpec("wikipedia", "title", "read", "Offline Wikipedia plain text; redirects are resolved and navigation/references removed.");
 
 /** Register the ZIM tools on a registry, bound to one ZimTools. */
 export function registerZimTools(registry: ToolRegistry, tools: ZimTools): void {
   registry.register(ZIM_SEARCH_SPEC, (args) => tools.search(argString(args, "query"), argInt(args, "max_results", 5, 1, 10)));
-  registry.register(ZIM_READ_SPEC, (args) => tools.read(argString(args, "title"), wikiReadOptions(args, tools.maxReadChars)));
+  for (const operation of WIKI_OPERATIONS) {
+    const spec = wikiToolSpec("wikipedia", "title", operation, "Offline Wikipedia plain text; redirects are resolved and navigation/references removed.");
+    registry.register(spec, (args) => tools.read(argString(args, "title"), wikiToolOptions(args, tools.maxReadChars, "title", operation)));
+  }
 }
