@@ -30,6 +30,8 @@ import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextW
 import { ChatPersistence } from "../src/llm/persist.js";
 import { ConversationArchive, type ArchiveRecord } from "../src/llm/archive.js";
 import { archiveChat } from "../src/llm/archived-chat.js";
+import { startInspector } from "../src/ui/server.js";
+import { Script } from "node:vm";
 import { recoverTurns } from "../src/llm/recovery.js";
 import { archiveTools } from "../src/tools/archive.js";
 import { archiveAttachments } from "../src/bot/attachment-store.js";
@@ -6239,6 +6241,77 @@ const ok = (name: string): void => {
     assert.equal(recoverTurns(archive, store), 0);
     ok("archive: continuing an interrupted turn cannot duplicate retained rounds during recovery");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-ui-"));
+  const archive = new ConversationArchive(dir);
+  const scope = { requestId: "request-1", channelId: "channel-1", purpose: "reply" as const };
+  const request = { model: "test", messages: [{ role: "user", content: "<script>alert('x')</script>" }], stream: true };
+  archive.record("model.started", scope, {});
+  archive.record("model.request", scope, request);
+  archive.record("model.status", scope, { status: 200 });
+  const raw = Buffer.from('data: {"choices":[{"delta":{"content":"Hello 🌎"}}]}\n\ndata: [DONE]\n\n');
+  const split = raw.indexOf(Buffer.from("🌎")) + 1;
+  for (const bytes of [raw.subarray(0, split), raw.subarray(split)]) {
+    archive.record("model.bytes", scope, { blob: archive.putBlob(bytes), size: bytes.length });
+  }
+  const server = await startInspector(dir, 0);
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const page = await fetch(base);
+    assert.equal(page.status, 200);
+    assert.ok(page.headers.get("content-security-policy")?.includes("frame-ancestors 'none'"));
+    const html = await page.text();
+    assert.ok(html.includes("API Inspector"));
+    assert.ok(!html.includes(request.messages[0].content), "archived model text is never interpolated into HTML");
+    const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1];
+    new Script(script); // Check the actual browser script's syntax, including template escapes.
+    assert.equal((await fetch(base + "/api/requests", { headers: { Origin: "https://untrusted.example" } })).status, 403);
+    const forbiddenHost = await new Promise<number | undefined>((resolve, reject) => {
+      http.get(base + "/api/requests", { headers: { Host: "untrusted.example" } }, response => {
+        response.resume(); resolve(response.statusCode);
+      }).on("error", reject);
+    });
+    assert.equal(forbiddenHost, 403);
+    assert.equal((await fetch(base + "/api/requests", { method: "POST" })).status, 405);
+    assert.equal((await fetch(base + "/api/requests?before=NaN")).status, 400);
+    assert.equal((await fetch(base + "/api/requests/missing")).status, 404);
+    let list = await (await fetch(base + "/api/requests")).json() as { items: { id: string; state: string }[]; next: number | null };
+    assert.equal(list.items[0].state, "pending");
+    const d = await (await fetch(base + "/api/requests/request-1")).json() as {
+      rawResponse: string; responseBase64: string; responseBytes: number; events: { type: string; data: unknown }[];
+    };
+    assert.equal(d.rawResponse, raw.toString("utf8"));
+    assert.deepEqual(Buffer.from(d.responseBase64, "base64"), raw, "downloads preserve exact bytes across split UTF-8 chunks");
+    assert.equal(d.responseBytes, raw.length);
+    assert.deepEqual(d.events.find(e => e.type === "model.request")!.data, request);
+    archive.record("model.finished", scope, { content: "Hello 🌎", reasoning: "test reasoning", toolCalls: [] });
+    for (let i = 0; i < 101; i++) {
+      const s = { requestId: `older-${i}`, channelId: "other", purpose: "chime" as const };
+      archive.record("model.started", s, {});
+      archive.record("model.failed", s, { error: "endpoint unavailable" });
+    }
+    list = await (await fetch(base + "/api/requests")).json() as typeof list;
+    assert.equal(list.items.length, 100);
+    assert.ok(list.next);
+    const older = await (await fetch(base + "/api/requests?before=" + list.next)).json() as typeof list;
+    assert.equal(older.items.length, 2);
+    assert.equal(older.items.at(-1)!.state, "finished");
+    const filtered = await (await fetch(base + "/api/requests?q=channel-1")).json() as typeof list;
+    assert.deepEqual(filtered.items.map(i => i.id), ["request-1"]);
+    const journal = path.join(dir, "events.jsonl");
+    fs.appendFileSync(journal, '{"unfinished":');
+    assert.equal((await fetch(base + "/api/requests")).status, 200, "a live partial journal line is left for the next refresh");
+    fs.appendFileSync(journal, 'true}\n');
+    assert.equal((await fetch(base + "/api/requests")).status, 500, "corrupt committed journal lines fail closed");
+    ok("web UI: read-only live archive, exact request/response bytes, filters, pagination, origin checks and corruption handling");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    archive.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 console.log(`\n${checks} check groups passed`);

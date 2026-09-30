@@ -77,7 +77,7 @@ npm test                  # smoke tests (tsx test/smoke.ts)
 ## 3. Testing Guidelines
 
 - Whole suite is `test/smoke.ts` via `npm test` — no framework, no selection, no config. Hermetic: mock OpenAI-compatible HTTP server on an ephemeral port, fake Discord channels, injected DNS/search backends, temp workspace dirs; no `.env`/Discord/network needed.
-- Plain `node:assert/strict`; `ok(name)` check groups (currently **211**); the final line prints the count.
+- Plain `node:assert/strict`; `ok(name)` check groups (currently **212**); the final line prints the count.
 - Async is driven with `ticks()` (`setImmediate`), not real sleeps.
 - In tests use the pure `parseConfig(env)`, never `loadConfig()` (calls `process.exit(1)`).
 - Web-tool tests use `WebToolsOptions.allowPrivate`/`resolver`/`searchFetch` — tests-only escape hatches, never enable in production.
