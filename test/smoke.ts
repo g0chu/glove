@@ -6327,6 +6327,55 @@ const ok = (name: string): void => {
     assert.ok(!html.includes(request.messages[0].content), "archived model text is never interpolated into HTML");
     const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1];
     new Script(script); // Check the actual browser script's syntax, including template escapes.
+    // Exercise the shipped browser renderer without a browser dependency.
+    class UiNode {
+      textContent = "";
+      children: UiNode[] = [];
+      open = false;
+      checked = true;
+      hidden = false;
+      value = "";
+      scrollTop = 0;
+      scrollHeight = 100;
+      clientHeight = 100;
+      className = "";
+      constructor(readonly tag = "div") {}
+      append(...nodes: UiNode[]): void { this.children.push(...nodes); }
+      replaceChildren(...nodes: UiNode[]): void { this.children = nodes; }
+      querySelectorAll(selector: string): UiNode[] {
+        return this.children.flatMap(n => [...(n.tag === selector ? [n] : []), ...n.querySelectorAll(selector)]);
+      }
+    }
+    const elements = new Map<string, UiNode>();
+    const element = (id: string): UiNode => {
+      if (!elements.has(id)) elements.set(id, new UiNode());
+      return elements.get(id)!;
+    };
+    const browser = {
+      document: { getElementById: element, createElement: (tag: string) => new UiNode(tag),
+        createTextNode: (text: string) => { const n = new UiNode(); n.textContent = text; return n; } },
+      fetch: () => new Promise(() => {}), setInterval: () => {}, setTimeout: () => {}, clearTimeout: () => {},
+    };
+    const partial = 'data: {"choices":[{"delta":{"reasoning_content":"Thinking", "tool_calls":[{"index":0,"id":"call-1","function":{"name":"web_search","arguments":"{\\\"q\\\": "}}]}}]}\n\n'
+      + 'data: {"choices":[{"delta":{"content":"Hello", "tool_calls":[{"index":0,"function":{"arguments":"\\\"cats\\\"}"}}]}}]}\n\n'
+      + 'data: {"choices":';
+    new Script(script + `
+      detail = { rawResponse: ${JSON.stringify(partial)}, events: [] };
+      outputView = 'readable'; renderOutput();
+    `).runInNewContext(browser);
+    const visibleText = (n: UiNode): string => n.textContent + n.children.map(visibleText).join(" ");
+    assert.ok(visibleText(element("output")).includes("Thinking"));
+    assert.ok(visibleText(element("output")).includes("Hello"));
+    assert.ok(visibleText(element("output")).includes("web_search"));
+    assert.ok(visibleText(element("output")).includes("cats"));
+    element("output").querySelectorAll("details")[0].open = false;
+    element("output").scrollTop = 15;
+    element("output").scrollHeight = 500;
+    new Script("renderOutput()").runInNewContext(browser);
+    assert.equal(element("output").querySelectorAll("details")[0].open, false);
+    assert.equal(element("output").scrollTop, 15, "stream refresh preserves the reader's position");
+    assert.ok(html.includes('id="live"') && html.includes('id="follow"'));
+
     assert.equal((await fetch(base + "/api/requests", { headers: { Origin: "https://untrusted.example" } })).status, 403);
     const forbiddenHost = await new Promise<number | undefined>((resolve, reject) => {
       http.get(base + "/api/requests", { headers: { Host: "untrusted.example" } }, response => {
@@ -6340,8 +6389,10 @@ const ok = (name: string): void => {
     let list = await (await fetch(base + "/api/requests")).json() as { items: { id: string; state: string }[]; next: number | null };
     assert.equal(list.items[0].state, "pending");
     const d = await (await fetch(base + "/api/requests/request-1")).json() as {
-      rawResponse: string; responseBase64: string; responseBytes: number; events: { type: string; data: unknown }[];
+      rawRequest: string; requestBytes: number; rawResponse: string; responseBase64: string; responseBytes: number; events: { type: string; data: unknown }[];
     };
+    assert.equal(d.rawRequest, JSON.stringify(request));
+    assert.equal(d.requestBytes, Buffer.byteLength(JSON.stringify(request)));
     assert.equal(d.rawResponse, raw.toString("utf8"));
     assert.deepEqual(Buffer.from(d.responseBase64, "base64"), raw, "downloads preserve exact bytes across split UTF-8 chunks");
     assert.equal(d.responseBytes, raw.length);

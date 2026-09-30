@@ -94,13 +94,16 @@ export class InteractionReader {
     if (!item) return null;
     const { records: _records, ...metadata } = item;
     const chunks: Buffer[] = [];
+    let requestBytes: Buffer | undefined;
     const events: { type: string; time: string; data: unknown }[] = [];
     for (const record of [...item.records]) {
-      const data = JSON.parse((await this.blob(record.data)).toString("utf8"));
+      const payload = await this.blob(record.data);
+      const data = JSON.parse(payload.toString("utf8"));
+      if (record.type === "model.request") requestBytes = payload;
       if (record.type === "model.bytes") chunks.push(await this.blob(data.blob));
       else events.push({ type: record.type, time: record.time, data });
     }
-    return { ...metadata, events, rawResponse: Buffer.concat(chunks).toString("utf8"),
+    return { ...metadata, events, rawRequest: requestBytes?.toString("utf8") ?? "", requestBytes: requestBytes?.length ?? 0, rawResponse: Buffer.concat(chunks).toString("utf8"),
       responseBase64: Buffer.concat(chunks).toString("base64"), responseBytes: chunks.reduce((n, chunk) => n + chunk.length, 0) };
   }
 }
