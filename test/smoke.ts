@@ -2480,6 +2480,37 @@ const ok = (name: string): void => {
   ok("queue: newestPendingMentionAfter reports the newer pending mention turn that supersedes an interrupted turn");
 }
 
+// Duplicate deliveries and already-covered triggers must not create another reply.
+{
+  let release!: () => void;
+  const turns: string[] = [];
+  const queue = new ChannelQueue("dedup", {
+    runTurn: async (_channel, turn) => {
+      turns.push(turn.id);
+      if (turn.id === "1") await new Promise<void>((resolve) => { release = resolve; });
+    },
+  });
+  queue.push({ id: "1", chime: false });
+  queue.push({ id: "1", chime: false });
+  queue.push({ id: "2", chime: true });
+  queue.push({ id: "3", chime: false });
+  queue.push({ id: "4", chime: false });
+  queue.push({ id: "3", chime: false });
+  assert.equal(queue.size, 3, "active and pending duplicate IDs cannot queue another turn");
+  assert.equal(queue.newestPendingMentionAfter("1", (id) => id !== "4"), "3", "a deleted newest trigger cannot mask a valid newer mention");
+  queue.discardCovered(["1", "2", "3"]);
+  queue.push({ id: "5", chime: true });
+  release();
+  await ticks(5);
+  assert.deepEqual(turns, ["1", "4", "5"], "covered triggers are removed while messages outside the answered prompt survive");
+  queue.push({ id: "1", chime: false });
+  queue.push({ id: "3", chime: false });
+  queue.push({ id: "4", chime: false });
+  await ticks(3);
+  assert.deepEqual(turns, ["1", "4", "5"], "completed and covered triggers stay deduplicated after the queue drains");
+  ok("queue: duplicate triggers, covered messages and deleted superseding mentions cannot produce redundant replies");
+}
+
 // --------------------------------------------------------------- writer --
 {
   interface FakeMessage {
@@ -4660,17 +4691,19 @@ const ok = (name: string): void => {
         return;
       }
       if (url.includes("tokenhold")) {
-        // Prefill ends after ONE token: the content delta arrives, then the
-        // stream pauses (the generation an abort may not cut) and completes
-        // — an abort after the first token must be ignored, and the
-        // request resolves with what was generated.
+        // Keep the stream open after reply text until the activity signal aborts it.
         res.writeHead(200, { "Content-Type": "text/event-stream" });
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "start" } }] })}\n\n`);
-        setTimeout(() => {
-          res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: " end" } }] })}\n\n`);
-          res.write("data: [DONE]\n\n");
-          res.end();
-        }, 200);
+        return;
+      }
+      if (url.includes("reasonhold")) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "thinking" } }] })}\n\n`);
+        return;
+      }
+      if (url.includes("toolhold")) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "partial", function: { name: "write", arguments: "{" } }] } }] })}\n\n`);
         return;
       }
       if (url.includes("hold")) {
@@ -5021,32 +5054,23 @@ const ok = (name: string): void => {
   }
   ok("llm: the caller's signal interrupts prefill (InterruptedError, not a timeout)");
 
-  // Once generation has started (the first token arrived), the signal is
-  // ignored: reasoning, tool calls and the response run to completion and
-  // the request RESOLVES with what was generated.
-  {
-    const tokenClient = new LlmClient({
-      apiUrl: `${base}/v1/tokenhold`,
-      apiKey: "none",
-      model: "local",
-      stream: true,
-      timeoutMs: 5000,
-    });
-    const gen = new AbortController();
-    let resolveDelta: () => void = () => {};
-    const deltaArrived = new Promise<void>((r) => (resolveDelta = r));
-    const p = tokenClient.chat(
-      [{ role: "user", content: "gen" }],
-      { onDelta: () => resolveDelta() },
-      undefined,
-      gen.signal,
-    );
-    await deltaArrived;
-    gen.abort(); // the first token has arrived: this must be ignored
-    const res = await p;
-    assert.equal(res.content, "start end", "the generation ran to completion despite the abort");
+  // Ordinary activity interrupts both reasoning and reply generation promptly.
+  for (const phase of ["reasonhold", "tokenhold", "toolhold"] as const) {
+    const client = new LlmClient({ apiUrl: `${base}/v1/${phase}`, apiKey: "none", model: "local", stream: true, timeoutMs: 5000 });
+    const activity = new AbortController();
+    let arrived!: () => void;
+    const received = new Promise<void>((resolve) => { arrived = resolve; });
+    const pending = client.chat([{ role: "user", content: "old context" }], {
+      onDelta: () => { arrived(); },
+      onReasoning: () => { arrived(); },
+      onResponseBytes: () => { if (phase === "toolhold") arrived(); },
+    }, undefined, activity.signal);
+    await received;
+    activity.abort();
+    await assert.rejects(pending, InterruptedError);
+    await assert.rejects(client.chat([], undefined, undefined, activity.signal), InterruptedError);
   }
-  ok("llm: an abort after the first token is ignored (the generation runs to completion)");
+  ok("llm: ordinary activity interrupts reasoning, reply text and tool fragments without returning partial results");
 
   {
     const mention = new AbortController();
@@ -6157,6 +6181,63 @@ const ok = (name: string): void => {
     assert.deepEqual(restored.get("trimmed").snapshot().map((entry) => entry.role), ["user"], "recovery cannot resurrect a deliberately trimmed exchange");
     assert.equal(recoverTurns(archive, restored), 0);
     ok("chime history: crash recovery restores NO decisions once with or without their atomic checkpoint");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// A fresh prompt after tool-time activity continues from saved results without replay.
+{
+  const context = new ChannelContext();
+  context.pushUser("Alice", "write", "trigger", 1, []);
+  const activity = new AbortController();
+  let executions = 0;
+  const registry = new ToolRegistry().register({ name: "write", description: "", parameters: {} }, async () => {
+    executions++;
+    context.pushUser("Bob", "new context", "new", 2, []);
+    activity.abort();
+    return "saved exactly once";
+  });
+  const rounds: ToolRound[] = [];
+  await assert.rejects(runToolTurn([{ role: "user", content: "Alice: write" }], {
+    registry, maxRounds: 2, signal: activity.signal, interruptSignal: activity.signal,
+    chat: async () => ({ content: "writing", toolCalls: [{ id: "write", name: "write", arguments: "{}" }] }),
+    onRoundComplete: (round) => { rounds.push(round); },
+  }), /completed tool results were retained/);
+  recordTurn("turn:attempt:0", context, rounds, [null], null);
+  const messages = await contextToMessages(context, { systemPrompt: "", maxMessages: 10, enableImages: false,
+    imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024 });
+  const outcome = await runToolTurn(messages, { registry, maxRounds: 1, chat: async (updated) => {
+    assert.ok(updated.some((entry) => entry.content === "Bob: new context"));
+    assert.ok(updated.some((entry) => entry.role === "tool" && entry.content === "saved exactly once"));
+    return { content: "updated answer", toolCalls: [] };
+  } });
+  assert.equal(outcome.content, "updated answer");
+  assert.equal(executions, 1);
+  ok("activity: updated prompts continue from retained tool results without executing the old calls again");
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-retained-attempt-"));
+  const archive = new ConversationArchive(dir);
+  try {
+    const store = new ChannelContextStore();
+    const context = store.get("c");
+    context.pushUser("Alice", "write", "trigger", 1, []);
+    const scope = { channelId: "c", turnId: "turn", messageId: "trigger", attempt: 0, round: 0, purpose: "reply" as const };
+    archive.record("turn.started", scope, {});
+    const call = { id: "w", name: "write", arguments: "{}" };
+    archive.record("reply.accepted", scope, { content: "writing", toolCalls: [call] });
+    const observer = archiveTools(archive, scope);
+    observer.started(call, 0);
+    const result = { role: "tool" as const, name: "write", toolCallId: "w", content: "saved" };
+    observer.finished(result, 0);
+    recordTurn("turn:attempt:0", context, [{ content: "writing", calls: [call], results: [result] }], [null], null);
+    archive.record("context.checkpoint", { channelId: "c" }, context.serialize());
+    archive.record("reply.accepted", { ...scope, attempt: 1 }, { content: "fresh final", toolCalls: [] });
+    assert.equal(recoverTurns(archive, store), 1);
+    assert.equal(context.snapshot().filter((entry) => entry.role === "tool").length, 1, "recovery skips tool rounds checkpointed by an earlier attempt");
+    assert.equal(context.snapshot().at(-1)!.content, "fresh final");
+    assert.equal(recoverTurns(archive, store), 0);
+    ok("archive: continuing an interrupted turn cannot duplicate retained rounds during recovery");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 

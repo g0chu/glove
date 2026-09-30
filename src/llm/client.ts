@@ -90,7 +90,7 @@ export interface ToolSpec {
 
 /** Per-call controls; ordinary replies retain the endpoint defaults. */
 export interface ChatRequestOptions {
-  /** Human mentions cancel even after reasoning or response generation starts. */
+  /** Additional cancellation signal, effective in every response phase. */
   interruptSignal?: AbortSignal;
   toolChoice?: "auto" | "required";
   /** Maximum generated tokens for this call, including reasoning at compatible endpoints. */
@@ -221,7 +221,7 @@ function isAbortError(err: unknown): boolean {
 /**
  * A model request aborted by the caller's signal — the channel-activity
  * interruption (index.ts): the channel changed (a new message, an edit, a
- * typing indicator) while the prompt was being processed, so the in-flight
+ * typing indicator, or deletion) during any model phase, so the in-flight
  * request is cancelled on purpose. Distinct from the request's own timeout
  * (which reports "timed out"): the turn catches it and waits for the
  * channel to go quiet, then discards the turn when a newer turn supersedes
@@ -231,7 +231,7 @@ function isAbortError(err: unknown): boolean {
  */
 export class InterruptedError extends Error {
   constructor() {
-    super("model request interrupted (the channel changed while the prompt was being processed)");
+    super("model request interrupted (the channel changed)");
     this.name = "InterruptedError";
   }
 }
@@ -312,13 +312,9 @@ export class LlmClient {
    * callbacks as they arrive. When `tools` is provided (and non-empty), it
    * is sent with `tool_choice: "auto"` and the result may carry `toolCalls`
    * instead of (or alongside) content. When `signal` is provided, aborting
-   * it cancels the request while the PROMPT is still being processed (before
-   * the model's first token) — the channel-activity interruption (see
-   * InterruptedError), reported as an InterruptedError, never a timeout.
-   * Once generation has started (for a streamed request, the first
-   * content/reasoning/tool-call delta), the request runs to completion
-   * regardless of the signal: reasoning, tool calls and the response are
-   * never cut off mid-flight.
+   * it cancels prompt processing, reasoning and reply generation alike,
+   * reported as an InterruptedError, never a timeout. Partial responses
+   * are not returned as completed results.
    */
   async chat(
     messages: ChatMessage[],
@@ -337,18 +333,11 @@ export class LlmClient {
     const controller = new AbortController();
     this.active.add(controller);
     const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
-    // The caller's signal aborts the request while the prompt is still being
-    // processed (the channel-activity interruption): the fetch/stream
-    // cancels at once instead of running to the timeout. Once the model has
-    // started generating (phase.generating, set by readSse on the first
-    // token), the signal is ignored — the generation runs to completion.
-    // Non-stream requests stay interruptable throughout: their single
-    // response IS the generation, and it has only happened once the body
-    // arrives, which the client cannot observe in advance.
+    // Channel activity cancels every phase, including streamed reasoning,
+    // reply text and tool-call fragments. Generation state is diagnostic only.
     const phase = { generating: false };
     let callerAborted = false;
     const onCallerAbort = (): void => {
-      if (phase.generating) return;
       callerAborted = true;
       controller.abort();
     };
@@ -361,14 +350,13 @@ export class LlmClient {
     try {
       const res = await this.request(messages, tools, controller, options, cbs);
       const result = this.opts.stream
-        ? await this.readSse(res, cbs, phase)
+        ? await this.readSse(res, cbs, phase, controller.signal)
         : await this.readJson(res, cbs);
       if (callerAborted) throw new InterruptedError();
       return result;
     } catch (err) {
       if (callerAborted) {
-        // The caller's signal fired while the prompt was still being
-        // processed (the channel-activity interruption): the request was
+        // Channel activity cancelled the request in any response phase; it was
         // cancelled on purpose, whatever the underlying abort error is.
         throw new InterruptedError();
       }
@@ -482,7 +470,7 @@ export class LlmClient {
     }
   }
 
-  private async readSse(res: Response, callbacks: StreamCallbacks, phase: { generating: boolean }): Promise<ChatResult> {
+  private async readSse(res: Response, callbacks: StreamCallbacks, phase: { generating: boolean }, signal: AbortSignal): Promise<ChatResult> {
     const body = res.body;
     if (!body) throw new Error("malformed model response: empty body");
     const reader = body.getReader();
@@ -511,6 +499,7 @@ export class LlmClient {
       buffer += decoder.decode(value, { stream: true });
       let nl: number;
       while ((nl = buffer.indexOf("\n")) >= 0) {
+        if (signal.aborted) throw new DOMException("model request aborted", "AbortError");
         const line = buffer.slice(0, nl).trimEnd();
         buffer = buffer.slice(nl + 1);
         if (!line.startsWith("data:")) continue; // skip comments / other fields
@@ -537,14 +526,16 @@ export class LlmClient {
         if (delta && typeof delta === "object") {
           const content = delta.content;
           if (typeof content === "string" && content.length > 0) {
-            phase.generating = true; // first token: the request is no longer interruptible
+            phase.generating = true; // generation state is used only for timeout diagnostics
             full += content;
             callbacks.onDelta?.(content);
+            if (signal.aborted) throw new DOMException("model request aborted", "AbortError");
           }
           const reasoning = reasoningOf(delta);
           if (reasoning.length > 0) {
-            phase.generating = true; // first token: the request is no longer interruptible
+            phase.generating = true; // generation state is used only for timeout diagnostics
             callbacks.onReasoning?.(reasoning);
+            if (signal.aborted) throw new DOMException("model request aborted", "AbortError");
             fullReasoning += reasoning;
           }
           for (const tc of delta.tool_calls ?? []) {
@@ -564,7 +555,7 @@ export class LlmClient {
                 acc.arguments += JSON.stringify(fn.arguments);
               }
             }
-            phase.generating = true; // first token: the request is no longer interruptible
+            phase.generating = true; // generation state is used only for timeout diagnostics
             calls.set(idx, acc);
           }
         }

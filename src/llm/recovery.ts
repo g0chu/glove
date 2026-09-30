@@ -53,6 +53,7 @@ export function recoverTurns(archive: ConversationArchive, contexts: ChannelCont
     // Legacy reply records remain recoverable; raw candidates stay archived.
     const models = rows.filter((r) => (r.type === "model.finished" || r.type === "reply.accepted") && r.scope.purpose === "reply");
     for (const model of models) {
+      if (archive.hasRecordedTurn(`${turnId}:attempt:${model.scope.attempt}`)) continue;
       const result = archive.readData<ChatResult>(model);
       const sameRound = rows.filter((r) => r.scope.attempt === model.scope.attempt && r.scope.round === model.scope.round);
       if (result.toolCalls.length === 0) {

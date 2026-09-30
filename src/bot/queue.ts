@@ -31,7 +31,8 @@ export interface QueueDeps {
  * mentions (which always respond) and, with chime enabled, every other
  * non-mention message (which the model may decline). Semantics:
  *  - one turn (trigger -> model reply) at a time;
- *  - turns arriving while one is in flight are queued, not dropped;
+ *  - duplicate trigger IDs are ignored, including completed triggers;
+ *  - queued triggers included in a delivered answer can be discarded;
  *  - turns run in arrival order;
  *  - without chime, ambient (non-mention) messages never trigger a turn;
  *  - a trigger whose message left the channel context (deleted) before its
@@ -40,6 +41,7 @@ export interface QueueDeps {
 export class ChannelQueue {
   private pending: TurnRequest[] = [];
   private pumping = false;
+  private readonly requested = new Set<string>();
 
   constructor(
     private readonly channelId: string,
@@ -59,20 +61,29 @@ export class ChannelQueue {
    * that carries everything, so it is the one that answers the channel's
    * newest information. Chime turns never supersede a mention (their
    * decision may stay silent), and a turn whose trigger left the context
-   * will be skipped, so the caller double-checks the id against the context.
+   * will be skipped; `exists` lets callers exclude removed triggers.
    */
-  newestPendingMentionAfter(id: string): string | null {
+  newestPendingMentionAfter(id: string, exists: (id: string) => boolean = () => true): string | null {
     let found: string | null = null;
     for (const t of this.pending) {
-      if (!t.chime && compareDiscordIds(t.id, id) > 0) found = t.id;
+      if (!t.chime && exists(t.id) && compareDiscordIds(t.id, id) > 0 &&
+        (found === null || compareDiscordIds(t.id, found) > 0)) found = t.id;
     }
     return found;
   }
 
-  /** Queue a turn to run, in arrival order. */
+  /** Queue a previously unseen trigger, in arrival order. */
   push(request: TurnRequest): void {
+    if (this.requested.has(request.id)) return;
+    this.requested.add(request.id);
     this.pending.push(request);
     void this.pump();
+  }
+
+  /** Drop queued triggers already included in a successfully delivered answer. */
+  discardCovered(ids: Iterable<string>): void {
+    const covered = new Set(ids);
+    this.pending = this.pending.filter((turn) => !covered.has(turn.id));
   }
 
   private async pump(): Promise<void> {

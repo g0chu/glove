@@ -232,16 +232,8 @@ async function main(): Promise<void> {
     }
   };
 
-  // The per-channel chat-activity tracker: a running turn's in-flight model
-  // request is aborted on any change in the channel (a new message, an edit,
-  // a typing indicator) while its PROMPT is still being processed — once the
-  // model's first token has arrived (reasoning, a tool call, or the
-  // response), the generation runs to completion and the interruption only
-  // dooms the next model call, before its prompt is sent — and after the
-  // interruption the turn waits for the channel to go quiet (no activity
-  // for DISCORD_MESSAGE_STABLE_MS) before retrying with the updated context
-  // (see runTurn). A chime turn also waits for that stillness before
-  // deciding at all (see runTurn).
+  // Other users' and bots' activity cancels every model phase. Retrying
+  // waits for stillness and rebuilds the conversation from a fresh snapshot.
   const channelActivity = new ChannelActivity();
 
   /**
@@ -253,27 +245,16 @@ async function main(): Promise<void> {
    * part of the context, so edits that happened while the turn was queued
    * are picked up automatically.
    *
-   * The turn runs in attempts. While an attempt is running, any change in
-   * the channel (a new message, an edit, a typing indicator — the bot's own
-   * posts and typing never count) interrupts it: the attempt's in-flight
-   * model request is aborted while its prompt is still being processed
-   * (before the model's first token — reasoning, tool calls and response
-   * generation are never cut off mid-flight, so an activity during a tool
-   * execution or a running generation interrupts the NEXT model call,
-   * before its prompt is sent; the partial reply of a pre-first-token
-   * interruption is withdrawn, its thinking line kept), the turn then waits
-   * for the channel to go quiet (no activity for DISCORD_MESSAGE_STABLE_MS),
-   * and the interrupted turn is judged: superseded (a newer turn will answer
-   * the channel — any newer committed message for a chime decision, a newer
-   * pending mention turn for a mention) it is DISCARDED — never completed
-   * later, nothing recorded — so the model responds to the newest
-   * information through the newer turn's own reply; not superseded (an edit
-   * or a typing indicator interrupted the attempt, so nothing else will
-   * answer) it retries with a freshly built context, which carries
-   * everything that arrived or changed while it waited, so the new prompt is
-   * sent with the new information. An interrupted attempt records nothing
-   * either way before tools execute. Once tools have executed, a failed
-   * continuation stops and records their results instead of retrying.
+   * The turn runs in attempts. Messages, edits, deletions and typing from
+   * other users/bots cancel prompt processing, reasoning and reply text.
+   * The partial reply is withdrawn. Completed tool rounds are checkpointed
+   * under a durable attempt identity, then the turn waits for stillness.
+   * A newer queued mention supersedes an older mention; a newer committed
+   * user entry supersedes a chime. Otherwise a fresh attempt sees updated
+   * context and completed tool results without replaying earlier rounds.
+   * Completed rounds remain counted against the turn's tool budget.
+   * Successfully delivered answers consume queued triggers included in their
+   * prompt, preventing another answer over those same messages.
    *
    * A chime turn decides over a still conversation: before the decision it
    * waits for complete stillness (no activity for DISCORD_MESSAGE_STABLE_MS,
@@ -319,6 +300,7 @@ async function main(): Promise<void> {
     // One token account for the whole turn: interrupted attempts consumed
     // real tokens too, so their model calls count in the turn's report.
     const tokens = new TurnTokens();
+    let retainedToolRounds = 0;
 
     try {
       for (let attempt = 0; ; attempt++) {
@@ -327,7 +309,7 @@ async function main(): Promise<void> {
         const callModel: ChatFn = (msgs, cbs, t, signal, options) => {
           if (stopping) throw new Error("bot is shutting down");
           if (attemptController.signal.aborted) throw new InterruptedError();
-          return llm.chat(msgs, cbs, t, signal, { ...options, interruptSignal: signal ? mentionController.signal : undefined });
+          return llm.chat(msgs, cbs, t, signal, options);
         };
         // Per-attempt state: a fresh writer (a previous attempt's partial
         // reply has been withdrawn), a fresh activity poster, a fresh round
@@ -339,10 +321,7 @@ async function main(): Promise<void> {
           throttleMs: cfg.discord.streamUpdateThrottleMs,
         });
         const attemptController = new AbortController();
-        // Human mentions override the ordinary prefill-only activity signal.
-        const mentionController = new AbortController();
-        const unwatch = channelActivity.watch(channelId, (mention) => {
-          if (mention) mentionController.abort();
+        const unwatch = channelActivity.watch(channelId, () => {
           attemptController.abort();
         });
         // Every model call of the attempt goes through a tracked wrapper so
@@ -352,12 +331,9 @@ async function main(): Promise<void> {
         // for the next compaction check. The reply rounds stream into
         // the writer; the compaction summarizer and the chime decision use
         // a plain wrapper on the same account (their text is never posted).
-        // The attempt's abort signal rides along: channel activity aborts
-        // the in-flight call while its prompt is still being processed
-        // (after the first token the call runs to completion) and dooms the
-        // next one (it fails at once at the entry check). The compaction
-        // summarizer shares the signal; interrupted compaction propagates
-        // without falling into the emergency-trim path.
+        // Channel activity cancels prompt processing, reasoning and reply
+        // generation. Completed tools are retained before a fresh attempt
+        // rebuilds the conversation; unstarted tools are skipped.
         const sharedTools = cfg.discord.chimeEnabled ? chimeTools(tools.registry.specs()) : tools.registry.specs();
         const measuredReplyChat: ChatFn = tokens.track(
           (msgs, _cbs, t, signal, options) =>
@@ -475,6 +451,12 @@ async function main(): Promise<void> {
             log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
             return;
           }
+          const newerMention = queues.get(channelId).newestPendingMentionAfter(turn.id, (id) => context.has(id));
+          if (!turn.chime && newerMention !== null) {
+            log.info(`channel ${channelId}: mention ${turn.id} superseded by ${newerMention}; the newer turn answers the full context`);
+            return;
+          }
+          let coveredIds = context.snapshot().filter((entry) => entry.role === "user").flatMap((entry) => entry.ids);
           if (turn.chime) {
             // A message that committed while the turn waited for stillness
             // (or while the context was being built) supersedes this chime:
@@ -562,6 +544,7 @@ async function main(): Promise<void> {
               }
               try {
                 messages = rebuilt;
+                coveredIds = context.snapshot().filter((entry) => entry.role === "user").flatMap((entry) => entry.ids);
                 decision = await decisionOver(messages);
               } catch (err2) {
                 if (isInterruptedError(err2)) throw err2;
@@ -589,9 +572,9 @@ async function main(): Promise<void> {
             runToolTurn(msgs, {
               chat: replyChat,
               registry: tools.registry,
-              maxRounds: cfg.tools.maxRounds,
+              maxRounds: Math.max(0, cfg.tools.maxRounds - retainedToolRounds),
               signal: attemptController.signal,
-              interruptSignal: mentionController.signal,
+              interruptSignal: attemptController.signal,
               observeTools: (round) => {
                 if (stopping) throw new Error("bot is shutting down");
                 return archiveTools(archive, { ...scope, round });
@@ -653,6 +636,7 @@ async function main(): Promise<void> {
               log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
               return;
             }
+            coveredIds = context.snapshot().filter((entry) => entry.role === "user").flatMap((entry) => entry.ids);
             outcome = await runModel(rebuilt);
           }
           if (outcome.toolRounds > 0) {
@@ -662,25 +646,23 @@ async function main(): Promise<void> {
             outcome.exhausted && outcome.content.trim() === ""
               ? "*(stopped: the model kept requesting tools past the round limit)*"
               : outcome.content;
+          if (attemptController.signal.aborted) throw new InterruptedError();
           const posted = await writer.finish(finalText);
           archive.record("discord.delivery", scope, { posted, raw: finalText, reasoning: outcome.reasoning });
           if (context.has(turn.id)) recordTurn(turnId, context, rounds, roundSettled, posted, outcome.reasoning, finalText);
+          if (posted && finalText.trim() && !outcome.exhausted) queues.get(channelId).discardCovered(coveredIds);
           break; // the attempt completed: the turn is done
         } catch (err) {
-          if (isInterruptedError(err)) {
-            // The channel changed (a new message, an edit, a typing
-            // indicator) while the attempt's prompt was still being
-            // processed — the interruption lands before the model's first
-            // token for ordinary activity, or during generation for a
-            // human mention: the abort
-            // already happened (this error is its trace). Withdraw the
-            // partial reply (the thinking line is kept in the channel, like
-            // a finished round's) and wait for the channel to go quiet — no
-            // activity for the stability window, the window restarting on
-            // every new change — so that every message that arrived or
-            // changed while the attempt was interrupted has committed (and
-            // queued its own turn, when it queues one) before the
-            // interrupted turn is judged.
+          if (isInterruptedError(err) || (attemptController.signal.aborted && rounds.length > 0)) {
+            // Persist completed work before rebuilding; the next attempt sees
+            // these results and can continue without replaying executed tools.
+            if (rounds.length > 0 && context.has(turn.id)) {
+              recordTurn(`${turnId}:attempt:${attempt}`, context, rounds, roundSettled, null);
+              retainedToolRounds += rounds.length;
+            }
+            // Withdraw partial reply text and wait for every pending message
+            // to stabilize before deciding whether a newer turn supersedes
+            // this one or it should continue over freshly built context.
             log.info(
               `turn in ${channelId}: interrupted by channel activity (attempt ${attempt + 1}); waiting for the channel to go quiet (${cfg.discord.messageStableMs}ms)`,
             );
@@ -695,7 +677,7 @@ async function main(): Promise<void> {
             // The interrupted turn's fate — it is never completed later as a
             // stale turn; the model responds to the newest information
             // through the turn that answers the channel's newest state:
-            //   superseded -> discarded (nothing recorded). A chime turn is
+            //   superseded -> discarded (completed work is retained). A chime turn is
             //   superseded by any newer committed user entry (the newer
             //   message's own turn decides over the still conversation); a
             //   mention turn by a newer pending mention turn (it always
@@ -709,7 +691,7 @@ async function main(): Promise<void> {
             //   everything that arrived or changed while we waited.
             const supersededBy = turn.chime
               ? context.newestUserEntryAfter(turn.id)
-              : queues.get(channelId).newestPendingMentionAfter(turn.id);
+              : queues.get(channelId).newestPendingMentionAfter(turn.id, (id) => context.has(id));
             if (supersededBy !== null && context.has(supersededBy)) {
               log.info(
                 `turn in ${channelId}: superseded by a newer ${turn.chime ? "message" : "mention"} (${supersededBy}) while the attempt was interrupted; discarding the turn — the newer turn responds to the newest information`,
@@ -720,12 +702,6 @@ async function main(): Promise<void> {
               `turn in ${channelId}: no newer turn supersedes it; retrying with a freshly built context (attempt ${attempt + 2})`,
             );
             continue; // next attempt: a fresh context, a fresh prompt
-          }
-          if (mentionController.signal.aborted && rounds.length > 0) {
-            await writer.interrupt();
-            if (context.has(turn.id)) recordTurn(turnId, context, rounds, roundSettled, null);
-            await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
-            break;
           }
           log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
           const posted = await writer.reportError(err);
@@ -806,7 +782,7 @@ async function main(): Promise<void> {
       // The startup seed raced the stabilization: the message is already in
       // the context (with the content the API saw at seed time), so refresh
       // it in place instead of appending a duplicate entry.
-      ctx.updateContent(message.id, content);
+      syncMessageUpdate(ctx, message, botId, botUser.username);
     } else {
       ctx.pushUser(
         name,
@@ -933,7 +909,7 @@ async function main(): Promise<void> {
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
     gate.arrive(message);
     // A new message is a change in the channel: it interrupts a running
-    // turn's prompt processing and restarts its quiet wait (see
+    // turn's model request and restarts its quiet wait (see
     // ChannelActivity).
     const channelId = message.channel?.id;
     if (channelId) channelActivity.note(channelId, !message.author.bot && isMentionOf(message, botId));
@@ -967,12 +943,13 @@ async function main(): Promise<void> {
       if (conv) syncMessageUpdate(conv, message, botId, botUser.username);
     }
     // An edit is a change in the channel: it interrupts a running turn's
-    // prompt processing and restarts its quiet wait (see ChannelActivity).
+    // model request and restarts its quiet wait (see ChannelActivity).
     // The note comes after the gate refresh, so a still-pending message
     // commits a hair before the quiet wait can resolve — the retry's
     // context carries it.
-    if (isTrackable(message, botId, cfg.discord.guildId)) {
-      channelActivity.note(channelId, gate.isPending(message.id) && !message.author.bot && isMentionOf(message, botId));
+    if (message.channel.type === ChannelType.GuildText &&
+      (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId) && message.author?.id !== botId) {
+      channelActivity.note(channelId, gate.isPending(message.id) && !!message.author && !message.author.bot && isMentionOf(message, botId));
     }
   });
 

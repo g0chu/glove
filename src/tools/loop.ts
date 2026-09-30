@@ -48,26 +48,14 @@ export interface ToolTurnDeps {
   /** Max number of tool-execution rounds before the turn is cut off. */
   maxRounds: number;
   /**
-   * When provided, it is passed to every model call of the turn, so the
-   * caller can interrupt the turn on channel activity (see index.ts). Only
-   * the PROMPT processing of a model call is interruptable: a signal aborted
-   * while the prompt is still being processed cancels the request at once,
-   * and an already-aborted signal makes the next call fail at once with the
-   * client's interruption error — both before the model's first token. Once
-   * generation has started (reasoning, tool calls, the response) the request
-   * runs to completion regardless of the signal, so activity during a tool
-   * execution interrupts the NEXT model call, before its prompt is sent.
-   * The caller turns the interruption error into a quiet-wait, after which
-   * the turn is discarded (a newer turn supersedes it) or retried with a
-   * freshly built context that carries everything that arrived while it
-   * waited. Tool calls that are already executing run to completion (they
-   * have their own deadlines); only not-yet-started prompt processing is
-   * aborted. After any executed round, interruption or overflow instead
-   * becomes an ordinary failure: the caller retains the rounds and stops,
-   * preventing automatic replay of side effects.
+   * Passed to every model call: channel activity cancels prompt processing,
+   * reasoning and reply text. Running tools finish with their own deadlines.
+   * After an executed round, interruption/overflow becomes an ordinary error
+   * so callers cannot blindly replay the turn. The bot checkpoints completed
+   * rounds on activity, then rebuilds from that history for a fresh attempt.
    */
   signal?: AbortSignal;
-  /** Stop generation and skip tools that have not started after a human mention. */
+  /** Skip tools that have not started after channel activity. */
   interruptSignal?: AbortSignal;
   /**
    * Called right after a response that contains tool calls is fully
@@ -115,7 +103,7 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
   let toolRounds = 0;
   const checkMention = (): void => {
     if (!deps.interruptSignal?.aborted) return;
-    if (toolRounds > 0) throw new Error("stopped after tools executed because a new mention arrived; completed tool results were retained");
+    if (toolRounds > 0) throw new Error("stopped after tools executed because channel activity arrived; completed tool results were retained");
     throw new InterruptedError();
   };
   for (;;) {
