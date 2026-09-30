@@ -39,15 +39,16 @@ import { ChannelActivity } from "../src/bot/quiet.js";
 import { chimeReplyChat } from "../src/bot/chime-reply.js";
 import { chimeTools, CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
 import { InterruptedError, isInterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
-import { LlamaMetrics, TurnTokens, deriveCompactionBudget } from "../src/llm/metrics.js";
+import { LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
+import { recordTurn } from "../src/bot/turn-record.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
 import { buildChannelContext, contextToMessages, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
-import { runToolTurn } from "../src/tools/loop.js";
+import { runToolTurn, type ToolRound } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
 import { buildTools } from "../src/tools/index.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
@@ -707,7 +708,7 @@ const ok = (name: string): void => {
   assert.equal(await decideChime(async () => ({ content: "NO chatter", toolCalls: [{ id: "t", name: "chime", arguments: "broken" }] }), transcript), null);
   ok("chime: unrelated tools, reasoning and text beside broken arguments never decide");
 
-  // The normal request shares schemas; a broken decision gets a required, chime-only repair.
+  // Repairs preserve both the schema prefix and tool choice.
   for (const first of ["empty", "invalid", "multiple", "unrelated"] as const) {
     const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string; maxTokens?: number }> = [];
     const recovered = await decideChime(async (messages, tools, signal, options) => {
@@ -726,8 +727,8 @@ const ok = (name: string): void => {
     assert.deepEqual(recovered, { respond: false, reason: "chatter" });
     assert.equal(requests.length, 2);
     assert.equal(requests[0].choice, "auto");
-    assert.deepEqual(requests[1].tools, [CHIME_TOOL_SPEC]);
-    assert.equal(requests[1].choice, "required");
+    assert.deepEqual(requests[1].tools, requests[0].tools);
+    assert.equal(requests[1].choice, "auto");
     assert.equal(requests[0].maxTokens, CHIME_MAX_TOKENS);
     assert.equal(requests[1].maxTokens, CHIME_MAX_TOKENS, "repair also bounds generation");
     assert.deepEqual(requests[1].messages.slice(0, -1), requests[0].messages, "repair preserves the message prefix");
@@ -845,7 +846,7 @@ const ok = (name: string): void => {
         return { content: "", toolCalls: mixed ? [decision, write] : [decision], usage: { input: 10, output: 2 } };
       }
       if (!mixed && requests === 2) {
-        assert.deepEqual(tools, registry.specs(), "repair hides the virtual tool");
+        assert.deepEqual(tools, chimeTools(registry.specs()), "repair preserves the schema prefix");
         assert.deepEqual(msgs.slice(0, -1), trigger);
         return { content: "", toolCalls: [write], usage: { input: 10, output: 2 } };
       }
@@ -5232,6 +5233,32 @@ const ok = (name: string): void => {
   assert.equal(recoveryRequests[0].max_tokens, CHIME_MAX_TOKENS);
   ok("chime: real HTTP tool rejection stays silent without a text fallback");
 
+
+  const prefixMessages: ChatMessage[] = [
+    { role: "system", content: "  Verbatim master\n  " },
+    { role: "user", content: "Alice: continue" },
+    { role: "assistant", content: "  $x^2$  ", reasoningContent: "original reasoning", toolCalls: [{ id: "p", name: "echo", arguments: "{}" }] },
+    { role: "tool", name: "echo", toolCallId: "p", content: "4" },
+  ];
+  const prefixTools = [{ name: "echo", description: "echo", parameters: { type: "object", properties: {} } }];
+  const prefixStart = seenRequests.length;
+  const wireChat: ChatFn = (...args) => nsClient.chat(...args);
+  // This mock returns plain text, so the decision exercises its repair too.
+  await decideChime((messages, tools, signal, options) => wireChat(messages, undefined, tools, signal, options),
+    prefixMessages, undefined, undefined, undefined, undefined, chimeTools(prefixTools));
+  await chimeReplyChat(wireChat)(prefixMessages, undefined, prefixTools);
+  const prefixBodies = seenRequests.slice(prefixStart).map((r) => r.body as Record<string, unknown>);
+  assert.equal(prefixBodies.length, 3);
+  const replyBody = prefixBodies[2];
+  for (const body of prefixBodies) {
+    assert.deepEqual(body.tools, replyBody.tools, "schema identity holds through actual HTTP serialization");
+    assert.equal(body.tool_choice, "auto");
+    assert.equal(Object.hasOwn(body, "cache_prompt"), false);
+    assert.deepEqual((body.messages as unknown[]).slice(0, prefixMessages.length), replyBody.messages,
+      "decision, repair and reply preserve the exact serialized conversation prefix");
+  }
+  ok("prompt prefix: real HTTP decision, repair and reply retain identical schemas, choice and conversation bytes");
+
   server.close();
 }
 
@@ -5370,13 +5397,15 @@ const ok = (name: string): void => {
     for (let i = 1; i <= 4; i++) context.pushUser("User", "old text ".repeat(20), String(i), i, []);
     let resolve!: (text: string) => void;
     let reject!: (err: Error) => void;
+    let started!: () => void;
+    const summarizing = new Promise<void>((resolve) => { started = resolve; });
     const pending = buildChannelContext({} as GuildTextBasedChannel, context, "4", {
       botId: "bot", botName: "Bot", systemPrompt: "", maxMessages: 20,
       enableImages: false, imagesMaxBytes: 1024, enableFileContents: false,
       fileContentsMaxBytes: 1024, maxTokens: 1, keepMessages: 1,
-      summarize: () => new Promise<string>((yes, no) => { resolve = yes; reject = no; }),
+      summarize: () => new Promise<string>((yes, no) => { resolve = yes; reject = no; started(); }),
     });
-    await ticks();
+    await summarizing;
     if (mutation === "clear") {
       context.reset();
       context.pushUser("User", "new conversation", "5", 5, []);
@@ -5881,6 +5910,200 @@ const ok = (name: string): void => {
     assert.equal(fs.readFileSync(path.join(parent, "chats.json"), "utf8"), "working context");
     ok("archive: inspect/export work; purge requires explicit confirmation and refuses an active writer");
   } finally { fs.rmSync(parent, { recursive: true, force: true }); }
+}
+
+// --------------------------------------------------- prompt prefix stability --
+{
+  const context = new ChannelContext();
+  context.seeded = true;
+  const attachment = { url: "https://cdn.discordapp.com/attachments/1/2/file.txt?ex=1&is=2&hm=old", name: "file.txt", size: 12, contentType: "text/plain" };
+  const image = { ...attachment, url: "https://cdn.discordapp.com/attachments/1/2/img.png", name: "img.png", contentType: "image/png" };
+  context.pushUser("Alice", "read these", "1", 1, [attachment, image]);
+  let downloads = 0;
+  const opts = {
+    systemPrompt: "unchanged master", maxMessages: 1,
+    enableImages: true, imagesMaxBytes: 1024, enableFileContents: true, fileContentsMaxBytes: 1024,
+    imageFetch: async () => { downloads++; return new Response("image bytes"); },
+    fileFetch: async () => { downloads++; return new Response("file contents"); },
+  };
+  const original = await contextToMessages(context, opts);
+  assert.equal(downloads, 2);
+  context.appendTurn([{
+    content: "checking", ids: [], calls: [{ id: "call", name: "echo", arguments: "{}" }],
+    results: [{ name: "echo", toolCallId: "call", content: "result" }],
+  }], { content: "done", ids: [] });
+  context.pushUser("Bob", "continue", "2", 2, []);
+  assert.deepEqual((await contextToMessages(context, opts)).slice(0, original.length), original, "tool entries and arrivals cannot age attachments out of a rendered prefix");
+  assert.equal(downloads, 2, "rendered attachments need no further downloads");
+  assert.ok(context.estimateTokens(opts.systemPrompt, 1, 1024) >= 1000, "retained image still counts outside the admission window");
+  const restored = ChannelContext.restore(JSON.parse(JSON.stringify(context.serialize())));
+  restored.updateAttachments("1", [{ ...attachment, url: attachment.url.replace("ex=1&is=2&hm=old", "ex=3&is=4&hm=new") }, image]);
+  const unavailable = async (): Promise<Response> => { throw new Error("CDN unavailable"); };
+  assert.deepEqual((await contextToMessages(restored, { ...opts, imageFetch: unavailable, fileFetch: unavailable })).slice(0, original.length), original,
+    "restart and signed-URL refresh preserve exact attachment parts even without the CDN");
+  assert.deepEqual((await contextToMessages(restored, { ...opts, maxMessages: 500 })).slice(0, original.length), original, "changing admission size does not rewrite existing history");
+  // A genuinely replaced attachment is rendered under the current limits.
+  restored.updateAttachments("1", [{ ...attachment, url: "https://cdn.discordapp.com/attachments/1/3/new.txt" }]);
+  const changed = await contextToMessages(restored, { ...opts, maxMessages: 500 });
+  assert.equal(typeof changed[1].content, "string");
+  assert.match(String(changed[1].content), /file contents/);
+  const limited = await contextToMessages(restored, { ...opts, maxMessages: 500, fileContentsMaxBytes: 1 });
+  assert.match(String(limited[1].content), /exceeds/);
+  assert.doesNotMatch(String(limited[1].content), /file contents/);
+  const disabled = await contextToMessages(restored, { ...opts, enableImages: false, enableFileContents: false });
+  assert.equal(disabled[1].content, "Alice: read these", "disabling features invalidates cached parts");
+  restored.updateAttachments("1", []);
+  assert.equal((await contextToMessages(restored, opts))[1].content, "Alice: read these", "removed attachments do not survive in the prompt");
+  assert.equal(restored.find("1")!.attachmentPrompt!.images.length, 0);
+  ok("prompt prefix: attachment admission, limits, URL refresh, edits and restart remain consistent");
+
+  const failed = new ChannelContext();
+  failed.pushUser("Alice", "file", "3", 3, [attachment]);
+  const failure = await contextToMessages(failed, { ...opts, fileFetch: unavailable });
+  assert.deepEqual(await contextToMessages(failed, opts), failure, "a transient download result does not silently rewrite prior context");
+  failed.updateContent("3", "retry this file");
+  assert.match(String((await contextToMessages(failed, opts))[1].content), /file contents/, "an explicit message edit allows another render");
+  const race = new ChannelContext();
+  race.pushUser("Alice", "file", "4", 4, [attachment]);
+  await contextToMessages(race, { ...opts, fileFetch: async () => {
+    race.reset();
+    return new Response("late bytes");
+  } });
+  assert.equal(race.length, 0, "a late attachment download cannot resurrect cleared entries");
+  const replaced = new ChannelContext();
+  replaced.pushUser("Alice", "file", "5", 5, [attachment]);
+  await contextToMessages(replaced, { ...opts, fileFetch: async () => {
+    replaced.updateAttachments("5", []);
+    return new Response("stale bytes");
+  } });
+  assert.equal(replaced.find("5")!.attachmentPrompt, undefined, "stale downloaded bytes cannot be pinned onto replacement metadata");
+  assert.equal((await contextToMessages(replaced, opts))[1].content, "Alice: file");
+  ok("prompt prefix: failed downloads stay stable and late results cannot restore cleared or replaced attachments");
+}
+
+{
+  const context = new ChannelContext();
+  context.seeded = true;
+  context.pushUser("Alice", "calculate", "1", 1, []);
+  const opts = { systemPrompt: "master", maxMessages: 10, enableImages: false, imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024 };
+  const messages = await contextToMessages(context, opts);
+  const call = { id: "call", name: "echo", arguments: "{}" };
+  const raw = "  Calculating $x^2$ for <@bot>  ";
+  const final = "  Result: $x^2$  ";
+  const rounds: ToolRound[] = [];
+  let requests = 0;
+  await runToolTurn(messages, {
+    registry: new ToolRegistry().register({ name: "echo", description: "", parameters: {} }, async () => "4"),
+    maxRounds: 2,
+    chat: async () => ++requests === 1
+      ? { content: raw, reasoning: "reasoning", toolCalls: [call] }
+      : { content: final, toolCalls: [] },
+    onRoundComplete: (round) => { rounds.push(round); },
+  });
+  const displayed = sanitizeForDiscord(raw).trim();
+  const displayedFinal = sanitizeForDiscord(final).trim();
+  recordTurn("turn", context, rounds, [{ messageIds: ["round"], text: displayed, chunks: [displayed] }],
+    { messageIds: ["final"], text: displayedFinal, chunks: [displayedFinal] }, undefined, final);
+  const expected = [...messages, { role: "assistant", content: final }];
+  assert.deepEqual(await contextToMessages(context, opts), expected, "the next turn retains the exact tool-round request and raw final answer");
+  const restored = ChannelContext.restore(JSON.parse(JSON.stringify(context.serialize())));
+  syncMessageUpdate(restored, { id: "round", content: displayed, attachments: [] }, "bot", "Bot");
+  syncMessageUpdate(restored, { id: "final", content: displayedFinal, attachments: [] }, "bot", "Bot");
+  assert.deepEqual(await contextToMessages(restored, opts), expected, "Discord settle echoes and restart cannot replace raw model text");
+  syncMessageUpdate(restored, { id: "round", content: "edited <@bot>", attachments: [] }, "bot", "Bot");
+  assert.equal(restored.find("round")!.modelContent, undefined);
+  assert.equal((await contextToMessages(restored, opts))[2].content, "edited @Bot");
+  const chunked = restored.pushAssistant("displayed", ["a", "b"], ["first", "second"], { modelContent: "original raw answer" });
+  syncMessageUpdate(restored, { id: "b", content: "second", attachments: [] }, "bot", "Bot");
+  assert.equal(chunked.modelContent, "original raw answer");
+  syncMessageUpdate(restored, { id: "b", content: "changed", attachments: [] }, "bot", "Bot");
+  assert.equal(chunked.modelContent, undefined);
+  assert.equal(chunked.content, "first\nchanged");
+  restored.removeById("round");
+  assert.ok(!restored.snapshot().some((entry) => entry.toolCallId === "call"), "real deletions still remove the full tool group");
+  ok("prompt prefix: raw model narration and answers survive delivery formatting, echoes and restart while real edits still apply");
+}
+
+{
+  const context = new ChannelContext();
+  context.seeded = true;
+  context.pushUser("Alice", "old", "1", 1, []);
+  context.pushUser("Alice", "recent", "2", 2, []);
+  context.setMeasuredTokens(1000);
+  const tokens = new TurnTokens();
+  let summaries = 0;
+  const opts = {
+    botId: "bot", botName: "Bot", systemPrompt: "master", maxMessages: 10,
+    enableImages: false, imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024,
+    maxTokens: 100, keepMessages: 1,
+    summarize: async (messages: ChatMessage[]): Promise<string> => {
+      summaries++;
+      return (await tokens.track(async () => ({ content: "summary", toolCalls: [], usage: { input: 1000, output: 5, cachedInput: 900 } }), context)(messages)).content;
+    },
+  };
+  const channel = {} as GuildTextBasedChannel;
+  const compacted = await buildChannelContext(channel, context, "2", opts);
+  assert.equal(context.getSummary(), "summary", "usage reporting does not invalidate the summarizer's revision guard");
+  assert.equal(context.getMeasuredTokens(), null, "pre-compaction usage is forgotten");
+  await tokens.track(async () => ({ content: "reply", toolCalls: [], usage: { input: 20, output: 2, cachedInput: 10 } }), context)(compacted!);
+  assert.equal(context.getMeasuredTokens(), 20);
+  assert.equal(tokens.peakInput, 1000, "cost accounting retains the old peak without reassigning it to current history");
+  context.pushUser("Bob", "again", "3", 3, []);
+  await buildChannelContext(channel, context, "3", opts);
+  assert.equal(summaries, 1, "the old peak cannot cause another compaction next turn");
+  assert.equal(tokens.cachedInput, 910);
+  assert.equal(tokens.cacheReportedInput, 1020);
+  assert.equal(tokens.cacheCalls, 2);
+  // A late measurement from an obsolete prompt must not survive destructive changes.
+  for (const mutation of [() => context.reset(), () => context.emergencyShrink("3", 10, "", 10), () => context.updateContent("3", "edited")]) {
+    if (!context.has("3")) context.pushUser("Bob", "again", "3", 3, []);
+    let finish!: (result: ChatResult) => void;
+    const pending = tokens.track(() => new Promise<ChatResult>((resolve) => { finish = resolve; }), context)([]);
+    mutation();
+    finish({ content: "stale", toolCalls: [], usage: { input: 9999, output: 1 } });
+    await pending;
+    assert.equal(context.getMeasuredTokens(), null);
+  }
+  assert.equal(tokens.cacheCalls, 2, "unknown cache counts are not counted as zero cache hits");
+  const other = new ChannelContext();
+  await tokens.track(async () => ({ content: "other", toolCalls: [], usage: { input: 8000, output: 1 } }), other)([]);
+  assert.equal(context.getMeasuredTokens(), null, "another channel's usage cannot contaminate this channel");
+  await tokens.track(async () => ({ content: "no usage", toolCalls: [] }), other)([]);
+  assert.equal(other.getMeasuredTokens(), null, "missing usage falls back to an estimate instead of stale usage");
+  ok("prompt prefix: compaction and stale-request measurements cannot trigger repeated shrink or contaminate other channels");
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-prefix-recovery-"));
+  let archive = new ConversationArchive(dir);
+  try {
+    const context = new ChannelContext();
+    context.pushUser("Alice", "calculate", "trigger", 1, []);
+    archive.record("context.checkpoint", { channelId: "c" }, context.serialize());
+    const scope = { channelId: "c", turnId: "raw-turn", messageId: "trigger", attempt: 0, round: 0, purpose: "reply" as const };
+    archive.record("turn.started", scope, {});
+    const raw = "  $x^2$  ";
+    const calls = [{ id: "c1", name: "echo", arguments: "{}" }];
+    archive.record("model.finished", scope, { content: raw, toolCalls: calls });
+    const observer = archiveTools(archive, scope);
+    observer.started(calls[0], 0);
+    observer.finished({ role: "tool", name: "echo", toolCallId: "c1", content: "4" }, 0);
+    const posted = { messageIds: ["posted"], text: "x²", chunks: ["x²"] };
+    archive.record("round.finished", scope, { delivery: posted });
+    archive.record("discord.delivery", scope, { raw, posted: { ...posted, messageIds: ["final"] } });
+    archive.close();
+    archive = new ConversationArchive(dir);
+    const store = new ChannelContextStore();
+    store.restore("c", archive.restoreContexts().get("c")!);
+    assert.equal(recoverTurns(archive, store), 1);
+    const recovered = store.get("c");
+    const msgs = await contextToMessages(recovered, { systemPrompt: "", maxMessages: 10, enableImages: false, imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024 });
+    assert.equal(msgs[1].content, raw);
+    assert.equal(msgs[3].content, raw);
+    assert.equal(recovered.find("posted")!.content, "x²", "delivery text remains available for edit tracking");
+    assert.equal(recoverTurns(archive, store), 0, "recovery still happens once");
+    ok("prompt prefix: crash recovery retains raw round/final text separately from formatted Discord delivery");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 console.log(`\n${checks} check groups passed`);

@@ -38,8 +38,12 @@ export interface ContextEntry {
   /** Durable turn identity, used to make crash recovery idempotent. */
   turnId?: string;
   role: Role;
-  /** The text as the model sees it (mentions of the bot already replaced by its Discord name). */
+  /** Conversation/delivery text (user mentions already rendered as the bot's Discord name). */
   content: string;
+  /** Original model text, before Discord formatting; discarded on a real edit. */
+  modelContent?: string;
+  /** Frozen attachment rendering; admission uses the window only on first render. */
+  attachmentPrompt?: AttachmentPrompt;
   /** The Discord message id(s) backing the entry (one per chunk for a chunked reply; [] when there is no Discord message). */
   ids: string[];
   /** Per-chunk text as posted (chunked bot replies only). */
@@ -48,7 +52,7 @@ export interface ContextEntry {
   name?: string;
   /** True when the author is another bot (labeled "(bot)" in the context). */
   bot?: boolean;
-  /** Attachment metadata; images are downloaded at turn time, within the image window. */
+  /** Attachment metadata; admitted attachments retain their first rendering until removed or edited. */
   attachments: MessageAttachmentLike[];
   /** The Discord createdTimestamp (keeps the startup seed chronological). */
   ts: number;
@@ -58,6 +62,13 @@ export interface ContextEntry {
   toolCalls?: ToolCall[];
   /** tool entries: the id of the call this result answers. */
   toolCallId?: string;
+}
+
+/** Persisted attachment suffix, stable until metadata or rendering settings change. */
+export interface AttachmentPrompt {
+  key: string;
+  text: string;
+  images: string[];
 }
 
 /**
@@ -136,12 +147,13 @@ export class ChannelContext {
   /** Whether the startup seed (the channel's last N messages) has been taken in. */
   seeded = false;
   /**
-   * The model endpoint's own count of the last turn's largest request
+   * The model endpoint's own count of the latest valid request
    * (prompt tokens, from the usage/timings the endpoint reports) — the
    * measured context size the compaction trigger prefers over the char
    * estimate. Null when never measured (or after a reset).
    */
   private measuredTokens: number | null = null;
+  private measurementEpoch = 0;
   /**
    * The time of the latest !clear, or null (never cleared): the restart
    * catch-up seed never re-imports messages older than it (a clear is a
@@ -185,12 +197,13 @@ export class ChannelContext {
     content: string,
     ids: string[],
     chunks?: string[],
-    extra?: { reasoning?: string; toolCalls?: ToolCall[] },
+    extra?: { reasoning?: string; toolCalls?: ToolCall[]; modelContent?: string },
   ): ContextEntry {
     const entry: ContextEntry = { role: "assistant", content, ids: [...ids], ts: Date.now(), attachments: [] };
     if (chunks) entry.chunks = [...chunks];
     if (extra?.reasoning) entry.reasoning = extra.reasoning;
     if (extra?.toolCalls) entry.toolCalls = [...extra.toolCalls];
+    if (extra?.modelContent !== undefined) entry.modelContent = extra.modelContent;
     this.entries.push(entry);
     this.changed();
     return entry;
@@ -216,23 +229,24 @@ export class ChannelContext {
   appendTurn(
     rounds: Array<{
       content: string;
+      modelContent?: string;
       reasoning?: string;
       calls: ToolCall[];
       results: Array<{ toolCallId: string; name: string; content: string }>;
       ids: string[];
       chunks?: string[];
     }>,
-    final: { content: string; reasoning?: string; ids: string[]; chunks?: string[] },
+    final: { content: string; modelContent?: string; reasoning?: string; ids: string[]; chunks?: string[] },
     turnId?: string,
   ): void {
     const start = this.entries.length;
     this.batching = true;
     try {
       for (const r of rounds) {
-        this.pushAssistant(r.content, r.ids, r.chunks, { reasoning: r.reasoning, toolCalls: r.calls });
+        this.pushAssistant(r.content, r.ids, r.chunks, { reasoning: r.reasoning, toolCalls: r.calls, modelContent: r.modelContent });
         for (const t of r.results) this.pushTool(t.name, t.toolCallId, t.content);
       }
-      this.pushAssistant(final.content, final.ids, final.chunks, { reasoning: final.reasoning });
+      this.pushAssistant(final.content, final.ids, final.chunks, { reasoning: final.reasoning, modelContent: final.modelContent });
       if (turnId) for (let i = start; i < this.entries.length; i++) this.entries[i].turnId = turnId;
     } finally {
       this.batching = false;
@@ -276,6 +290,10 @@ export class ChannelContext {
     const entry = this.find(messageId);
     if (entry) {
       entry.content = content;
+      delete entry.modelContent;
+      delete entry.attachmentPrompt;
+      if (entry.chunks?.length === 1) entry.chunks[0] = content;
+      this.invalidateMeasurement();
       this.changed();
     }
   }
@@ -287,8 +305,9 @@ export class ChannelContext {
    */
   updateAttachments(messageId: string, attachments: MessageAttachmentLike[]): void {
     const entry = this.find(messageId);
-    if (entry) {
+    if (entry && JSON.stringify(entry.attachments) !== JSON.stringify(attachments)) {
       entry.attachments = [...attachments];
+      this.invalidateMeasurement();
       this.changed();
     }
   }
@@ -301,6 +320,8 @@ export class ChannelContext {
     if (i === -1) return;
     entry.chunks[i] = chunkContent;
     entry.content = entry.chunks.join("\n");
+    delete entry.modelContent;
+    this.invalidateMeasurement();
     this.changed();
   }
 
@@ -314,6 +335,7 @@ export class ChannelContext {
     const i = this.entries.findIndex((e) => e.ids.includes(messageId));
     if (i === -1) return false;
     this.entries.splice(i, this.entryGroupSize(i));
+    this.invalidateMeasurement();
     this.changed();
     return true;
   }
@@ -334,11 +356,30 @@ export class ChannelContext {
     return [...this.entries];
   }
 
+  /** Save a rendering only while its entry and original metadata still belong here. */
+  setAttachmentPrompt(entry: ContextEntry, attachments: MessageAttachmentLike[], prompt: AttachmentPrompt): void {
+    if (!this.entries.includes(entry) || entry.attachments !== attachments) return;
+    entry.attachmentPrompt = prompt;
+    this.invalidateMeasurement();
+    this.changed();
+  }
+
+  /** Generation of the context measurement; stale in-flight calls cannot restore it. */
+  getMeasurementEpoch(): number {
+    return this.measurementEpoch;
+  }
+
+  /** Forget counts for a prompt that was replaced, edited, cleared or compacted. */
+  invalidateMeasurement(): void {
+    this.measurementEpoch++;
+    this.measuredTokens = null;
+  }
+
   clear(): void {
     this.summary = null;
     this.entries.length = 0;
     this.seeded = false;
-    this.measuredTokens = null;
+    this.invalidateMeasurement();
     this.changed();
   }
 
@@ -352,7 +393,7 @@ export class ChannelContext {
     this.summary = null;
     this.entries.length = 0;
     this.seeded = true;
-    this.measuredTokens = null;
+    this.invalidateMeasurement();
     this.clearedAt = Date.now();
     this.changed();
   }
@@ -362,16 +403,18 @@ export class ChannelContext {
     return this.clearedAt;
   }
 
-  /** The endpoint-reported token size of the last turn's largest request, or null (unmeasured). */
+  /** The endpoint-reported size of the latest valid request, or null (unmeasured). */
   getMeasuredTokens(): number | null {
     return this.measuredTokens;
   }
 
-  /** Record (or, with null, forget) the endpoint-reported token size of a turn's largest request. */
+  /** Record (or, with null, forget) the endpoint-reported prompt size. */
   setMeasuredTokens(tokens: number | null): void {
+    if (tokens === null) this.measurementEpoch++;
     if (this.measuredTokens === tokens) return;
     this.measuredTokens = tokens;
-    this.changed();
+    // Token bookkeeping does not mutate the transcript a summarizer captured.
+    this.onChange?.();
   }
 
   get length(): number {
@@ -394,7 +437,7 @@ export class ChannelContext {
       summary: this.summary,
       measuredTokens: this.measuredTokens,
       clearedAt: this.clearedAt,
-      entries: this.entries.map((e) => ({ ...e, ids: [...e.ids], chunks: e.chunks ? [...e.chunks] : undefined, attachments: [...e.attachments], toolCalls: e.toolCalls ? [...e.toolCalls] : undefined })),
+      entries: this.entries.map((e) => ({ ...e, ids: [...e.ids], chunks: e.chunks ? [...e.chunks] : undefined, attachments: [...e.attachments], toolCalls: e.toolCalls ? [...e.toolCalls] : undefined, attachmentPrompt: e.attachmentPrompt ? { ...e.attachmentPrompt, images: [...e.attachmentPrompt.images] } : undefined })),
     };
   }
 
@@ -454,16 +497,18 @@ export class ChannelContext {
     this.entries.length = 0;
     this.entries.push(...groupConsecutiveReplies(groups.flat()));
     this.seeded = true;
+    this.invalidateMeasurement();
     this.changed();
   }
 
   /**
    * Estimated tokens of the next request built from this context: the
    * system prompt + the summary + every entry, plus a fixed cost for the
-   * images that would actually be sent (the newest `window` entries) and,
+   * images in retained renderings. Unrendered attachments use `window` and,
    * when `fileMaxBytes` is given (file contents enabled), a cost for the
    * non-image attachments that would be inlined (their size, capped at
-   * `fileMaxBytes`, same ~4-chars-per-token heuristic). When the endpoint
+   * `fileMaxBytes`, same ~4-chars-per-token heuristic). Persisted file text
+   * is counted even after leaving the admission window. When the endpoint
    * reported a measured size (getMeasuredTokens), the compaction trigger
    * prefers that over this estimate.
    */
@@ -476,8 +521,10 @@ export class ChannelContext {
       // The reasoning and the tool calls travel with the request, so they
       // count toward its size.
       const calls = e.toolCalls !== undefined ? JSON.stringify(e.toolCalls).length : 0;
-      t += Math.ceil((e.content.length + (e.reasoning?.length ?? 0) + calls) / 4);
-      if (i >= windowStart) {
+      t += Math.ceil(((e.modelContent ?? e.content).length + (e.reasoning?.length ?? 0) + calls) / 4);
+      if (e.attachmentPrompt) {
+        t += estimateTokens(e.attachmentPrompt.text) + e.attachmentPrompt.images.length * IMAGE_TOKEN_ESTIMATE;
+      } else if (i >= windowStart) {
         t += e.attachments.filter(isImageAttachment).length * IMAGE_TOKEN_ESTIMATE;
         if (fileMaxBytes !== undefined) {
           for (const a of e.attachments) {
@@ -533,6 +580,7 @@ export class ChannelContext {
     if (text.length === 0) return { ok: false, reason: "summarizer" };
     this.summary = text.slice(0, COMPACTION_SUMMARY_MAX_CHARS);
     this.entries.splice(0, keepStart);
+    this.invalidateMeasurement();
     this.changed();
     return { ok: true };
   }
@@ -549,6 +597,7 @@ export class ChannelContext {
     window: number,
     fileMaxBytes?: number,
   ): void {
+    this.invalidateMeasurement();
     while (this.estimateTokens(systemPrompt, window, fileMaxBytes) > maxTokens) {
       const i = this.entries.findIndex((e) => !e.ids.includes(protectedId));
       if (i === -1) break; // only the protected entry is left
@@ -633,6 +682,7 @@ function groupConsecutiveReplies(entries: ContextEntry[]): ContextEntry[] {
       prev !== undefined &&
       prev.role === "assistant" &&
       e.turnId === undefined && prev.turnId === undefined &&
+      e.modelContent === undefined && prev.modelContent === undefined &&
       e.reasoning === undefined && prev.reasoning === undefined &&
       e.toolCalls === undefined && prev.toolCalls === undefined &&
       e.ts - prev.ts <= BOT_REPLY_GROUP_GAP_MS
@@ -687,6 +737,12 @@ function sanitizeEntry(raw: unknown): ContextEntry | null {
   };
   if (Array.isArray(e.chunks) && e.chunks.every((c) => typeof c === "string")) entry.chunks = e.chunks as string[];
   if (typeof e.name === "string") entry.name = e.name;
+  if (e.role === "assistant" && typeof e.modelContent === "string") entry.modelContent = e.modelContent;
+  const prompt = e.attachmentPrompt as Partial<AttachmentPrompt> | undefined;
+  if (prompt && typeof prompt.key === "string" && typeof prompt.text === "string" &&
+      Array.isArray(prompt.images) && prompt.images.every((url) => typeof url === "string" && /^data:image\/(?:png|jpeg|webp|gif);base64,/.test(url))) {
+    entry.attachmentPrompt = { key: prompt.key, text: prompt.text, images: [...prompt.images] };
+  }
   if (typeof e.turnId === "string") entry.turnId = e.turnId;
   if (e.bot === true) entry.bot = true;
   if (typeof e.reasoning === "string" && e.reasoning.length > 0) entry.reasoning = e.reasoning;

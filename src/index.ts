@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
+import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
 import { chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
@@ -42,6 +43,7 @@ async function main(): Promise<void> {
     `model=${cfg.model.name}`,
     `endpoint=${cfg.model.apiUrl}`,
     `stream=${cfg.model.stream}`,
+    `prompt-cache=${cfg.model.disablePromptCache ? "disabled" : "endpoint default"}`,
     `images=${cfg.model.enableImages}`,
     `files=${cfg.model.enableFileContents}`,
     `window=${cfg.model.contextMaxMessages}`,
@@ -204,20 +206,14 @@ async function main(): Promise<void> {
 
   /**
    * End-of-turn token bookkeeping: report the turn's usage (the endpoint's
-   * own counts, accumulated by `tokens`) and refresh the channel's measured
-   * context size for the next compaction check — the endpoint's count of
-   * this turn's largest prompt, falling back (metrics enabled) to the
-   * llama-server's own report of its last request's size (GET /slots).
+   * own counts, accumulated by `tokens`). Measurements are recorded at each
+   * completed request, so a pre-compaction peak cannot overwrite a shrink.
+   * Slots are diagnostic only: another channel/client can own their usage.
    */
-  const reportTurnTokens = async (channelId: string, context: ChannelContext, tokens: TurnTokens): Promise<void> => {
+  const reportTurnTokens = async (channelId: string, tokens: TurnTokens): Promise<void> => {
     const server = metrics ? await metrics.snapshot() : null;
     if (server !== null) setAutoCompactionBudget(server.ctxSize); // the automatic budget converges here if the startup probe missed the server
     if (tokens.calls === 0 && server === null) return;
-    let measured: number | null = tokens.peakInput > 0 ? tokens.peakInput : null;
-    if (measured === null && server !== null && server.lastRequestTokens !== null && server.lastRequestTokens > 0) {
-      measured = server.lastRequestTokens;
-    }
-    if (measured !== null) context.setMeasuredTokens(measured);
     const pct =
       server !== null && server.ctxSize > 0 && server.lastRequestTokens !== null
         ? ` (${Math.round((server.lastRequestTokens / server.ctxSize) * 100)}%)`
@@ -225,8 +221,10 @@ async function main(): Promise<void> {
     const serverPart =
       server !== null ? `, server context ${server.lastRequestTokens ?? "?"}/${server.ctxSize} tokens${pct}` : "";
     if (tokens.calls > 0) {
+      const cachePart = tokens.cacheCalls > 0
+        ? `, prompt cache ${tokens.cachedInput}/${tokens.cacheReportedInput} input tokens reused (${tokens.cacheCalls} reporting call(s))` : "";
       log.info(
-        `turn in ${channelId}: ${tokens.input} input + ${tokens.output} output tokens over ${tokens.calls} model call(s)${serverPart}`,
+        `turn in ${channelId}: ${tokens.input} input + ${tokens.output} output tokens over ${tokens.calls} model call(s)${cachePart}${serverPart}`,
       );
     } else {
       log.info(`turn in ${channelId}: no model call ran${serverPart}`);
@@ -349,8 +347,8 @@ async function main(): Promise<void> {
         // Every model call of the attempt goes through a tracked wrapper so
         // the endpoint's reported usage (input/output per call, largest
         // prompt) is accumulated: the turn's cost is reported at the end,
-        // and the largest prompt becomes the channel's measured context
-        // size for the next compaction check. The reply rounds stream into
+        // and the latest valid request measures the channel's context
+        // for the next compaction check. The reply rounds stream into
         // the writer; the compaction summarizer and the chime decision use
         // a plain wrapper on the same account (their text is never posted).
         // The attempt's abort signal rides along: channel activity aborts
@@ -372,6 +370,7 @@ async function main(): Promise<void> {
               signal,
               options,
             ),
+          context,
         );
         const guardedReplyChat = cfg.discord.chimeEnabled
           ? chimeReplyChat(measuredReplyChat, () => writer.discard())
@@ -384,7 +383,7 @@ async function main(): Promise<void> {
           return result;
         };
         const plainChat: ChatFn = tokens.track((msgs, cbs, t, signal, options) =>
-          archiveChat(archive, { ...scope, purpose: t?.some((tool) => tool.name === "chime") ? "chime" : "compaction" }, callModel)(msgs, cbs, t, signal, options));
+          archiveChat(archive, { ...scope, purpose: t?.some((tool) => tool.name === "chime") ? "chime" : "compaction" }, callModel)(msgs, cbs, t, signal, options), context);
         // The attempt's conversation, recorded when the attempt completes:
         // each executed round (the model's text, its reasoning, its calls,
         // the results, and the ids its narration settled to) plus the final
@@ -462,7 +461,7 @@ async function main(): Promise<void> {
             keepMessages: cfg.model.compactionKeepMessages,
             compactionPrompt: cfg.model.compactionPrompt,
             summarize: async (msgs) => {
-              const result = await tokens.track(archiveChat(archive, { ...scope, purpose: "compaction" }, callModel))(
+              const result = await tokens.track(archiveChat(archive, { ...scope, purpose: "compaction" }, callModel), context)(
                 msgs, undefined, sharedTools, attemptController.signal,
               );
               if (result.toolCalls.length > 0) throw new Error("compaction returned tool calls instead of a summary");
@@ -720,7 +719,7 @@ async function main(): Promise<void> {
           log.error(`turn failed in channel ${channelId}: ${errMsg(err)}`);
           const posted = await writer.reportError(err);
           archive.record("turn.failed", scope, { error: errMsg(err), posted });
-          if (context.has(turn.id)) recordTurn(turnId, context, rounds, roundSettled, posted, undefined);
+          if (context.has(turn.id)) recordTurn(turnId, context, rounds, roundSettled, posted, undefined, posted?.text ?? "");
           break;
         } finally {
           unwatch();
@@ -728,48 +727,8 @@ async function main(): Promise<void> {
       }
     } finally {
       archive.record("turn.finished", { channelId, turnId, messageId: turn.id }, {});
-      await reportTurnTokens(channelId, context, tokens);
+      await reportTurnTokens(channelId, tokens);
     }
-  };
-
-  /**
-   * Record a completed turn in the channel's conversation store: each
-   * executed round (the model's text — or what of it settled in the channel
-   * — its reasoning, the calls it requested, the results) and the final
-   * reply (the canonical posted text, with the chunk ids so edits and
-   * deletes of the posted messages keep syncing the context). When nothing
-   * was posted (every send failed), the final reply is still recorded with
-   * no backing message ids: the model's history keeps what the model said.
-   */
-  const recordTurn = (
-    turnId: string,
-    context: ChannelContext,
-    rounds: ToolRound[],
-    roundSettled: Array<PostedReply | null>,
-    posted: PostedReply | null,
-    finalReasoning?: string,
-    finalContent = "",
-  ): void => {
-    context.appendTurn(
-      rounds.map((r, i) => {
-        const settled = roundSettled[i];
-        return {
-          content: settled?.text ?? r.content,
-          reasoning: r.reasoning,
-          calls: r.calls,
-          results: r.results,
-          ids: settled?.messageIds ?? [],
-          chunks: settled?.chunks,
-        };
-      }),
-      {
-        content: posted?.text ?? finalContent,
-        reasoning: finalReasoning,
-        ids: posted?.messageIds ?? [],
-        chunks: posted?.chunks,
-      },
-      turnId,
-    );
   };
 
   /** The channel's context store, if the channel is tracked at all. */

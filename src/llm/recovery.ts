@@ -61,12 +61,12 @@ export function recoverTurns(archive: ConversationArchive, contexts: ChannelCont
             : "Error: this call was not started before process restart",
         };
       });
-      rounds.push({ content: delivery?.text ?? result.content, reasoning: result.reasoning, calls: result.toolCalls, results, ids: delivery?.messageIds ?? [], chunks: delivery?.chunks });
+      rounds.push({ content: delivery?.text ?? result.content, modelContent: result.content, reasoning: result.reasoning, calls: result.toolCalls, results, ids: delivery?.messageIds ?? [], chunks: delivery?.chunks });
     }
     const delivered = [...rows].reverse().find((r) => r.type === "discord.delivery");
     if (delivered) {
       const data = archive.readData<{ posted: PostedReply | null; raw: string; reasoning?: string }>(delivered);
-      final = { content: data.posted?.text ?? data.raw, reasoning: data.reasoning, ids: data.posted?.messageIds ?? [], chunks: data.posted?.chunks };
+      final = { content: data.posted?.text ?? data.raw, modelContent: data.raw, reasoning: data.reasoning, ids: data.posted?.messageIds ?? [], chunks: data.posted?.chunks };
     }
     if (rounds.length || final) {
       context.appendTurn(rounds, final ?? { content: "[turn interrupted by process restart; retained tool results above, no automatic replay]", ids: [] }, turnId);

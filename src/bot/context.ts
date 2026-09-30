@@ -12,6 +12,7 @@ import { fetchMessageFiles, type FileFetch } from "./files.js";
 import {
   fetchMessageImages,
   isImageAttachment,
+  isDiscordCdnUrl,
   type AttachmentImage,
   type ImageFetch,
   type MessageAttachmentLike,
@@ -152,6 +153,8 @@ export async function buildChannelContext(
   }
   // File contents add a per-attachment cost to the estimate (their size,
   // capped at the download limit); undefined = the feature is off.
+  // Freeze attachment renderings before the compaction revision is captured.
+  await contextToMessages(context, opts);
   const fileCost = opts.enableFileContents ? opts.fileContentsMaxBytes : undefined;
   // The size check prefers the endpoint's own count of this channel's last
   // request (measured tokens, counted by the model's tokenizer) over the
@@ -210,7 +213,8 @@ export function syncMessageUpdate(
   if (!entry) return; // not in this channel's context
   if (entry.ids.length === 1) {
     const newContent = replaceMentionText(message.content, botId, botName);
-    if (newContent !== entry.content) context.updateContent(message.id, newContent);
+    const echoed = entry.chunks?.length === 1 && entry.chunks[0] === message.content;
+    if (!echoed && newContent !== entry.content) context.updateContent(message.id, newContent);
     context.updateAttachments(
       message.id,
       [...message.attachments.values()].map((a) => ({
@@ -258,7 +262,7 @@ export function prefixEndIndex(
     // in-window-attachment case for a textless assistant is unreachable —
     // bot messages carry no attachments — and the pipelines never apply to
     // tool entries, so the rule above is exact.)
-    if (e.role === "user" || e.role === "tool" || e.content.length > 0 || (e.toolCalls?.length ?? 0) > 0 || e.reasoning) {
+    if (e.role === "user" || e.role === "tool" || (e.modelContent ?? e.content).length > 0 || (e.toolCalls?.length ?? 0) > 0 || e.reasoning) {
       n += 1;
       continue;
     }
@@ -309,12 +313,11 @@ function toSeedEntry(m: MessageLike, botId: string, botName: string): SeedEntry 
  * message — the role is the safest across llama.cpp chat templates), then
  * every entry in order. User entries are prefixed by the author's display
  * name (`Name: …`, `Name (bot): …` for other bots); assistant entries are
- * unlabeled — the role is the identity. Image attachments of the newest
- * `maxMessages` entries become image_url parts (a skipped attachment leaves
- * a one-line note); older image attachments leave a note instead of being
- * re-downloaded every turn. Non-image attachments of those entries are
- * downloaded and inlined as labeled, fenced blocks when file contents are
- * enabled (older ones leave a note instead). Entries that carry no text,
+ * unlabeled — the role is the identity. On first render, attachments of the
+ * newest `maxMessages` entries are admitted as image parts / fenced text;
+ * older attachments get skip notes. The suffix is persisted unchanged on
+ * later turns, until metadata/settings or an explicit message edit invalidate
+ * it. Entries that carry no text,
  * no images, and no file blocks are dropped.
  */
 export async function contextToMessages(
@@ -344,12 +347,15 @@ export async function contextToMessages(
       out.push({ role: "tool", toolCallId: e.toolCallId ?? "", name: e.name ?? "", content: e.content });
       continue;
     }
-    const images: AttachmentImage[] = [];
+    const attachments = e.attachments;
+    const key = attachmentPromptKey(attachments, opts);
+    const cached = e.attachmentPrompt?.key === key ? e.attachmentPrompt : undefined;
+    const images: AttachmentImage[] = cached?.images.map((url) => ({ url })) ?? [];
     const files: string[] = [];
     const notes: string[] = [];
-    if (opts.enableImages) {
+    if (!cached && attachments.length > 0 && opts.enableImages) {
       if (i >= imageWindowStart) {
-        const res = await fetchMessageImages(e.attachments, opts.imagesMaxBytes, {
+        const res = await fetchMessageImages(attachments, opts.imagesMaxBytes, {
           fetchImpl: opts.imageFetch,
           storage: opts.attachmentStore,
           // With file contents on, non-image attachments are the file
@@ -360,16 +366,16 @@ export async function contextToMessages(
         notes.push(...res.notes);
       } else {
         // Outside the image window: a note instead of re-downloading every turn.
-        for (const att of e.attachments) {
+        for (const att of attachments) {
           if (isImageAttachment(att)) {
             notes.push(`*[attachment "${att.name}" not sent: older than the image window]*`);
           }
         }
       }
     }
-    if (opts.enableFileContents) {
+    if (!cached && attachments.length > 0 && opts.enableFileContents) {
       if (i >= imageWindowStart) {
-        const res = await fetchMessageFiles(e.attachments, opts.fileContentsMaxBytes, {
+        const res = await fetchMessageFiles(attachments, opts.fileContentsMaxBytes, {
           fetchImpl: opts.fileFetch,
           storage: opts.attachmentStore,
         });
@@ -377,23 +383,28 @@ export async function contextToMessages(
         notes.push(...res.notes);
       } else {
         // Outside the file window: a note instead of re-downloading every turn.
-        for (const att of e.attachments) {
+        for (const att of attachments) {
           if (!isImageAttachment(att)) {
             notes.push(`*[attachment "${att.name}" not sent: older than the file window]*`);
           }
         }
       }
     }
+    const attachmentText = cached?.text ?? [...files, ...notes].join("\n");
+    if (!cached && (attachments.length > 0 || e.attachmentPrompt)) {
+      context.setAttachmentPrompt(e, attachments, { key, text: attachmentText, images: images.map((img) => img.url) });
+    }
+    const content = e.modelContent ?? e.content;
     const label = e.role === "user" && e.name ? speakerLabel(e.name, e.bot ?? false) : "";
     const text =
-      e.content.length > 0
+      content.length > 0
         ? label
-          ? `${label}: ${e.content}`
-          : e.content
+          ? `${label}: ${content}`
+          : content
         : label
           ? `${label}:`
           : "";
-    const body = [text, ...files, ...notes].filter((s) => s.length > 0).join("\n");
+    const body = [text, attachmentText].filter((s) => s.length > 0).join("\n");
     // An assistant entry that requested tools carries them even when it has
     // no text (the model answered with calls only) — the history must not
     // lose the call/result pairing.
@@ -410,4 +421,21 @@ export async function contextToMessages(
     out.push(msg);
   }
   return out;
+}
+
+/** Signed CDN URL refreshes do not change an attachment's immutable identity. */
+function attachmentPromptKey(
+  attachments: MessageAttachmentLike[],
+  opts: Pick<ContextOptions, "enableImages" | "imagesMaxBytes" | "enableFileContents" | "fileContentsMaxBytes" | "imageFetch" | "fileFetch">,
+): string {
+  return JSON.stringify([1, opts.enableImages, opts.imagesMaxBytes, opts.enableFileContents, opts.fileContentsMaxBytes,
+    !!opts.imageFetch, !!opts.fileFetch, attachments.map((att) => {
+      let url = att.url;
+      if (isDiscordCdnUrl(url)) {
+        const parsed = new URL(url);
+        for (const param of ["ex", "is", "hm"]) parsed.searchParams.delete(param);
+        url = parsed.href;
+      }
+      return [url, att.name, att.size, att.contentType];
+    })]);
 }

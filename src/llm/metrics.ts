@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatResult, ChatRequestOptions, StreamCallbacks, ToolSpec } from "./client.js";
+import type { ChannelContext } from "./context.js";
 
 /** One model request (the same shape `LlmClient.chat` and the tool loop's `chat` dep take). */
 export type ChatFn = (
@@ -15,7 +16,7 @@ export type ChatFn = (
  * it. The counts are the endpoint's own (its tokenizer), not an estimate:
  * `input`/`output` sum every call of the turn (the reply's tool rounds, the
  * compaction summarizer, the chime decision alike), and `peakInput` is the
- * largest prompt one call carried — the channel's context size on the wire.
+ * largest prompt one call carried (diagnostic only, never restored after a shrink).
  * Calls that report no usage (endpoints without usage reporting) are
  * ignored, so a silent endpoint leaves all counters at zero.
  */
@@ -28,16 +29,32 @@ export class TurnTokens {
   peakInput = 0;
   /** How many model calls reported usage. */
   calls = 0;
+  /** Input tokens for calls that reported cache usage, and the reused subset. */
+  cacheReportedInput = 0;
+  cachedInput = 0;
+  cacheCalls = 0;
 
   /** Wrap a chat function so every call it makes reports its usage here. */
-  track(chat: ChatFn): ChatFn {
+  track(chat: ChatFn, context?: ChannelContext): ChatFn {
     return async (messages, callbacks, tools, signal, options) => {
+      const epoch = context?.getMeasurementEpoch();
       const res = await chat(messages, callbacks, tools, signal, options);
       if (res.usage) {
         this.input += res.usage.input;
         this.output += res.usage.output;
         this.peakInput = Math.max(this.peakInput, res.usage.input);
         this.calls += 1;
+        if (res.usage.cachedInput !== undefined) {
+          this.cachedInput += res.usage.cachedInput;
+          this.cacheReportedInput += res.usage.input;
+          this.cacheCalls++;
+        }
+      }
+      // Update immediately, not from the turn's peak at turn-end: compaction
+      // and overflow recovery may replace that large prompt later in this turn.
+      // Missing input usage falls back to estimates, never an earlier prompt's count.
+      if (context && context.getMeasurementEpoch() === epoch) {
+        context.setMeasuredTokens(res.usage && res.usage.input > 0 ? res.usage.input : null);
       }
       return res;
     };
