@@ -3,7 +3,7 @@ import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMess
 import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
-import { chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
+import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
 import { chimeReplyChat } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
@@ -196,6 +196,7 @@ async function main(): Promise<void> {
     );
   };
   const tools = buildTools(cfg);
+  if (cfg.discord.chimeEnabled) tools.registry.register(CHIME_TOOL_SPEC, executeReplyChime);
   if (tools.registry.size > 0) {
     log.info(
       "tools enabled:",
@@ -373,7 +374,7 @@ async function main(): Promise<void> {
           context,
         );
         const guardedReplyChat = cfg.discord.chimeEnabled
-          ? chimeReplyChat(measuredReplyChat, () => writer.discard())
+          ? chimeReplyChat(measuredReplyChat)
           : measuredReplyChat;
         const replyChat: ChatFn = async (...args) => {
           const result = await guardedReplyChat(...args);
@@ -491,6 +492,8 @@ async function main(): Promise<void> {
             // prompt, tool history, reasoning and attachments. Only the decision
             // instruction is appended, keeping the conversation prefix reusable.
             const decisionOver = async (msgs: ChatMessage[]): Promise<ChimeDecision | null> => {
+              const position = context.length;
+              const timestamp = Date.now();
               return decideChime(
                 (m, tools, signal, options) => plainChat(m, undefined, tools, signal, options),
                 msgs,
@@ -499,6 +502,13 @@ async function main(): Promise<void> {
                 { channelId, messageId: turn.id },
                 cfg.discord.chimePrompt,
                 sharedTools,
+                (exchange) => {
+                  if (!context.has(turn.id)) return;
+                  const exchangeId = randomUUID();
+                  archive.record("chime.accepted", scope, { exchangeId, messages: exchange, position, timestamp });
+                  context.appendExchange(exchange, exchangeId, position, timestamp);
+                  msgs.push(...exchange);
+                },
               );
             };
             let decision: ChimeDecision | null;
@@ -573,6 +583,7 @@ async function main(): Promise<void> {
               return;
             }
           }
+          if (!context.has(turn.id)) return;
           writer.start();
           const runModel = (msgs: Parameters<typeof runToolTurn>[0]): Promise<ToolTurnOutcome> =>
             runToolTurn(msgs, {

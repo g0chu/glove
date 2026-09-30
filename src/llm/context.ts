@@ -1,8 +1,8 @@
-import type { MessageAttachmentLike, ToolCall } from "./client.js";
+import type { ChatMessage, MessageAttachmentLike, ToolCall } from "./client.js";
 import { isImageAttachment, isInterruptedError } from "./client.js";
 
 /** The role of one context entry (the request `messages` array uses it). */
-export type Role = "user" | "assistant" | "tool";
+export type Role = "system" | "user" | "assistant" | "tool";
 
 /**
  * The speaker label the model sees on a non-bot message: the author's
@@ -37,6 +37,8 @@ export function speakerLabel(name: string, isBot: boolean): string {
 export interface ContextEntry {
   /** Durable turn identity, used to make crash recovery idempotent. */
   turnId?: string;
+  /** Identity of an atomically retained decision exchange. */
+  exchangeId?: string;
   role: Role;
   /** Conversation/delivery text (user mentions already rendered as the bot's Discord name). */
   content: string;
@@ -254,6 +256,21 @@ export class ChannelContext {
     }
   }
 
+  /** Atomically retain a decision instruction, assistant call and answered results. */
+  appendExchange(messages: ChatMessage[], exchangeId: string, position = this.entries.length, timestamp = Date.now()): void {
+    if (this.entries.some((entry) => entry.exchangeId === exchangeId)) return;
+    const entries: ContextEntry[] = messages.map((message) => {
+      if (typeof message.content !== "string") throw new Error("decision exchange must contain text messages");
+      return {
+        role: message.role, content: message.content, ids: [], attachments: [], ts: timestamp, exchangeId,
+        reasoning: message.reasoningContent, toolCalls: message.toolCalls,
+        toolCallId: message.toolCallId, name: message.name,
+      };
+    });
+    this.entries.splice(Math.min(position, this.entries.length), 0, ...entries);
+    this.changed();
+  }
+
   /** The entry backed by the given Discord message id, if any. */
   find(messageId: string): ContextEntry | undefined {
     return this.entries.find((e) => e.ids.includes(messageId));
@@ -348,6 +365,11 @@ export class ChannelContext {
    */
   private entryGroupSize(i: number): number {
     let size = 1;
+    const exchangeId = this.entries[i].exchangeId;
+    if (exchangeId) {
+      while (this.entries[i + size]?.exchangeId === exchangeId) size++;
+      return size;
+    }
     while (i + size < this.entries.length && this.entries[i + size].role === "tool") size++;
     return size;
   }
@@ -490,7 +512,8 @@ export class ChannelContext {
     // fetched Discord message may have a timestamp between a call and result.
     const groups: ContextEntry[][] = [];
     for (const entry of merged) {
-      if (entry.role === "tool" && groups.length > 0) groups[groups.length - 1].push(entry);
+      if (groups.length > 0 && (entry.role === "tool" ||
+        (entry.exchangeId !== undefined && entry.exchangeId === groups.at(-1)![0].exchangeId))) groups[groups.length - 1].push(entry);
       else groups.push([entry]);
     }
     groups.sort(([a], [b]) => a.ts - b.ts || compareDiscordIds(a.ids[0], b.ids[0]));
@@ -558,7 +581,8 @@ export class ChannelContext {
     // the folded part — fold the whole group into the summary instead of
     // leaving orphaned results behind.
     let keepStart = keepStart0;
-    while (keepStart < n && this.entries[keepStart].role === "tool") keepStart++;
+    while (keepStart < n && (this.entries[keepStart].role === "tool" ||
+      (this.entries[keepStart].exchangeId !== undefined && this.entries[keepStart].exchangeId === this.entries[keepStart - 1]?.exchangeId))) keepStart++;
     if (keepStart >= n) {
       // Everything would fold into the summary — only do that when the
       // protected mention is not among the kept entries we just gave up on
@@ -723,7 +747,7 @@ export function compareDiscordIds(a: string, b: string): number {
 function sanitizeEntry(raw: unknown): ContextEntry | null {
   if (raw === null || typeof raw !== "object") return null;
   const e = raw as Record<string, unknown>;
-  if (e.role !== "user" && e.role !== "assistant" && e.role !== "tool") return null;
+  if (e.role !== "system" && e.role !== "user" && e.role !== "assistant" && e.role !== "tool") return null;
   if (typeof e.content !== "string") return null;
   if (!Array.isArray(e.ids) || e.ids.some((id) => typeof id !== "string")) return null;
   const entry: ContextEntry = {
@@ -743,6 +767,7 @@ function sanitizeEntry(raw: unknown): ContextEntry | null {
       Array.isArray(prompt.images) && prompt.images.every((url) => typeof url === "string" && /^data:image\/(?:png|jpeg|webp|gif);base64,/.test(url))) {
     entry.attachmentPrompt = { key: prompt.key, text: prompt.text, images: [...prompt.images] };
   }
+  if (typeof e.exchangeId === "string") entry.exchangeId = e.exchangeId;
   if (typeof e.turnId === "string") entry.turnId = e.turnId;
   if (e.bot === true) entry.bot = true;
   if (typeof e.reasoning === "string" && e.reasoning.length > 0) entry.reasoning = e.reasoning;

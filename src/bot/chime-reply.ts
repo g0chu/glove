@@ -6,11 +6,11 @@ import { log } from "../log.js";
 import { CHIME_TOOL_NAME, chimeTools } from "./chime.js";
 
 /**
- * Advertise the shared schemas without letting the virtual decision tool
- * enter the executable tool loop. Wrap an archived/token-counted chat so
- * every compatibility or repair request is recorded and measured separately.
+ * Advertise the shared schemas; chime calls use the registered reply handler
+ * and remain in the executable loop and its history. Wrap an archived/token-counted
+ * chat so every compatibility request is recorded and measured separately.
  */
-export function chimeReplyChat(chat: ChatFn, onRepair?: () => Promise<unknown>): ChatFn {
+export function chimeReplyChat(chat: ChatFn): ChatFn {
   let toolFreeEndpoint = false;
   return async (messages, callbacks, tools, signal, options) => {
     const executableTools = tools?.filter((tool) => tool.name !== CHIME_TOOL_NAME) ?? [];
@@ -26,27 +26,6 @@ export function chimeReplyChat(chat: ChatFn, onRepair?: () => Promise<unknown>):
       toolFreeEndpoint = true;
       log.warn("reply endpoint rejected chime tool metadata; retrying without tools");
       result = await chat(messages, callbacks, undefined, signal, options);
-    }
-    if (!result.toolCalls.some((call) => call.name === CHIME_TOOL_NAME)) return result;
-    const withoutChime = (res: ChatResult): ChatResult => ({
-      ...res, toolCalls: res.toolCalls.filter((call) => call.name !== CHIME_TOOL_NAME),
-    });
-    result = withoutChime(result);
-    // Preserve an actual answer or executable calls from a mixed response.
-    // The decision itself is neither executed nor added to working history.
-    if (result.content.trim() || result.toolCalls.length > 0) return result;
-
-    // A decision-only response is not an answer. Nothing has executed, so
-    // one repair is safe. Keep the schema prefix stable; validation below
-    // still rejects another decision-only response without executing it.
-    log.warn("reply returned only a chime decision; retrying once with reply tools");
-    await onRepair?.();
-    result = withoutChime(await chat([...messages, {
-      role: "system",
-      content: "The decision phase is over. Answer the preceding conversation now. Do not call chime or decide whether to respond. Use the available tools if needed, or provide the reply text.",
-    }], callbacks, chimeTools(executableTools), signal, options));
-    if (!result.content.trim() && result.toolCalls.length === 0) {
-      throw new Error("model did not provide a reply after the chime decision repair");
     }
     return result;
   };
