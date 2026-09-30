@@ -299,9 +299,21 @@ to hide chime NO decisions in Discord while keeping their diagnostic logs
 (default: `true`). Restart the bot after changing these settings.
 
 
-### Human mention interruptions
+### Channel activity interruptions
 
-A new human message mentioning the bot interrupts its active model request immediately, including streamed reasoning and response generation. A pending edit containing a human mention does the same. The partial reply is withdrawn; after stabilization, the newer mention's turn rebuilds the prompt from the updated conversation. Ordinary messages and typing retain the prefill-only interruption behavior described above. Tools that have not started are skipped; already-running tools finish and their results are retained before the newer turn runs, without replaying them.
+Typing, new messages, edits and deletions from other users or bots immediately
+interrupt the active model request during prompt processing, reasoning or reply
+text. Partial replies are withdrawn. The bot waits for the channel to settle,
+then rebuilds the prompt with updated context. Unstarted tools are skipped;
+running tools finish and their results are retained before continuing, without
+replaying completed rounds or resetting the turn's tool budget.
+
+Duplicate trigger IDs are ignored. A newer pending mention supersedes an older
+mention before generation starts, including bursts that arrived before an
+attempt began watching activity. After a successful answer, queued triggers
+already included in that answer's prompt are removed. Messages arriving later
+remain eligible for their own turn. Chime bursts continue to settle into the
+newest message's decision; ambient messages do not cancel an unanswered mention.
 
 The stability gate commits pending messages in Discord snowflake order within each channel. A newer stable mention waits for earlier pending messages to finish stabilizing, so their final content precedes it in the prompt. Other channels remain independent. Deleting an earlier pending message releases stable messages behind it; clearing a channel or shutting down discards all its pending messages.
 
@@ -311,5 +323,5 @@ fresh Discord history, paginating new-message gaps and reconciling the latest 10
 tracked user messages for edits and confirmed deletions. Activity during the fetch
 discards that snapshot; discovered changes restart the quiet wait before rebuilding
 the prompt. Refresh failures stop the attempt rather than answer from stale history.
-The bot’s own activity is excluded. Ordinary activity after generation starts still
-allows that generation to finish; human mentions retain their immediate interruption.
+The bot’s own activity is excluded. Channel activity cancels generation as well
+as prompt processing.

@@ -706,11 +706,10 @@ export class ResponseWriter {
    * channel activity, see index.ts): stop the typing indicator, complete
    * the round's thinking line (kept, like a finished round's), and withdraw
    * the round's partial text (stripped from the activity message, or its
-   * live message(s) deleted). With the prefill-only interruption (see
-   * LlmClient.chat) an interrupted attempt has streamed no token yet, so
-   * this is normally a no-op beyond stopping typing; the paths below cover
-   * the defensive cases (a non-stream call aborted mid-flight, a manual
-   * interrupt). The caller then waits for the channel to go quiet and
+   * live message(s) deleted). When interrupted during prompt processing,
+   * this is normally a no-op beyond stopping typing. During reasoning or
+   * reply generation, it removes the live text while preserving thinking
+   * lines. The caller then waits for the channel to go quiet and
    * either discards the turn (a newer turn supersedes it) or retries it
    * with a fresh writer, so the partial text never lingers as a broken
    * reply. A no-op when the writer never started or already finished.
