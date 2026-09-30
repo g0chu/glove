@@ -340,3 +340,13 @@ discards that snapshot; discovered changes restart the quiet wait before rebuild
 the prompt. Refresh failures stop the attempt rather than answer from stale history.
 The bot’s own activity is excluded. Channel activity cancels generation as well
 as prompt processing.
+
+Offline Wikipedia browsing: `wikipedia_read` and `vault_read` accept `mode: "outline"`
+to list section IDs and headings without loading the article into context. Pass
+`section` (an ID or exact heading; `lead` selects introductory text) to read only
+that section and its subsections. Pass `query` for case-insensitive literal matches
+with short surrounding excerpts. `offset` and `max_chars` paginate the selected
+text; responses report the next offset when more remains. Reads default to 3000
+characters, capped by `TOOLS_MAX_RESULT_CHARS`. Sections and matches remain
+accessible beyond that cap. Outlines are paginated too; their offsets refer to
+the rendered outline. Query offsets refer to the selected article/section text.

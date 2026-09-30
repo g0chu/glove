@@ -11,7 +11,7 @@ import path from "node:path";
 import type { ChildProcess } from "node:child_process";
 import type { ToolSpec } from "../llm/client.js";
 import { errMsg } from "../log.js";
-import { ToolRegistry, argString, argInt, argOptionalString } from "./executor.js";
+import { ToolRegistry, argString, argInt } from "./executor.js";
 import {
   loadCorpus,
   searchTitles,
@@ -20,6 +20,7 @@ import {
   extractWikilinks,
   type VaultCorpus,
 } from "./vault/corpus.js";
+import { browseWiki, wikiReadOptions, WIKI_READ_PROPERTIES, type WikiReadOptions } from "./wiki.js";
 import { scanBody, type BodyScanOptions } from "./vault/body.js";
 
 /** How much of a note's body "abstract" mode returns (chars). */
@@ -109,7 +110,7 @@ export class VaultTools {
    * file stem, e.g. a deduplicated "Title (2)"), else an exact-title
    * resolution (0 = no match, 1 = read, several = an ambiguity error).
    */
-  async read(note: string, mode: "full" | "abstract" = "full"): Promise<string> {
+  async read(note: string, mode: "full" | "abstract" = "full", options?: WikiReadOptions): Promise<string> {
     const n = note.trim();
     if (n.length === 0) throw new Error("note must not be empty");
     if (n.includes("/") || n.includes("\\") || n.includes("..")) {
@@ -121,6 +122,9 @@ export class VaultTools {
     const { title, fields, body } = splitFrontmatter(raw);
     const name = title || file;
     const kb = Math.max(1, Math.ceil(raw.length / 1024));
+    if (options) {
+      return `Wikipedia vault: ${name} (${file}.md, ${kb} KB)\n\n${options.mode === "abstract" ? renderFields(fields) + "\n\n" : ""}${browseWiki(body, options, this.opts.maxTextChars)}`;
+    }
     if (mode === "abstract") {
       const abs = body.slice(0, ABSTRACT_CHARS);
       const more = body.length > ABSTRACT_CHARS ? " [abstract cut — use mode \"full\" for the whole note]" : "";
@@ -130,6 +134,9 @@ export class VaultTools {
     const text = truncated ? body.slice(0, this.opts.maxTextChars) : body;
     return `Wikipedia vault: ${name} (${file}.md, ${kb} KB)${truncated ? " [truncated]" : ""}\n\n${text}`;
   }
+
+  /** Configured output ceiling for browsing reads. */
+  get maxReadChars(): number { return this.opts.maxTextChars; }
 
   /** List one note's outgoing [[wikilinks]] (deduplicated, capped). */
   async links(note: string): Promise<string> {
@@ -219,12 +226,12 @@ export const VAULT_SEARCH_SPEC: ToolSpec = {
 export const VAULT_READ_SPEC: ToolSpec = {
   name: "vault_read",
   description:
-    "Read one note of the offline Wikipedia vault by its exact title as returned by vault_search (spaces or underscores both work; a deduplicated \"(2)\" suffix is part of the name). Returns the note as markdown (frontmatter dropped); very long notes are truncated. mode \"abstract\" returns the frontmatter plus only the start of the note — for disambiguation without reading it all.",
+    "Read one note of the offline Wikipedia vault by its exact title as returned by vault_search (spaces or underscores both work; a deduplicated \"(2)\" suffix is part of the name). Returns the note as markdown (frontmatter dropped); Use mode outline to list section IDs, section to read a heading and its subsections, query for matching excerpts, and offset/max_chars to paginate. Prefer targeted reads. mode \"abstract\" returns the frontmatter plus only the start of the note — for disambiguation without reading it all.",
   parameters: {
     type: "object",
     properties: {
       note: { type: "string", description: "The exact note title (e.g. \"Albert Einstein\") or file stem." },
-      mode: { type: "string", enum: ["full", "abstract"], description: "\"full\" (default) or \"abstract\" (frontmatter + the note's start)." },
+      ...WIKI_READ_PROPERTIES,
     },
     required: ["note"],
     additionalProperties: false,
@@ -249,11 +256,8 @@ export const VAULT_LINKS_SPEC: ToolSpec = {
 export function registerVaultTools(registry: ToolRegistry, tools: VaultTools): void {
   registry.register(VAULT_SEARCH_SPEC, (args) => tools.search(argString(args, "query"), argInt(args, "max_results", 5, 1, 10)));
   registry.register(VAULT_READ_SPEC, (args) => {
-    const mode = argOptionalString(args, "mode");
-    if (mode !== undefined && mode !== "full" && mode !== "abstract") {
-      throw new Error(`argument "mode" must be "full" or "abstract" (got "${mode}")`);
-    }
-    return tools.read(argString(args, "note"), mode ?? "full");
+    const options = wikiReadOptions(args, tools.maxReadChars);
+    return tools.read(argString(args, "note"), options.mode === "abstract" ? "abstract" : "full", options);
   });
   registry.register(VAULT_LINKS_SPEC, (args) => tools.links(argString(args, "note")));
 }

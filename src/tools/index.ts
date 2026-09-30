@@ -90,7 +90,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(zim);
     registerZimTools(registry, zim);
     bullets.push(
-      "- wikipedia_search, wikipedia_read: an offline Wikipedia archive on this machine (no internet needed) — search article titles, then read the article text. Prefer it for established facts: people, places, events, science topics.",
+      "- wikipedia_search, wikipedia_read: an offline Wikipedia archive on this machine (no internet needed) — search article titles, then use wikipedia_read mode outline, section, query and offset/max_chars for targeted excerpts. Prefer it for established facts: people, places, events, science topics.",
     );
     rules.push("Cite Wikipedia article titles when you use wikipedia_read.");
   }
@@ -108,7 +108,7 @@ export function buildTools(cfg: Config): ToolsSetup {
     clients.push(vault);
     registerVaultTools(registry, vault);
     bullets.push(
-      "- vault_search, vault_read, vault_links: an offline Wikipedia vault of markdown notes on this machine (no internet needed) — search note titles and bodies, read a note by title, list a note's [[wikilinks]] and follow them. Prefer it for established facts: people, places, events, science topics.",
+      "- vault_search, vault_read, vault_links: an offline Wikipedia vault of markdown notes on this machine (no internet needed) — search note titles and bodies, browse a note with vault_read mode outline, section, query and offset/max_chars, list a note's [[wikilinks]] and follow them. Prefer it for established facts: people, places, events, science topics.",
     );
     rules.push("Cite the vault note titles when you use vault_read.");
   }
