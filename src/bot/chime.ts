@@ -13,19 +13,19 @@ export const CHIME_SYSTEM_PROMPT =
 
 /** Keep tool definitions and their order identical across decision and reply requests. */
 export function chimeTools(tools: ToolSpec[]): ToolSpec[] {
-  return [...tools, CHIME_TOOL_SPEC];
+  return [...tools.filter((tool) => tool.name !== CHIME_TOOL_NAME), CHIME_TOOL_SPEC];
 }
 
 /** Bound decision generation, including reasoning, so it cannot run like a full reply. */
 export const CHIME_MAX_TOKENS = 1024;
 
-/** The name of the (virtual) tool the chime decision is reported through. */
+/** The name of the tool the chime decision is reported through. */
 export const CHIME_TOOL_NAME = "chime";
 
 /**
  * The spec of the chime tool — sent with the decision call so the model
- * reports its answer as a tool call instead of plain text. It is never
- * executed: the arguments *are* the decision.
+ * reports its answer as a tool call instead of plain text. Decision calls
+ * are acknowledged locally; reply calls use the registered reply handler.
  */
 export const CHIME_TOOL_SPEC: ToolSpec = {
   name: CHIME_TOOL_NAME,
@@ -80,6 +80,7 @@ export async function decideChime(
   diagnosticContext?: { channelId: string; messageId: string },
   decisionPrompt?: string,
   tools: ToolSpec[] = chimeTools([]),
+  onAccepted?: (exchange: ChatMessage[]) => void,
 ): Promise<ChimeDecision | null> {
   const prefix = diagnosticContext
     ? `channel ${diagnosticContext.channelId}: message ${diagnosticContext.messageId}: ` : "";
@@ -96,12 +97,13 @@ export async function decideChime(
   const messages: ChatMessage[] = [...transcript, { role: "system", content: decisionPrompt?.trim() || CHIME_SYSTEM_PROMPT }];
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
+      const requestMessages: ChatMessage[] = attempt === 0 ? messages : [...messages, {
+        role: "system", content: "Decide about the newest transcript message above. Call the chime tool exactly once with respond and a short reason. Do not return a plain-text decision. Do not answer the conversation itself.",
+      }];
       let res: ChatResult;
       try {
         res = await chat(
-          attempt === 0 ? messages : [...messages, {
-            role: "system", content: "Decide about the newest transcript message above. Call the chime tool exactly once with respond and a short reason. Do not return a plain-text decision. Do not answer the conversation itself.",
-          }],
+          requestMessages,
           tools,
           signal,
           { toolChoice: "auto", maxTokens: CHIME_MAX_TOKENS },
@@ -115,7 +117,17 @@ export async function decideChime(
         log.info(`${prefix}chime prompt cache: ${res.usage.cachedInput}/${res.usage.input} input tokens reused`);
       }
       const decision = parseDecision(res, warn);
-      if (decision !== null) return decision;
+      if (decision !== null) {
+        onAccepted?.([
+          ...requestMessages.slice(transcript.length),
+          { role: "assistant", content: res.content, reasoningContent: res.reasoning, toolCalls: res.toolCalls },
+          { role: "tool", name: CHIME_TOOL_NAME, toolCallId: res.toolCalls[0].id, content: JSON.stringify(decision) },
+          { role: "system", content: decision.respond
+            ? "The chime decision is complete. Answer the preceding conversation now, using tools if needed."
+            : "The chime decision is complete. Stay silent for this message and wait for new conversation activity." },
+        ]);
+        return decision;
+      }
       if (attempt === 0) warn("retrying unusable chime decision once with the shared tool schemas");
     }
     return null;
@@ -196,4 +208,11 @@ function preview(text: string): string {
 export function formatChimeNo(reason: string): string {
   const r = truncate(reason.trim().replace(/\s*\n+\s*/g, " "), 200);
   return r === "" ? "🔕 *chime: no*" : `🔕 *chime: no — ${r}*`;
+}
+
+/** A reply-phase decision is acknowledged and retained like every other tool call. */
+export async function executeReplyChime(args: Record<string, unknown>): Promise<string> {
+  const decision = parseChimeArgs(JSON.stringify(args));
+  if (!decision) throw new Error("invalid chime decision arguments");
+  return JSON.stringify({ ...decision, instruction: "The reply phase is already underway. Continue answering the conversation; do not repeat the chime decision." });
 }

@@ -37,7 +37,7 @@ import { captureCatchup } from "../src/bot/catchup.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
 import { chimeReplyChat } from "../src/bot/chime-reply.js";
-import { chimeTools, CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
+import { executeReplyChime, chimeTools, CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
 import { InterruptedError, isInterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
@@ -822,70 +822,36 @@ const ok = (name: string): void => {
   ok("chime: a context-overflow rejection is re-thrown (the turn shrinks and retries once)");
 }
 
-// Shared tool schemas must not turn reply decisions into executable rounds.
+// Reply chime calls are ordinary retained tool rounds, including mixed calls.
 {
   const trigger: ChatMessage[] = [{ role: "user", content: "Alice: @Glove should you respond?" }];
   const decision = { id: "d", name: "chime", arguments: '{"respond":false,"reason":"quiet"}' };
-  const write = { id: "w", name: "write", arguments: "{}" };
   for (const mixed of [false, true]) {
     let requests = 0;
     let executions = 0;
-    let repairs = 0;
-    let recorded = 0;
-    const registry = new ToolRegistry().register({ name: "write", description: "write", parameters: {} }, async () => {
-      executions++;
-      return "saved";
-    });
+    const write = { id: "w", name: "write", arguments: "{}" };
+    const registry = new ToolRegistry()
+      .register({ name: "write", description: "write", parameters: {} }, async () => { executions++; return "saved"; })
+      .register(CHIME_TOOL_SPEC, executeReplyChime);
     const messages = structuredClone(trigger);
-    const tokens = new TurnTokens();
-    const chat = chimeReplyChat(tokens.track(async (msgs, _cbs, tools) => {
-      requests++;
-      assert.ok(!msgs.some(m => m.toolCalls?.some(c => c.name === "chime")), "virtual decisions never enter history");
-      if (requests === 1) {
-        assert.deepEqual(tools?.map(t => t.name), ["write", "chime"]);
-        return { content: "", toolCalls: mixed ? [decision, write] : [decision], usage: { input: 10, output: 2 } };
-      }
-      if (!mixed && requests === 2) {
-        assert.deepEqual(tools, chimeTools(registry.specs()), "repair preserves the schema prefix");
-        assert.deepEqual(msgs.slice(0, -1), trigger);
-        return { content: "", toolCalls: [write], usage: { input: 10, output: 2 } };
-      }
-      return { content: "saved your file", toolCalls: [], usage: { input: 10, output: 2 } };
-    }), async () => { repairs++; });
-    const outcome = await runToolTurn(messages, { registry, maxRounds: 1, chat,
-      onToolCalls: calls => { assert.deepEqual(calls, [write]); },
-      onRoundComplete: round => { recorded++; assert.deepEqual(round.calls, [write]); },
+    const rounds: ToolRound[] = [];
+    const chat = chimeReplyChat(async (msgs, _cbs, tools) => {
+      assert.deepEqual(tools, registry.specs(), "schemas and their order remain unchanged");
+      if (++requests === 1) return { content: "", reasoning: "deciding", toolCalls: mixed ? [decision, write] : [decision] };
+      assert.deepEqual(msgs[1].toolCalls, mixed ? [decision, write] : [decision]);
+      assert.equal(msgs[1].reasoningContent, "deciding");
+      assert.equal(msgs[2].toolCallId, "d");
+      return { content: "answer", toolCalls: [] };
     });
-    assert.equal(outcome.content, "saved your file");
-    assert.equal(outcome.exhausted, false);
-    assert.equal(executions, 1, "the real write executes exactly once");
-    assert.equal(recorded, 1);
-    assert.equal(outcome.toolRounds, 1, "virtual decisions consume no tool budget");
-    assert.equal(repairs, mixed ? 0 : 1);
-    assert.equal(tokens.calls, requests, "every repair is accounted separately");
-    assert.equal(tokens.input, requests * 10);
-    assert.equal(messages.length, 3, "only trigger and real tool round enter history");
+    const outcome = await runToolTurn(messages, { registry, maxRounds: 1, chat, onRoundComplete: (round) => { rounds.push(round); } });
+    assert.equal(outcome.content, "answer");
+    assert.equal(executions, mixed ? 1 : 0);
+    assert.equal(rounds.length, 1);
+    assert.deepEqual(rounds[0].calls, mixed ? [decision, write] : [decision]);
+    assert.equal(requests, 2);
   }
-  ok("chime reply: decision-only and mixed calls never execute chime or replay real tools");
-
+  ok("chime reply: decision-only and mixed calls retain their full calls, reasoning and paired results");
   let requests = 0;
-  let repairs = 0;
-  const answerChat = chimeReplyChat(async () => {
-    requests++;
-    return { content: "Here is the answer", reasoning: "thinking", toolCalls: [decision] };
-  }, async () => { repairs++; });
-  assert.deepEqual(await answerChat(trigger), { content: "Here is the answer", reasoning: "thinking", toolCalls: [] });
-  assert.equal(requests, 1);
-  assert.equal(repairs, 0, "text already streamed is preserved without duplicate delivery");
-  requests = 0;
-  await assert.rejects(chimeReplyChat(async () => {
-    requests++;
-    return { content: "", toolCalls: [decision] };
-  })(trigger), /did not provide a reply/);
-  assert.equal(requests, 2, "a model ignoring repair cannot loop forever");
-  assert.deepEqual(trigger, [{ role: "user", content: "Alice: @Glove should you respond?" }]);
-  ok("chime reply: keeps existing answers, bounds failed repairs and never mutates the trigger");
-
   const rejection = new Error("model endpoint returned HTTP 400 Bad Request: tools are not supported");
   requests = 0;
   const compatibilityChat = chimeReplyChat(async (_m, _c, tools) => {
@@ -913,12 +879,7 @@ const ok = (name: string): void => {
     requests = 0;
     await assert.rejects(chimeReplyChat(async () => { requests++; throw failure; })(trigger), err => err === failure);
     assert.equal(requests, 1, "only explicit tool compatibility failures are retried");
-    requests = 0;
-    await assert.rejects(chimeReplyChat(async () => {
-      if (++requests === 1) return { content: "", toolCalls: [decision] };
-      throw failure;
-    })(trigger), err => err === failure);
-    assert.equal(requests, 2, "repair errors propagate without further retries");
+
   }
   requests = 0;
   await assert.rejects(chimeReplyChat(async () => { requests++; throw rejection; })(trigger,
@@ -2371,14 +2332,15 @@ const ok = (name: string): void => {
     const client = new LlmClient({ apiUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/chat/completions`, apiKey: "none", model: "local", stream: false, timeoutMs: 5000 });
     const sharedTools = chimeTools([{ name: "file_read", description: "Read a file", parameters: { type: "object" } }]);
     assert.equal((await decideChime((m, t, signal, options) => client.chat(m, undefined, t, signal, options),
-      sharedContext, undefined, undefined, undefined, undefined, sharedTools))?.respond, true);
+      sharedContext, undefined, undefined, undefined, undefined, sharedTools, (exchange) => { sharedContext.push(...exchange); }))?.respond, true);
     await chimeReplyChat(client.chat.bind(client))(sharedContext, undefined, sharedTools.filter(tool => tool.name !== "chime"));
-    assert.deepEqual(wireRequests[0].messages.slice(0, -1), wireRequests[1].messages);
+    assert.deepEqual(wireRequests[1].messages.slice(0, wireRequests[0].messages.length), wireRequests[0].messages,
+      "the serialized reply extends the complete decision request prefix");
     assert.deepEqual(wireRequests[0].tools, wireRequests[1].tools);
     assert.equal(wireRequests[0].tool_choice, wireRequests[1].tool_choice);
     assert.equal(wireRequests[0].max_tokens, CHIME_MAX_TOKENS);
     assert.equal(wireRequests[1].max_tokens, undefined);
-    assert.deepEqual(sharedContext, originalContext, "decision does not mutate or persist its suffix");
+    assert.deepEqual(sharedContext.slice(0, originalContext.length), originalContext, "retaining the decision never rewrites earlier context");
     const apiBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     const toolFree = new LlmClient({ apiUrl: `${apiBase}/no-tools`, apiKey: "none", model: "local", stream: false, timeoutMs: 5000 });
     const beforeFallback = wireRequests.length;
@@ -2388,11 +2350,11 @@ const ok = (name: string): void => {
     assert.equal(wireRequests.at(-1)!.tool_choice, undefined, "tool-free fallback omits both fields on HTTP");
 
     const interrupted = new LlmClient({ apiUrl: `${apiBase}/decision-only`, apiKey: "none", model: "local", stream: false, timeoutMs: 5000 });
-    const ctrl = new AbortController();
-    const beforeRepair = wireRequests.length;
-    await assert.rejects(chimeReplyChat(interrupted.chat.bind(interrupted), async () => { ctrl.abort(); })(
-      sharedContext, undefined, undefined, ctrl.signal), InterruptedError);
-    assert.equal(wireRequests.length, beforeRepair + 1, "activity before a repair prevents any stale HTTP request");
+    const beforeDecision = wireRequests.length;
+    const replyDecision = await chimeReplyChat(interrupted.chat.bind(interrupted))(sharedContext);
+    assert.equal(replyDecision.toolCalls[0].name, "chime", "reply calls reach the registered tool handler");
+    assert.equal(wireRequests.length, beforeDecision + 1);
+
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
@@ -5811,14 +5773,16 @@ const ok = (name: string): void => {
     let calls = 0;
     const chat = chimeReplyChat(archiveChat(archive, { ...scope, purpose: "reply-candidate" }, async () => {
       calls++;
-      return { content: "", toolCalls: calls === 1 ? [decision] : [decision, write] };
+      return { content: "", toolCalls: [decision, write] };
     }));
     const result = await chat([{ role: "user", content: "write once" }], undefined,
       [{ name: "write", description: "write", parameters: {} }]);
     archive.record("reply.accepted", { ...scope, purpose: "reply" }, result);
     const observer = archiveTools(archive, scope);
-    observer.started(write, 0);
-    observer.finished({ role: "tool", name: "write", toolCallId: "w", content: "saved once" }, 0);
+    observer.started(decision, 0);
+    observer.finished({ role: "tool", name: "chime", toolCallId: "d", content: "decision retained" }, 0);
+    observer.started(write, 1);
+    observer.finished({ role: "tool", name: "write", toolCallId: "w", content: "saved once" }, 1);
     // Simulate a crash after the tool result, before the atomic turn checkpoint.
     archive.close();
     archive = new ConversationArchive(dir);
@@ -5826,15 +5790,16 @@ const ok = (name: string): void => {
     for (const [id, data] of archive.restoreContexts()) if (data) restored.restore(id, data);
     assert.equal(recoverTurns(archive, restored), 1);
     const entries = restored.get("c").snapshot();
-    assert.deepEqual(entries[1].toolCalls, [write]);
-    assert.equal(entries[2].toolCallId, "w");
-    assert.equal(entries[2].content, "saved once");
-    assert.equal(entries.filter(e => e.role === "tool").length, 1, "no duplicated round or phantom chime result");
+    assert.deepEqual(entries[1].toolCalls, [decision, write]);
+    assert.equal(entries[2].toolCallId, "d");
+    assert.equal(entries[3].toolCallId, "w");
+    assert.equal(entries[3].content, "saved once");
+    assert.equal(entries.filter(e => e.role === "tool").length, 2, "each real and chime call has one paired result");
     assert.equal(recoverTurns(archive, restored), 0);
-    assert.equal(calls, 2, "recovery never replays model calls");
-    assert.equal([...archive.records()].filter(r => r.type === "model.finished" && r.scope.purpose === "reply-candidate").length, 2,
-      "raw rejected and mixed responses remain in the durable archive");
-    ok("archive: reply repair recovery restores only accepted calls with correctly paired results");
+    assert.equal(calls, 1, "recovery never replays model calls");
+    assert.equal([...archive.records()].filter(r => r.type === "model.finished" && r.scope.purpose === "reply-candidate").length, 1,
+      "the full mixed response remains in the durable archive");
+    ok("archive: reply recovery retains chime and real calls with correctly paired results");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -6103,6 +6068,95 @@ const ok = (name: string): void => {
     assert.equal(recovered.find("posted")!.content, "x²", "delivery text remains available for edit tracking");
     assert.equal(recoverTurns(archive, store), 0, "recovery still happens once");
     ok("prompt prefix: crash recovery retains raw round/final text separately from formatted Discord delivery");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// Unified chime history retains the exact decision request prefix and complete groups.
+{
+  const opts = { systemPrompt: "  master\n", maxMessages: 10, enableImages: false, imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024 };
+  for (const respond of [false, true]) {
+    const context = new ChannelContext();
+    context.seeded = true;
+    context.pushUser("Alice", "hello", "1", 1, []);
+    let request: ChatMessage[] = [];
+    let exchange: ChatMessage[] = [];
+    let attempts = 0;
+    const prefix = await contextToMessages(context, opts);
+    const decision = await decideChime(async (messages) => {
+      request = structuredClone(messages);
+      if (++attempts === 1) return { content: "unusable", toolCalls: [] };
+      return { content: "", reasoning: "  decision reasoning  ", toolCalls: [{ id: "decision", name: "chime", arguments: JSON.stringify({ respond, reason: "because" }) }] };
+    }, prefix, undefined, undefined, undefined, undefined, chimeTools([]), (messages) => {
+      exchange = messages;
+      context.appendExchange(messages, "exchange");
+    });
+    assert.equal(decision?.respond, respond);
+    const retained = await contextToMessages(context, opts);
+    assert.deepEqual(JSON.parse(JSON.stringify(retained.slice(0, request.length))), JSON.parse(JSON.stringify(request)),
+      "reply extends the exact successful decision request, including repair instructions");
+    assert.equal(retained[request.length].reasoningContent, "  decision reasoning  ");
+    assert.equal(retained[request.length + 1].toolCallId, "decision");
+    context.appendExchange(exchange, "exchange");
+    assert.equal(context.length, retained.length - 1, "exchange restoration is idempotent");
+    const restored = ChannelContext.restore(JSON.parse(JSON.stringify(context.serialize())));
+    assert.deepEqual(await contextToMessages(restored, opts), retained, "system instructions, calls, results and reasoning survive restart");
+    const timestamp = restored.snapshot()[1].ts;
+    restored.seedFrom([{ role: "user", id: "2", ts: timestamp, content: "new", name: "Bob", attachments: [] }]);
+    assert.deepEqual((await contextToMessages(restored, opts)).slice(0, retained.length), retained,
+      "catch-up cannot insert a user message inside a decision exchange");
+    const compacted = await restored.compact(3, async () => "summary");
+    assert.equal(compacted.ok, true);
+    assert.deepEqual(restored.snapshot().map((entry) => entry.role), ["user"], "compaction folds the whole exchange, including continuation instruction");
+    context.pushUser("Bob", "new", "2", Date.now(), []);
+    context.emergencyShrink("2", 1, "", 10);
+    assert.deepEqual(context.snapshot().map((entry) => entry.role), ["user"], "overflow leaves no orphaned decision instruction or result");
+    context.reset();
+    assert.equal(context.length, 0);
+  }
+  let accepted = 0;
+  await assert.rejects(decideChime(async () => { throw new InterruptedError(); }, [], undefined, undefined,
+    undefined, undefined, chimeTools([]), () => { accepted++; }), InterruptedError);
+  await decideChime(async () => ({ content: "invalid", toolCalls: [] }), [], undefined, undefined,
+    undefined, undefined, chimeTools([]), () => { accepted++; });
+  assert.equal(accepted, 0, "interrupted and invalid decisions cannot enter history");
+  ok("chime history: YES/NO repairs preserve exact prefixes through restart, catch-up, compaction, overflow and clear");
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-chime-history-"));
+  let archive = new ConversationArchive(dir);
+  try {
+    for (const channelId of ["journal", "checkpoint", "trimmed"]) {
+      const checkpoint = channelId !== "journal";
+      const context = new ChannelContext();
+      context.pushUser("Alice", "hello", "trigger", 1, []);
+      const scope = { channelId, turnId: channelId, messageId: "trigger", attempt: 0 };
+      archive.record("context.checkpoint", { channelId }, context.serialize());
+      archive.record("turn.started", scope, { id: "trigger", chime: true });
+      await decideChime(async () => ({ content: "", toolCalls: [{ id: "d", name: "chime", arguments: '{"respond":false,"reason":"quiet"}' }] }),
+        [{ role: "user", content: "Alice: hello" }], undefined, undefined, undefined, undefined, chimeTools([]), (messages) => {
+          archive.record("chime.accepted", scope, { exchangeId: channelId, messages });
+          if (checkpoint) {
+            context.appendExchange(messages, channelId);
+            if (channelId === "trimmed") context.emergencyShrink("trigger", 1, "", 10);
+            archive.record("context.checkpoint", { channelId }, context.serialize());
+          }
+        });
+    }
+    archive.close();
+    archive = new ConversationArchive(dir);
+    const restored = new ChannelContextStore();
+    for (const [id, data] of archive.restoreContexts()) if (data) restored.restore(id, data);
+    assert.equal(recoverTurns(archive, restored), 2);
+    for (const channelId of ["journal", "checkpoint"]) {
+      const entries = restored.get(channelId).snapshot();
+      assert.deepEqual(entries.map((entry) => entry.role), ["user", "system", "assistant", "tool", "system"]);
+      assert.equal(entries[3].toolCallId, "d");
+      assert.equal(restored.get(channelId).has("trigger"), true);
+    }
+    assert.deepEqual(restored.get("trimmed").snapshot().map((entry) => entry.role), ["user"], "recovery cannot resurrect a deliberately trimmed exchange");
+    assert.equal(recoverTurns(archive, restored), 0);
+    ok("chime history: crash recovery restores NO decisions once with or without their atomic checkpoint");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 

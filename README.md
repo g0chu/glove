@@ -227,23 +227,28 @@ When chime is enabled, decisions and replies share the exact system prompt,
 full conversation (including reasoning, tool calls/results, summary and
 attachments), and ordered tool definitions. Both use `tool_choice: "auto"`:
 changing this can change the server's rendered prompt. The decision adds a
-short **system-role** instruction **after** that shared context; a reply uses the shared
-context directly. The chime tool is advertised during replies for matching
-schemas, but reply handling removes it before tool execution or history
-recording. A decision-only reply gets one repair with unchanged tool schemas; a second
-failure stops with an error instead of consuming tool rounds. Existing reply
-text and real tool calls are preserved. Decision calls never execute tools;
-only a single valid chime call is accepted. Unusable decisions get one repair
-with the same tool schemas and `tool_choice: "auto"`, plus a trailing instruction.
-Repairs remain bounded to one retry and validate the result before accepting it.
-The decision and its instructions are never added to working conversation history. Mentions still bypass the decision.
+short **system-role** instruction **after** that shared context. Completed YES
+and NO decisions are retained in the same channel history: the instruction,
+original assistant text/reasoning and chime call, a matching tool result, and
+an instruction ending the decision phase. A YES reply extends that exact
+request prefix; a NO waits for new activity with its decision still in history.
+The decision exchange is checkpointed atomically and survives restart and
+crash recovery without duplication. Compaction and overflow remove exchanges
+whole, preserving call/result pairing. Interrupted or unusable decisions are
+not retained. Unusable decisions still get one repair with unchanged schemas
+and `tool_choice: "auto"`.
+
+During replies, chime is a registered local tool. Its call and result are
+retained with any other calls in the round, including mixed responses. The
+result tells the model to continue the reply already underway; mentions always
+receive a reply. These rounds use the normal `TOOLS_MAX_ROUNDS` limit.
 
 With no executable tools enabled, a reply receiving an explicit HTTP 400/422
 tool-compatibility rejection retries once without tool metadata. Other errors
 propagate, and configured executable tools are never silently disabled.
 Interruption signals apply to every repair/fallback; already executed tools
 are not replayed. Every raw request/result is archived and counted separately;
-crash recovery uses the accepted reply after virtual calls are removed, so
+crash recovery uses the accepted reply with all its paired tool results, so
 rejected candidates cannot create duplicate rounds or mispaired tool results.
 
 Compaction also sends the full active context with the same ordered tool
