@@ -11,6 +11,7 @@
  *
  * Both are bounded: a body scan must never hang a turn.
  */
+import { StringDecoder } from "node:string_decoder";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -69,7 +70,7 @@ function rgScan(
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     try {
-      child = spawn(rg, ["-l", "-i", "--fixed-strings", "-g", "*.md", query, dir], {
+      child = spawn(rg, ["-l", "-i", "--fixed-strings", "--null", "-g", "*.md", "--", query, dir], {
         stdio: ["ignore", "pipe", "pipe"],
       });
     } catch (e) {
@@ -87,16 +88,21 @@ function rgScan(
     const files: string[] = [];
     let partial = false;
     let capped = false;
-    const stderr: string[] = [];
+    let stderr = "";
     const timer = setTimeout(() => {
       partial = true;
       child.kill();
     }, budgetMs);
+    const decoder = new StringDecoder("utf8");
+    let pending = "";
     out.on("data", (chunk: Buffer) => {
-      for (const line of chunk.toString("utf8").split("\n")) {
-        const t = line.trim();
-        if (t.length === 0) continue;
-        const base = t.slice(t.lastIndexOf("/") + 1);
+      if (capped) return;
+      pending += decoder.write(chunk);
+      let end: number;
+      while ((end = pending.indexOf("\0")) >= 0) {
+        const name = pending.slice(0, end);
+        pending = pending.slice(end + 1);
+        const base = path.basename(name);
         if (base.endsWith(".md")) files.push(base.slice(0, -3));
         if (files.length >= maxFiles) {
           capped = true;
@@ -105,7 +111,7 @@ function rgScan(
         }
       }
     });
-    err.on("data", (c: Buffer) => stderr.push(c.toString("utf8")));
+    err.on("data", (c: Buffer) => { stderr = (stderr + c.toString("utf8")).slice(0, 200); });
     child.on("error", (e: NodeJS.ErrnoException) => {
       clearTimeout(timer);
       if (e.code === "ENOENT") {
@@ -120,7 +126,7 @@ function rgScan(
         // 0 = matches, 1 = no matches, partial/capped = killed on deadline or hit cap.
         resolve({ files, partial, engine: "rg" });
       } else {
-        reject(new Error(`ripgrep failed (${code}): ${stderr.join(" ").slice(0, 200)}`));
+        reject(new Error(`ripgrep failed (${code}): ${stderr}`));
       }
     });
   });

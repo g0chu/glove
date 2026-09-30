@@ -56,26 +56,34 @@ export function runShellCommand(
   onChild?: (child: ChildProcess) => void,
 ): Promise<ShellRun> {
   return new Promise((resolve, reject) => {
+    let outputBytes = 0;
+    let combinedCapped = false;
     const child = exec(
       command,
       { cwd, shell: "/bin/sh", timeout: timeoutMs, maxBuffer: maxOutputBytes, encoding: "utf8" },
       (err, stdout, stderr) => {
         const e = err as { stdout?: unknown; stderr?: unknown; code?: unknown; killed?: boolean } | null;
-        const out = String(e?.stdout ?? stdout);
-        const errOut = String(e?.stderr ?? stderr);
+        const rawOut = String(e?.stdout ?? stdout);
+        const rawErr = String(e?.stderr ?? stderr);
+        const out = new TextDecoder().decode(Buffer.from(rawOut).subarray(0, maxOutputBytes), { stream: true });
+        const remaining = Math.max(0, maxOutputBytes - Buffer.byteLength(out));
+        const errOut = new TextDecoder().decode(Buffer.from(rawErr).subarray(0, remaining), { stream: true });
+        if (combinedCapped) {
+          resolve({ exitCode: null, timedOut: false, capped: true, stdout: out, stderr: errOut });
+          return;
+        }
         if (err === null) {
           resolve({ exitCode: 0, timedOut: false, capped: false, stdout: out, stderr: errOut });
           return;
         }
-        // killed: the deadline (or an external signal) ended the command.
-        if (e?.killed === true) {
-          resolve({ exitCode: null, timedOut: true, capped: false, stdout: out, stderr: errOut });
-          return;
-        }
         const code = e?.code;
-        // The output cap killed the command; the args carry the partial output.
+        // Node may mark a maxBuffer kill as killed too; classify the cap first.
         if (typeof code === "string" && code.includes("MAXBUFFER")) {
           resolve({ exitCode: null, timedOut: false, capped: true, stdout: out, stderr: errOut });
+          return;
+        }
+        if (e?.killed === true) {
+          resolve({ exitCode: null, timedOut: true, capped: false, stdout: out, stderr: errOut });
           return;
         }
         if (typeof code === "number") {
@@ -87,6 +95,15 @@ export function runShellCommand(
         reject(new ToolError(`cannot start /bin/sh: ${err.message}`));
       },
     );
+    const countOutput = (chunk: string): void => {
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > maxOutputBytes && !combinedCapped) {
+        combinedCapped = true;
+        child.kill();
+      }
+    };
+    child.stdout?.on("data", countOutput);
+    child.stderr?.on("data", countOutput);
     onChild?.(child);
   });
 }
@@ -149,7 +166,7 @@ export const SHELL_EXEC_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      command: { type: "string", description: "Shell command; pipes, redirects and && are supported." },
+      command: { type: "string", minLength: 1, description: "Shell command; pipes, redirects and && are supported." },
       timeout_s: { type: "integer", minimum: 1, description: "Deadline in seconds (minimum 1; defaults to and is clamped to the configured cap)." },
     },
     required: ["command"],

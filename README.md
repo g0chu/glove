@@ -139,9 +139,9 @@ without the affected tensor/MTP combination.
 The bot can run four optional tool families, all **in-process** (no
 sidecars, no Docker). All are **opt-in** (default `false`) and need a model
 endpoint that supports function calling (`tools`). With all disabled, the bot
-behaves exactly as before. The model is only told about the families you
-enabled — a short system-prompt note lists exactly those, so the bot never
-claims tools it does not have.
+advertises no executable tool families. Enabled tools are described in their
+function schemas; tool guidance is not appended to `MODEL_SYSTEM_PROMPT`.
+The local `chime` schema is also shared by decision and reply requests.
 
 - **web tools**: `web_search` (DuckDuckGo) and `web_fetch` (plain
   pinned-socket HTTP fetch with SSRF protection, content extraction, and a
@@ -159,24 +159,30 @@ claims tools it does not have.
 - **wikipedia tools**: `wikipedia_search` and `wikipedia_read` over a local
   **offline Wikipedia archive** (a ZIM file pointed to by `ZIM_FILE`, e.g.
   the en.wikipedia "all nopic" dump in `./workspace`). The reader works
-  directly on the file — binary search over the ~20M-entry directory plus
-  a time-budgeted title scan, so lookups on a 50 GB archive take well under
-  a second. `wikipedia_read` returns the article as clean plain text
-  (references, TOC and navigation dropped).
+  directly on the file using indexed path lookups and time-budgeted title scans. `wikipedia_read` returns the article as clean plain text
+  (references, TOC and navigation dropped). Choose `intro`, `sections`,
+  `section`, or `full` when reading.
+- **vault tools**: `vault_search`, `vault_read`, and `vault_links` browse
+  an offline Wikipedia markdown vault configured with `VAULT_DIR`. Read modes
+  match the ZIM tools, and search also checks note contents.
+- **memory tool**: `memory` manages persistent named notes shared across
+  conversations. See [Persistent memory](#persistent-memory).
 
 A turn may run several model rounds: a round that ends in tool calls keeps
 its text in place (it stays in the channel above the activity lines), the
-tools execute — each call is posted as its own persistent activity message
+tools execute — calls appear in the turn’s shared activity message
 (name + arguments only; `DISCORD_SHOW_TOOL_ACTIVITY`) — and the next round
-continues with the results in context. Only the final reply is recorded in
-the channel history. `TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
+continues with the results in context. Completed rounds, including narration,
+reasoning, tool calls/results, and the final reply, are recorded in channel history.
+`TOOLS_MAX_ROUNDS` (default 5) caps the rounds.
 
 ### Setup
 
 Nothing to build or run — the tools live in the bot process. Just set
-`WEBTOOLS_ENABLED=true`, `FILETOOLS_ENABLED=true`, `SHELLTOOLS_ENABLED=true`
-and/or `ZIMTOOLS_ENABLED=true` (with `ZIM_FILE` pointing at a ZIM archive)
-in `.env` and restart the bot.
+`WEBTOOLS_ENABLED=true`, `FILETOOLS_ENABLED=true`, `SHELLTOOLS_ENABLED=true`,
+`ZIMTOOLS_ENABLED=true` (with `ZIM_FILE` pointing at a ZIM archive),
+`VAULTTOOLS_ENABLED=true` (with `VAULT_DIR` pointing at a markdown vault),
+and/or `MEMORYTOOLS_ENABLED=true` in `.env` and restart the bot.
 
 ### Notes
 
@@ -343,8 +349,17 @@ the prompt. Refresh failures stop the attempt rather than answer from stale hist
 The bot’s own activity is excluded. Channel activity cancels generation as well
 as prompt processing.
 
-Offline Wikipedia browsing: `wikipedia_read` and `vault_read` accept `mode: "outline"`
-to list section IDs and headings without loading the article into context. Pass
+Offline Wikipedia browsing: `wikipedia_read` and `vault_read` expose these choices:
+
+- `mode: "intro"`: the page introduction before article sections, including a page title if present; paginate to read a long introduction.
+- `mode: "sections"`: section IDs and headings, without article body text.
+- `mode: "section", section: "2"`: one section and its subsections, by ID or exact heading.
+- `mode: "full"`: paginated article text (the default).
+
+For example, call `wikipedia_read({"title":"Albert Einstein","mode":"sections"})`,
+then `wikipedia_read({"title":"Albert Einstein","mode":"section","section":"2"})`.
+`outline` remains an alias for `sections`; legacy `abstract` returns a 1000-character prefix.
+ Pass
 `section` (an ID or exact heading; `lead` selects introductory text) to read only
 that section and its subsections. Pass `query` for case-insensitive literal matches
 with short surrounding excerpts. `offset` and `max_chars` paginate the selected
@@ -352,3 +367,23 @@ text; responses report the next offset when more remains. Reads default to 3000
 characters, capped by `TOOLS_MAX_RESULT_CHARS`. Sections and matches remain
 accessible beyond that cap. Outlines are paginated too; their offsets refer to
 the rendered outline. Query offsets refer to the selected article/section text.
+
+### Persistent memory
+
+Set `MEMORYTOOLS_ENABLED=true` and restart to expose the `memory` tool. It can
+`save`, `read`, `search`, `list`, and `delete` named notes; saving the same key
+replaces its content. Search matches note keys and contents without regard to
+case. Notes survive restarts, compaction, and `!clear`, and are retrieved through
+tool calls rather than automatically added to every prompt.
+
+The store is **shared across all channels and users**: include user/channel
+identity in keys for personal preferences. It is not private per-user storage.
+`MEMORYTOOLS_FILE` defaults to `./data/memory.json`; its parent directory is
+created on the first save. `MEMORYTOOLS_MAX_BYTES` (default 1000000) bounds the
+entire JSON store, and `TOOLS_MAX_RESULT_CHARS` caps results. Writes are serialized
+and use a synced temporary file plus atomic rename. Invalid stores return tool
+errors without overwriting the file. Use one bot process per memory file.
+Deleting a note removes it from this store; tool calls/results already captured
+in the durable archive remain subject to the archive retention rules.
+
+The tool functionality and schema review is documented in [TOOL_AUDIT.md](TOOL_AUDIT.md).

@@ -154,8 +154,12 @@ export function articleText(html: string): string {
     const line = out[i];
     if (/^#{1,6} /.test(line)) {
       let j = i + 1;
-      while (j < out.length && !/^#{1,6} /.test(out[j])) j++;
-      const hasContent = out.slice(i + 1, j).some((l) => l.trim().length > 0);
+      while (j < out.length) {
+        const nextHeading = /^(#{1,6}) /.exec(out[j]);
+        if (nextHeading && nextHeading[1].length <= /^#{1,6}/.exec(line)![0].length) break;
+        j++;
+      }
+      const hasContent = out.slice(i + 1, j).some((l) => l.trim().length > 0 && !/^#{1,6} /.test(l));
       if (hasContent) kept.push(line);
     } else {
       kept.push(line);

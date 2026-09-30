@@ -4,7 +4,7 @@ import { lower1 } from "./vault/corpus.js";
 
 /** Optional selectors for a targeted article read. */
 export interface WikiReadOptions {
-  mode?: "full" | "abstract" | "outline";
+  mode?: "full" | "abstract" | "outline" | "intro" | "sections" | "section";
   section?: string;
   query?: string;
   offset?: number;
@@ -13,8 +13,8 @@ export interface WikiReadOptions {
 
 /** Schema shared by the ZIM and vault read tools. */
 export const WIKI_READ_PROPERTIES: Record<string, unknown> = {
-  mode: { type: "string", enum: ["full", "abstract", "outline"], default: "full", description: "full: paginated text; abstract: first 1000 characters of selected text; outline: heading IDs, ignoring section/query. query takes precedence over abstract." },
-  section: { type: "string", description: "Outline ID or exact case-insensitive heading, including subsections. lead selects text before the first heading. Duplicate headings require an ID." },
+  mode: { type: "string", enum: ["full", "intro", "sections", "section", "abstract", "outline"], default: "full", description: "Choose what to see: intro returns the introduction before article sections; sections lists heading IDs and titles only; section returns the named section and its subsections (requires section); full returns paginated article text. Legacy outline equals sections; abstract returns the first 1000 characters. sections/outline ignore section/query; query filters selected text in other modes." },
+  section: { type: "string", description: "Outline ID or exact case-insensitive heading, including subsections. lead selects the page introduction, including an initial title heading. Duplicate headings require an ID." },
   query: { type: "string", maxLength: 256, description: "Literal case-insensitive text to find in the selected article/section (max 256 characters). Returns up to 10 excerpts per call." },
   offset: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0, description: "Zero-based character offset in selected text, or rendered outline in outline mode. Continue with the returned next offset." },
   max_chars: { type: "integer", minimum: 1, description: "Text/excerpt character budget (default 3000, clamped to 1 and the configured cap). Headers and pagination notes are extra." },
@@ -23,13 +23,16 @@ export const WIKI_READ_PROPERTIES: Record<string, unknown> = {
 /** Validate model-supplied browsing arguments. */
 export function wikiReadOptions(args: Record<string, unknown>, cap: number): WikiReadOptions {
   const mode = argOptionalString(args, "mode");
-  if (mode !== undefined && mode !== "full" && mode !== "abstract" && mode !== "outline") {
-    throw new Error('argument "mode" must be "full", "abstract" or "outline"');
+  if (mode !== undefined && !["full", "abstract", "outline", "intro", "sections", "section"].includes(mode)) {
+    throw new Error('argument "mode" must be "full", "abstract" or "outline", or "intro", "sections", "section"');
   }
+  const section = argOptionalString(args, "section");
+  if (mode === "section" && !section) throw new Error("section mode requires a section ID or heading; use mode sections first");
+  if (mode === "intro" && section) throw new Error("intro mode cannot select a section");
   const query = argOptionalString(args, "query");
   if (query && query.length > 256) throw new Error("query too long (max 256 chars)");
   return {
-    mode, section: argOptionalString(args, "section"), query,
+    mode: mode as WikiReadOptions["mode"], section, query,
     offset: argInt(args, "offset", 0, 0, Number.MAX_SAFE_INTEGER),
     maxChars: argInt(args, "max_chars", Math.min(3000, cap), 1, cap),
   };
@@ -52,9 +55,11 @@ function sections(text: string): Section[] {
     }
     offset += line.length + 1;
   }
-  for (let i = 0; i < out.length; i++) {
-    const next = out.slice(i + 1).find((s) => s.level <= out[i].level);
-    if (next) out[i].end = next.start;
+  const following: Section[] = [];
+  for (let i = out.length - 1; i >= 0; i--) {
+    while (following.length && following[following.length - 1].level > out[i].level) following.pop();
+    out[i].end = following[following.length - 1]?.start ?? text.length;
+    following.push(out[i]);
   }
   return out;
 }
@@ -64,15 +69,23 @@ export function browseWiki(text: string, options: WikiReadOptions, cap: number):
   const budget = Math.max(1, Math.min(options.maxChars ?? 3000, cap));
   const offset = Math.max(0, options.offset ?? 0);
   const headings = sections(text);
-  if (options.mode === "outline") {
-    const outline = ["lead: text before the first heading", ...headings.map((s) => `${s.id}: ${"#".repeat(s.level)} ${s.title}`)].join("\n");
+  if (options.mode === "outline" || options.mode === "sections") {
+    const outline = ["lead: page introduction (including an initial title heading)", ...headings.map((s) => `${s.id}: ${"#".repeat(s.level)} ${s.title}`)].join("\n");
     return page(outline, offset, budget);
   }
+  if (options.mode === "section" && !options.section) throw new Error("section mode requires a section ID or heading; use mode sections first");
+  if (options.mode === "intro" && options.section) throw new Error("intro mode cannot select a section");
   let selected = text;
+  // An initial H1 is commonly the page title, not the first article section.
+  const introEnd = (headings[0]?.level === 1
+    ? headings[1]
+    : headings[0])?.start ?? text.length;
+  if (options.mode === "intro") selected = text.slice(0, introEnd);
   if (options.section) {
-    if (options.section.toLowerCase() === "lead") selected = text.slice(0, headings[0]?.start ?? text.length);
+    if (options.section.toLowerCase() === "lead") selected = text.slice(0, introEnd);
     else {
-      const matches = headings.filter((s) => s.id === options.section || s.title.toLowerCase() === options.section?.toLowerCase());
+      const byId = headings.find((s) => s.id === options.section);
+      const matches = byId ? [byId] : headings.filter((s) => s.title.toLowerCase() === options.section?.toLowerCase());
       if (matches.length !== 1) throw new Error(matches.length ? "ambiguous section heading; use an outline section ID" : "section not found; use mode outline to list sections");
       selected = text.slice(matches[0].start, matches[0].end);
     }

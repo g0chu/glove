@@ -50,7 +50,7 @@ export interface VaultToolsOptions {
 
 export class VaultTools {
   private corpusPromise: Promise<VaultCorpus> | null = null;
-  private activeChild: ChildProcess | null = null;
+  private readonly activeChildren = new Set<ChildProcess>();
   private stopped = false;
 
   constructor(private readonly opts: VaultToolsOptions) {}
@@ -78,7 +78,11 @@ export class VaultTools {
       rgPath: this.opts.rgPath,
       fake: this.opts.bodyScan,
       onChild: (c) => {
-        this.activeChild = c;
+        if (this.stopped) c.kill();
+        else {
+          this.activeChildren.add(c);
+          c.once("close", () => this.activeChildren.delete(c));
+        }
       },
     });
     if (titles.results.length === 0 && bodies.files.length === 0) {
@@ -166,9 +170,8 @@ export class VaultTools {
   abort(): void {
     this.stopped = true;
     this.corpusPromise = null;
-    const c = this.activeChild;
-    this.activeChild = null;
-    c?.kill();
+    for (const child of this.activeChildren) child.kill();
+    this.activeChildren.clear();
   }
 
   /** Resolve a note name to its file stem (direct file, else exact title). */
@@ -214,7 +217,7 @@ export const VAULT_SEARCH_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", maxLength: 256, description: "A note title or part of one, or text to find inside notes (e.g. \"Albert Einstein\", \"photosynthesis\")." },
+      query: { type: "string", minLength: 1, maxLength: 256, description: "A note title or part of one, or text to find inside notes (e.g. \"Albert Einstein\", \"photosynthesis\")." },
       max_results: { type: "integer", minimum: 1, maximum: 10, default: 5, description: "Requested results per list (default 5); clamped to 1-10 and the configured cap." },
     },
     required: ["query"],
@@ -224,11 +227,11 @@ export const VAULT_SEARCH_SPEC: ToolSpec = {
 
 export const VAULT_READ_SPEC: ToolSpec = {
   name: "vault_read",
-  description: "Read an offline Wikipedia note as paginated markdown. Resolves file stems first, then exact titles (case/space/underscore-insensitive); ambiguous titles require a listed file stem. Flat note names only; path separators and '..' are rejected. Frontmatter is omitted except in abstract mode. Use outline, section or query for targeted reads; cite the note title.",
+  description: "Read an offline Wikipedia note as paginated markdown. Resolves file stems first, then exact titles (case/space/underscore-insensitive); ambiguous titles require a listed file stem. Flat note names only; path separators and '..' are rejected. Frontmatter is omitted except in abstract mode. Choose mode intro for introductory text, sections for heading IDs, section with an ID/heading for its text, or full for the article. offset/max_chars paginate; query finds excerpts. Cite the note title.",
   parameters: {
     type: "object",
     properties: {
-      note: { type: "string", description: "The exact note title (e.g. \"Albert Einstein\") or file stem." },
+      note: { type: "string", minLength: 1, description: "The exact note title (e.g. \"Albert Einstein\") or file stem." },
       ...WIKI_READ_PROPERTIES,
     },
     required: ["note"],
@@ -242,7 +245,7 @@ export const VAULT_LINKS_SPEC: ToolSpec = {
   parameters: {
     type: "object",
     properties: {
-      note: { type: "string", description: "The exact note title (e.g. \"Albert Einstein\") or file stem." },
+      note: { type: "string", minLength: 1, description: "The exact note title (e.g. \"Albert Einstein\") or file stem." },
     },
     required: ["note"],
     additionalProperties: false,

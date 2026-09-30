@@ -170,6 +170,8 @@ export interface ToolsConfig {
   shell: ShellToolsConfig;
   zim: ZimToolsConfig;
   vault: VaultToolsConfig;
+  /** Optional bot-wide persistent note store. */
+  memory: { enabled: boolean; file: string; maxBytes: number };
   /** Max tool-execution rounds per turn before the turn is cut off. */
   maxRounds: number;
   /** Hard cap on characters in one tool result (all families). */
@@ -324,6 +326,11 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
         searchMaxResults: intEnv("VAULTTOOLS_SEARCH_MAX_RESULTS", 8, 1),
         scanBudgetMs: intEnv("VAULTTOOLS_SCAN_BUDGET_S", 10, 1) * 1000,
         rgPath: optional("VAULTTOOLS_RG_PATH", "rg"),
+      },
+      memory: {
+        enabled: boolEnv("MEMORYTOOLS_ENABLED", false),
+        file: optional("MEMORYTOOLS_FILE", "./data/memory.json"),
+        maxBytes: intEnv("MEMORYTOOLS_MAX_BYTES", 1_000_000, 1_024),
       },
       maxRounds: intEnv("TOOLS_MAX_ROUNDS", 5, 1),
       maxResultChars: intEnv("TOOLS_MAX_RESULT_CHARS", 200_000, 1_000),
