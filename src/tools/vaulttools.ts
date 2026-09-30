@@ -210,13 +210,12 @@ function renderFields(fields: Record<string, string>): string {
 
 export const VAULT_SEARCH_SPEC: ToolSpec = {
   name: "vault_search",
-  description:
-    "Search the offline Wikipedia vault of markdown notes on this machine (no internet needed) by note title and body text, case-insensitive (exact title, title prefix, title substring, plus a time-budgeted body scan). Returns matching note titles and the notes whose bodies contain the query. Use it for established facts — people, places, events, science topics.",
+  description: "Search offline Wikipedia note titles and literal text in markdown files, case-insensitive. Returns ranked title matches and matching file stems in separate lists; scans may be time-limited. Use vault_read for established facts.",
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", description: "A note title or part of one, or text to find inside notes (e.g. \"Albert Einstein\", \"photosynthesis\")." },
-      max_results: { type: "integer", description: "How many matches to return (1-10, default 5)." },
+      query: { type: "string", maxLength: 256, description: "A note title or part of one, or text to find inside notes (e.g. \"Albert Einstein\", \"photosynthesis\")." },
+      max_results: { type: "integer", minimum: 1, maximum: 10, default: 5, description: "Requested results per list (default 5); clamped to 1-10 and the configured cap." },
     },
     required: ["query"],
     additionalProperties: false,
@@ -225,8 +224,7 @@ export const VAULT_SEARCH_SPEC: ToolSpec = {
 
 export const VAULT_READ_SPEC: ToolSpec = {
   name: "vault_read",
-  description:
-    "Read one note of the offline Wikipedia vault by its exact title as returned by vault_search (spaces or underscores both work; a deduplicated \"(2)\" suffix is part of the name). Returns the note as markdown (frontmatter dropped); Use mode outline to list section IDs, section to read a heading and its subsections, query for matching excerpts, and offset/max_chars to paginate. Prefer targeted reads. mode \"abstract\" returns the frontmatter plus only the start of the note — for disambiguation without reading it all.",
+  description: "Read an offline Wikipedia note as paginated markdown. Resolves file stems first, then exact titles (case/space/underscore-insensitive); ambiguous titles require a listed file stem. Flat note names only; path separators and '..' are rejected. Frontmatter is omitted except in abstract mode. Use outline, section or query for targeted reads; cite the note title.",
   parameters: {
     type: "object",
     properties: {
@@ -240,8 +238,7 @@ export const VAULT_READ_SPEC: ToolSpec = {
 
 export const VAULT_LINKS_SPEC: ToolSpec = {
   name: "vault_links",
-  description:
-    "List the [[wikilinks]] inside one note of the offline Wikipedia vault — the notes it links to (deduplicated, capped at 50), without reading the whole note. Follow one with vault_read.",
+  description: "List up to 50 deduplicated unanchored [[wikilink]] targets from an offline note, in appearance order. Same flat-name resolution as vault_read; follow a target with vault_read.",
   parameters: {
     type: "object",
     properties: {

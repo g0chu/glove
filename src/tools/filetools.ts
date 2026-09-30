@@ -72,13 +72,13 @@ export class FileTools {
 /** OpenAI-compatible function specs for the file tools. */
 export const FILE_READ_SPEC: ToolSpec = {
   name: "file_read",
-  description: "Read a text file from the workspace. Large files can be read in windows with offset/limit (byte offsets).",
+  description: "Read a workspace text file using byte offset/limit. Returns the byte range and file size; output may be truncated. Use smaller windows if needed. Binary-looking files are rejected.",
   parameters: {
     type: "object",
     properties: {
       path: { type: "string", description: "File path relative to the workspace root." },
-      offset: { type: "integer", description: "Byte offset to start reading at (default 0)." },
-      limit: { type: "integer", description: "Maximum bytes to read (default: the bot's configured limit)." },
+      offset: { type: "integer", minimum: 0, maximum: 100_000_000, default: 0, description: "Zero-based byte offset (default 0; clamped to 0-100000000)." },
+      limit: { type: "integer", minimum: 0, maximum: 1_000_000, description: "Bytes to read; omitted or 0 uses the configured cap. Clamped to 0-1000000 and the configured cap." },
     },
     required: ["path"],
     additionalProperties: false,
@@ -87,13 +87,13 @@ export const FILE_READ_SPEC: ToolSpec = {
 
 export const FILE_WRITE_SPEC: ToolSpec = {
   name: "file_write",
-  description: "Create or overwrite a file in the workspace with the given full content. Use for new files or complete rewrites; for changing part of a file use file_edit.",
+  description: "Create or overwrite a workspace file with exact UTF-8 content, subject to the configured byte cap. Use file_edit for partial changes.",
   parameters: {
     type: "object",
     properties: {
       path: { type: "string", description: "File path relative to the workspace root." },
-      content: { type: "string", description: "The complete file content to write." },
-      create_dirs: { type: "boolean", description: "Create missing parent directories (default false)." },
+      content: { type: "string", description: "Complete content, preserving whitespace; empty string creates or clears a file." },
+      create_dirs: { type: "boolean", default: false, description: "Create missing parent directories (default false)." },
     },
     required: ["path", "content"],
     additionalProperties: false,
@@ -102,14 +102,14 @@ export const FILE_WRITE_SPEC: ToolSpec = {
 
 export const FILE_EDIT_SPEC: ToolSpec = {
   name: "file_edit",
-  description: "Edit a file in the workspace by replacing an exact text span. old_text must match the file content exactly (whitespace included); if it is missing, the edit fails and nothing is changed.",
+  description: "Replace exact, nonempty text in a workspace UTF-8 file. Replaces the first occurrence by default; fails without changes if no match or read/write caps are exceeded. Read the file first to preserve exact whitespace.",
   parameters: {
     type: "object",
     properties: {
       path: { type: "string", description: "File path relative to the workspace root." },
-      old_text: { type: "string", description: "The exact existing text to replace." },
-      new_text: { type: "string", description: "The replacement text." },
-      replace_all: { type: "boolean", description: "Replace every occurrence instead of just the first (default false)." },
+      old_text: { type: "string", minLength: 1, description: "Nonempty existing text, including leading/trailing whitespace." },
+      new_text: { type: "string", description: "Exact replacement text; empty string deletes the match." },
+      replace_all: { type: "boolean", default: false, description: "Replace every occurrence instead of just the first (default false)." },
     },
     required: ["path", "old_text", "new_text"],
     additionalProperties: false,
@@ -126,9 +126,9 @@ export function registerFileTools(registry: ToolRegistry, tools: FileTools): voi
     ),
   );
   registry.register(FILE_WRITE_SPEC, (args) =>
-    tools.write(argString(args, "path"), argString(args, "content"), asBool(args.create_dirs)),
+    tools.write(argString(args, "path"), argPresentString(args, "content"), asBool(args.create_dirs)),
   );
   registry.register(FILE_EDIT_SPEC, (args) =>
-    tools.edit(argString(args, "path"), argString(args, "old_text"), argPresentString(args, "new_text"), asBool(args.replace_all)),
+    tools.edit(argString(args, "path"), argPresentString(args, "old_text"), argPresentString(args, "new_text"), asBool(args.replace_all)),
   );
 }

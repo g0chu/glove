@@ -83,13 +83,12 @@ export class ZimTools {
 
 export const ZIM_SEARCH_SPEC: ToolSpec = {
   name: "wikipedia_search",
-  description:
-    "Search the local offline Wikipedia archive (a ZIM file of Wikipedia articles) by article title: exact, prefix and substring matches, case-insensitive. Returns a numbered list of article titles. Use it for established facts — people, places, events, science topics — without needing the internet. Body text is not searched.",
+  description: "Search offline Wikipedia article titles and paths, case-insensitive: exact, prefix, then substring. Returns titles and redirect markers; scans may be time-limited. Does not search article bodies. Use wikipedia_read for established facts.",
   parameters: {
     type: "object",
     properties: {
-      query: { type: "string", description: "An article title or part of one (e.g. \"Albert Einstein\", \"relativity\")." },
-      max_results: { type: "integer", description: "How many matches to return (1-10, default 5)." },
+      query: { type: "string", maxLength: 256, description: "An article title or part of one (e.g. \"Albert Einstein\", \"relativity\")." },
+      max_results: { type: "integer", minimum: 1, maximum: 10, default: 5, description: "Requested results (default 5); clamped to 1-10 and the configured cap." },
     },
     required: ["query"],
     additionalProperties: false,
@@ -98,8 +97,7 @@ export const ZIM_SEARCH_SPEC: ToolSpec = {
 
 export const ZIM_READ_SPEC: ToolSpec = {
   name: "wikipedia_read",
-  description:
-    "Read an article from the local offline Wikipedia archive by exact title, as returned by wikipedia_search (spaces or wiki-style underscores both work). Returns the article as plain text (references and navigation dropped, headings marked with #); Use mode outline to discover sections, section to read one, query to find short excerpts, and offset/max_chars to paginate. Prefer targeted reads to avoid filling context.",
+  description: "Read offline Wikipedia as paginated plain text, with references/navigation removed. Resolves redirects; accepts exact titles or wiki paths with spaces/underscores. Use outline, section or query for targeted reads. Cite the article title.",
   parameters: {
     type: "object",
     properties: {

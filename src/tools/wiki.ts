@@ -1,5 +1,4 @@
 /** Shared, bounded browsing of rendered offline Wikipedia articles. */
-import type { ToolSpec } from "../llm/client.js";
 import { argInt, argOptionalString } from "./executor.js";
 import { lower1 } from "./vault/corpus.js";
 
@@ -13,12 +12,12 @@ export interface WikiReadOptions {
 }
 
 /** Schema shared by the ZIM and vault read tools. */
-export const WIKI_READ_PROPERTIES: NonNullable<ToolSpec["parameters"]["properties"]> = {
-  mode: { type: "string", enum: ["full", "abstract", "outline"], description: "full (default), abstract (first 1000 characters), or outline (section IDs and headings). Prefer outline before reading a long article." },
-  section: { type: "string", description: "Section ID from outline, or exact heading (case-insensitive); includes subsections. Use lead for text before the first heading." },
-  query: { type: "string", description: "Find literal text within this article or selected section, case-insensitive. Returns short matching excerpts with offsets instead of the whole text." },
-  offset: { type: "integer", description: "Zero-based character offset within the selected text (default 0); use the next offset returned by a previous read." },
-  max_chars: { type: "integer", description: "Output text budget in characters (default 3000, capped by the configured tool limit)." },
+export const WIKI_READ_PROPERTIES: Record<string, unknown> = {
+  mode: { type: "string", enum: ["full", "abstract", "outline"], default: "full", description: "full: paginated text; abstract: first 1000 characters of selected text; outline: heading IDs, ignoring section/query. query takes precedence over abstract." },
+  section: { type: "string", description: "Outline ID or exact case-insensitive heading, including subsections. lead selects text before the first heading. Duplicate headings require an ID." },
+  query: { type: "string", maxLength: 256, description: "Literal case-insensitive text to find in the selected article/section (max 256 characters). Returns up to 10 excerpts per call." },
+  offset: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0, description: "Zero-based character offset in selected text, or rendered outline in outline mode. Continue with the returned next offset." },
+  max_chars: { type: "integer", minimum: 1, description: "Text/excerpt character budget (default 3000, clamped to 1 and the configured cap). Headers and pagination notes are extra." },
 };
 
 /** Validate model-supplied browsing arguments. */
