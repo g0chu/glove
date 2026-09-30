@@ -1,8 +1,9 @@
+import { snapshotReactions } from "./bot/reactions.js";
 import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, syncMessageUpdate, type ContextOptions } from "./bot/context.js";
+import { buildChannelContext, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
 import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
 import { chimeReplyChat } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
@@ -138,12 +139,11 @@ async function main(): Promise<void> {
       await captureCatchup(catchupBoundaries.get(channel.id) ?? null,
         async (before) => [...(await channel.messages.fetch({ limit: 100, before })).values()],
         (message) => archiveMessage(message, "catchup"));
-      // Reconcile the recent stored user messages where Discord still
+      // Reconcile recent stored messages, including every bot reply chunk, where Discord still
       // permits a direct fetch. A live event always wins over a fetch.
       const context = contexts.has(channel.id) ? contexts.get(channel.id) : null;
-      const recent = context?.snapshot().filter((e) => e.role === "user").slice(-100) ?? [];
-      for (const entry of recent) {
-        const id = entry.ids[0];
+      const recent = context?.snapshot().flatMap((e) => e.ids).slice(-100) ?? [];
+      for (const id of recent) {
         if (!id || liveMessageIds.has(id)) continue;
         try {
           const message = await channel.messages.fetch({ message: id, force: true });
@@ -373,7 +373,7 @@ async function main(): Promise<void> {
           // Every attempt, including mentions, starts from a quiet REST snapshot.
           await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
           if (attemptController.signal.aborted) throw new InterruptedError();
-          const trackedIds = context.snapshot().filter((e) => e.role === "user").slice(-100).flatMap((e) => e.ids);
+          const trackedIds = context.snapshot().flatMap((e) => e.ids).slice(-100);
           const newestTrackedId = [...trackedIds].sort(compareDiscordIds).at(-1);
           const fresh = await fetchFreshMessages(trackedIds,
             async (before) => [...(await textChannel.messages.fetch({ limit: 100, before, cache: false })).values()],
@@ -389,7 +389,7 @@ async function main(): Promise<void> {
           const refreshBot = client.user;
           if (!refreshBot) return;
           for (const message of fresh.messages) {
-            if (!isTrackable(message, refreshBot.id, cfg.discord.guildId)) continue;
+            if (!context.has(message.id) && !isTrackable(message, refreshBot.id, cfg.discord.guildId)) continue;
             archiveMessage(message, "refresh");
             if (context.has(message.id)) {
               const previous = JSON.stringify(context.find(message.id));
@@ -798,6 +798,7 @@ async function main(): Promise<void> {
         message.author.bot,
       );
     }
+    ctx.updateReactions(message.id, snapshotReactions(message));
     // A mention from any author (human or another bot) queues a turn that
     // always responds. With chime enabled, any other trackable message
     // (a human's or another bot's, without a mention) queues a chime turn
@@ -952,6 +953,45 @@ async function main(): Promise<void> {
       channelActivity.note(channelId, gate.isPending(message.id) && !!message.author && !message.author.bot && isMentionOf(message, botId));
     }
   });
+
+  // Serialize reaction REST observations per message so a later remove wins over an add.
+  const reactionTasks = new Map<string, Promise<void>>();
+  const reactionChanged = (message: Message | PartialMessage, source: string, userId?: string, emoji?: string): void => {
+    if (stopping || message.channel.type !== ChannelType.GuildText ||
+        (cfg.discord.guildId !== "" && message.guildId !== cfg.discord.guildId)) return;
+    const channelId = message.channelId;
+    liveMessageIds.add(message.id);
+    const external = userId !== client.user?.id;
+    if (external) channelActivity.note(channelId);
+    archive.record("discord.reaction", { channelId, messageId: message.id }, { source, userId, emoji });
+    const clearedAt = contexts.get(channelId).getClearedAt();
+    const previous = reactionTasks.get(message.id) ?? Promise.resolve();
+    const task = previous.catch(() => {}).then(async (): Promise<void> => {
+      const fresh = await message.channel.messages.fetch({ message: message.id, force: true, cache: false });
+      if (stopping || !client.user) return;
+      const context = contexts.get(channelId);
+      if (context.getClearedAt() !== clearedAt) return;
+      archiveMessage(fresh, source);
+      if (!context.has(fresh.id) && !gate.isPending(fresh.id) &&
+          !archive.wasTracked(channelId, fresh.id) &&
+          (clearedAt === null || fresh.createdTimestamp > clearedAt)) {
+        const seed = toSeedEntry(toMessageLike(fresh), client.user.id, client.user.username);
+        if (seed) context.seedFrom([seed], undefined, false);
+      }
+      context.updateReactions(fresh.id, snapshotReactions(fresh));
+      if (external) channelActivity.note(channelId);
+    }).catch((err) => { log.warn(`could not refresh message reactions: ${errMsg(err)}`); });
+    reactionTasks.set(message.id, task);
+    activeTurns.add(task);
+    void task.finally(() => {
+      activeTurns.delete(task);
+      if (reactionTasks.get(message.id) === task) reactionTasks.delete(message.id);
+    });
+  };
+  client.on("messageReactionAdd", (reaction, user) => reactionChanged(reaction.message, "reaction.add", user.id, reaction.emoji.toString()));
+  client.on("messageReactionRemove", (reaction, user) => reactionChanged(reaction.message, "reaction.remove", user.id, reaction.emoji.toString()));
+  client.on("messageReactionRemoveEmoji", (reaction) => reactionChanged(reaction.message, "reaction.removeEmoji"));
+  client.on("messageReactionRemoveAll", (message) => reactionChanged(message, "reaction.removeAll"));
 
   // A typing indicator is a change in the channel too: someone is about to
   // say something, so a running turn's prompt is stale before it is sent —

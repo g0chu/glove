@@ -201,6 +201,12 @@ in `.env` and restart the bot.
 - Per-tool caps (fetch size, redirect hops, cache, search result caps,
   workspace limits, …) are in `.env.example` and have sensible defaults.
 
+## Message reactions
+
+The model sees each message's current emoji reactions, with readable emoji names and counts. Adds, removals and clearing reactions update the stored conversation, including reactions on the bot's replies and uncached older messages. Reaction changes interrupt an active model request so it can rebuild from the updated context; they do not queue a new reply by themselves. Startup catch-up and the pre-turn refresh also reconcile reactions on up to 100 recent stored messages, and fetched channel history includes existing reactions. Cleared, deleted or compacted messages are not resurrected by reactions.
+
+With `MODEL_ENABLE_IMAGES=true`, reaction pictures are included even on messages outside the attachment image window. Custom emoji use a static first-frame PNG from Discord's CDN; standard emoji use [Twemoji](https://github.com/jdecked/twemoji) artwork (CC BY 4.0) from a fixed GitHub source. Each picture is labeled with its emoji name and message ID. Downloads have a 10-second deadline, reject redirects and respect `MODEL_IMAGES_MAX_BYTES`; unavailable pictures leave a note. Names/counts remain visible with images disabled. Rendered pictures and download failures persist across restarts. Unicode names come from Unicode 16.0, under the [Unicode data license](src/bot/UNICODE-LICENSE.txt).
+
 ## API inspector
 
 Run `npm run ui`, then open **http://127.0.0.1:3210**. The read-only web UI can run alongside the bot or browse its history while it is stopped. It reads `CHATS_ARCHIVE_DIR` from `.env` (default `./data/archive`) without acquiring the bot's archive lock. No Discord token or model connection is needed to run the UI. Set `WEB_UI_PORT` to change its port; after a build, run `node dist/ui-cli.js` instead.

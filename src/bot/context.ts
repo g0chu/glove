@@ -1,3 +1,4 @@
+import { snapshotReactions, fetchReactionImage, type ReactionMessage } from "./reactions.js";
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
 import {
@@ -24,7 +25,7 @@ import type { AttachmentStore } from "./attachment-store.js";
 const DISCORD_FETCH_LIMIT = 100;
 
 /** A channel message as the context builder sees it (discord.js messages are adapted into it). */
-export interface MessageLike {
+export interface MessageLike extends ReactionMessage {
   id: string;
   content: string;
   /** The display name is the guild nickname when set, else the global username. */
@@ -40,12 +41,13 @@ export interface MessageLike {
  * the guild nickname when set, else the global username; webhook messages
  * have no member, so their webhook name is used.
  */
-function toMessageLike(m: Message): MessageLike {
+export function toMessageLike(m: Message): MessageLike {
   return {
     id: m.id,
     content: m.content,
     author: { id: m.author.id, bot: m.author.bot, name: m.member?.displayName ?? m.author.username },
     attachments: m.attachments,
+    reactions: m.reactions,
     createdTimestamp: m.createdTimestamp,
   };
 }
@@ -140,6 +142,7 @@ export async function buildChannelContext(
       // while the bot was offline) honors the clear's watermark too: no
       // message older than the clear is re-imported after a restart.
       const clearedAt = context.getClearedAt();
+      for (const message of seed) context.updateReactions(message.id, snapshotReactions(message));
       context.seedFrom(
         seed
           .map((m) => toSeedEntry(m, opts.botId, opts.botName))
@@ -205,12 +208,13 @@ export async function buildChannelContext(
  */
 export function syncMessageUpdate(
   context: ChannelContext,
-  message: { id: string; content: string; attachments: { values(): Iterable<MessageAttachmentLike> } },
+  message: { id: string; content: string; attachments: { values(): Iterable<MessageAttachmentLike> } } & ReactionMessage,
   botId: string,
   botName: string,
 ): void {
   const entry = context.find(message.id);
   if (!entry) return; // not in this channel's context
+  if (message.reactions) context.updateReactions(message.id, snapshotReactions(message));
   if (entry.ids.length === 1) {
     const newContent = replaceMentionText(message.content, botId, botName);
     const echoed = entry.chunks?.length === 1 && entry.chunks[0] === message.content;
@@ -266,7 +270,8 @@ export function prefixEndIndex(
       n += 1;
       continue;
     }
-    if (e.attachments.length > 0 && (opts.enableImages || opts.enableFileContents)) n += 1;
+    if (Object.values(e.reactions ?? {}).some((reactions) => reactions.length > 0) ||
+        (e.attachments.length > 0 && (opts.enableImages || opts.enableFileContents))) n += 1;
   }
   return n;
 }
@@ -291,7 +296,7 @@ async function seedMessages(channel: GuildTextBasedChannel, limit: number): Prom
 }
 
 /** A fetched message as a seed entry (our UI lines — tool activity, thinking — are never context). */
-function toSeedEntry(m: MessageLike, botId: string, botName: string): SeedEntry | null {
+export function toSeedEntry(m: MessageLike, botId: string, botName: string): SeedEntry | null {
   if (m.author.id === botId && BOT_UI_RE.test(m.content)) return null;
   const entry: SeedEntry = {
     id: m.id,
@@ -300,6 +305,8 @@ function toSeedEntry(m: MessageLike, botId: string, botName: string): SeedEntry 
     content: replaceMentionText(m.content, botId, botName),
     attachments: [...m.attachments.values()],
   };
+  const reactions = snapshotReactions(m);
+  if (reactions.length > 0) entry.reactions = { [m.id]: reactions };
   if (m.author.id !== botId) {
     entry.name = m.author.name;
     entry.bot = m.author.bot;
@@ -404,17 +411,37 @@ export async function contextToMessages(
         : label
           ? `${label}:`
           : "";
-    const body = [text, attachmentText].filter((s) => s.length > 0).join("\n");
+    const reactionLines: string[] = [];
+    const reactionParts: ContentPart[] = [];
+    for (const [messageId, reactions] of Object.entries(e.reactions ?? {})) {
+      for (const reaction of reactions) {
+        reactionLines.push(`[reaction on message ${messageId}: ${reaction.name} (${reaction.emoji}) × ${reaction.count}]`);
+        if (opts.enableImages) {
+          const key = JSON.stringify([reaction.id ?? reaction.emoji, opts.imagesMaxBytes, !!opts.imageFetch]);
+          if (!Object.hasOwn(e.reactionImages ?? {}, key)) {
+            context.setReactionImage(e, key, await fetchReactionImage(reaction, opts.imagesMaxBytes, opts.imageFetch));
+          }
+          const image = e.reactionImages?.[key];
+          if (image) {
+            // Interleaved text identifies each picture even when several emojis react to one message.
+            reactionParts.push({ type: "text", text: `Reaction emoji picture: ${reaction.name} on message ${messageId}` });
+            reactionParts.push({ type: "image_url", image_url: { url: image } });
+          } else reactionLines.push(`[emoji picture unavailable: ${reaction.name}]`);
+        }
+      }
+    }
+    const body = [text, attachmentText, ...reactionLines].filter((s) => s.length > 0).join("\n");
     // An assistant entry that requested tools carries them even when it has
     // no text (the model answered with calls only) — the history must not
     // lose the call/result pairing.
     if (body.length === 0 && images.length === 0 && files.length === 0 && (e.toolCalls?.length ?? 0) === 0 && !e.reasoning) continue; // carries nothing
     const msg: ChatMessage =
-      images.length === 0 ? { role: e.role, content: body } : { role: e.role, content: [] };
-    if (images.length > 0) {
+      images.length === 0 && reactionParts.length === 0 ? { role: e.role, content: body } : { role: e.role, content: [] };
+    if (images.length > 0 || reactionParts.length > 0) {
       const parts = msg.content as ContentPart[];
       if (body.length > 0) parts.push({ type: "text", text: body });
       for (const img of images) parts.push({ type: "image_url", image_url: { url: img.url } });
+      parts.push(...reactionParts);
     }
     if (e.reasoning !== undefined && e.reasoning.length > 0) msg.reasoningContent = e.reasoning;
     if (e.toolCalls !== undefined && e.toolCalls.length > 0) msg.toolCalls = e.toolCalls;

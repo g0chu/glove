@@ -1,3 +1,6 @@
+import { snapshotReactions, reactionImageUrl, fetchReactionImage } from "../src/bot/reactions.js";
+import { createDiscordClient } from "../src/bot/client.js";
+import { GatewayIntentBits, Partials } from "discord.js";
 import { fetchFreshMessages } from "../src/bot/refresh.js";
 /**
  * Smoke tests: config parsing, the stability gate (a message commits once
@@ -6312,6 +6315,65 @@ const ok = (name: string): void => {
     archive.close();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// Reactions belong to the original message, including fetched history and bot reply chunks.
+{
+  const client = createDiscordClient();
+  assert(client.options.intents.has(GatewayIntentBits.GuildMessageReactions));
+  assert(client.options.partials.includes(Partials.Message));
+  assert(client.options.partials.includes(Partials.Reaction));
+  await client.destroy();
+  const snapshot = snapshotReactions({ reactions: { cache: new Map([
+    ["custom", { emoji: { id: "123", name: "party_blob" }, count: 2 }],
+    ["unicode", { emoji: { id: null, name: "👍" }, count: 3 }],
+    ["removed", { emoji: { id: null, name: "👎" }, count: 0 }],
+  ]) } });
+  assert.equal(snapshot.length, 2);
+  assert.equal(snapshot.find((r) => r.id === null)?.name, "thumbs up");
+  assert.equal(reactionImageUrl(snapshot.find((r) => r.id === "123")!), "https://cdn.discordapp.com/emojis/123.png?size=64");
+  assert(reactionImageUrl(snapshot.find((r) => r.id === null)!).endsWith("/1f44d.png"));
+  const context = new ChannelContext();
+  context.pushUser("person", "an old message", "1", 1, []);
+  context.pushAssistant("reply", ["2", "3"]);
+  context.setMeasuredTokens(123);
+  context.updateReactions("1", snapshot);
+  assert.equal(context.getMeasuredTokens(), null);
+  context.updateReactions("3", snapshot.slice(0, 1));
+  let downloads = 0;
+  const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0]);
+  const opts = { systemPrompt: "", maxMessages: 1, enableImages: true, imagesMaxBytes: 100,
+    enableFileContents: false, fileContentsMaxBytes: 100,
+    imageFetch: async (): Promise<Response> => { downloads++; return new Response(png); } };
+  const rendered = await contextToMessages(context, opts);
+  assert.equal(rendered.length, 2);
+  const parts = rendered[0].content as ContentPart[];
+  assert(parts.some((p) => p.type === "text" && p.text.includes("thumbs up (👍) × 3")));
+  assert.equal(parts.filter((p) => p.type === "image_url").length, 2);
+  assert.equal(downloads, 3);
+  assert(JSON.stringify(rendered[1]).includes("on message 3"));
+  assert.equal(context.find("1")?.content, "an old message");
+  const restored = ChannelContext.restore(context.serialize());
+  assert.deepEqual(await contextToMessages(restored, opts), rendered);
+  assert.equal(downloads, 3);
+  restored.setMeasuredTokens(99);
+  restored.updateReactions("1", snapshot);
+  assert.equal(restored.getMeasuredTokens(), 99); // identical REST observations do not invalidate measurements
+  restored.updateReactions("1", []);
+  const removed = await contextToMessages(restored, opts);
+  assert(!JSON.stringify(removed[0]).includes("reaction on message"));
+  const textOnly = await contextToMessages(context, { ...opts, enableImages: false });
+  assert.equal(typeof textOnly[0].content, "string");
+  assert(JSON.stringify(textOnly[0]).includes("party_blob"));
+  const seeded = new ChannelContext();
+  seeded.seedFrom([{ id: "9", ts: 1, role: "user", content: "historical", attachments: [], reactions: { "9": snapshot } }], undefined, false);
+  assert.equal(seeded.seeded, false); // observing an old reaction must not suppress the initial history fetch
+  assert.equal(seeded.find("9")?.reactions?.["9"].length, 2);
+  const failure = await fetchReactionImage(snapshot[0], 100, async () => new Response("failed", { status: 404 }));
+  assert.equal(failure, null);
+  assert.equal(await fetchReactionImage(snapshot[0], 4, async () => new Response(png)), null);
+  assert.equal(await fetchReactionImage(snapshot[0], 100, async () => new Response("not a PNG")), null);
+  ok("reactions: names, counts, historical messages, reply chunks, images, limits and restart persistence");
 }
 
 console.log(`\n${checks} check groups passed`);
