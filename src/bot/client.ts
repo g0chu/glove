@@ -15,6 +15,7 @@ export function createDiscordClient(): Client {
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.GuildMessageTyping,
       GatewayIntentBits.GuildMessageReactions,
       GatewayIntentBits.MessageContent,
     ],

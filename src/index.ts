@@ -3,10 +3,11 @@ import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
+import { buildChannelContext, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
 import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
 import { chimeReplyChat } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
+import { MessageObservations } from "./bot/observations.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { fetchFreshMessages } from "./bot/refresh.js";
 import { ChannelActivity } from "./bot/quiet.js";
@@ -17,7 +18,7 @@ import { ChatPersistence } from "./llm/persist.js";
 import { ConversationArchive } from "./llm/archive.js";
 import { archiveChat } from "./llm/archived-chat.js";
 import { archiveAttachments } from "./bot/attachment-store.js";
-import { captureCatchup } from "./bot/catchup.js";
+import { captureCatchup, coveredDiscordCursor } from "./bot/catchup.js";
 import { archiveTools } from "./tools/archive.js";
 import { recoverTurns } from "./llm/recovery.js";
 import {
@@ -115,6 +116,13 @@ async function main(): Promise<void> {
   // the observed cursor; a crash during catch-up must not skip the gap.
   for (const [channelId, after] of catchupBoundaries) archive.record("catchup.started", { channelId }, { after });
   const liveMessageIds = new Set<string>();
+  const messageObservations = new MessageObservations();
+  const noteLiveMessage = (id: string): void => {
+    liveMessageIds.add(id);
+    messageObservations.note(id);
+  };
+  const deletedChannelIds = new Set<string>();
+  const refreshCursors = new Map<string, string | null>();
   const catchups = new Map<string, Promise<void>>();
   const ensureCatchupBoundary = (channelId: string): void => {
     if (!catchupBoundaries.has(channelId)) {
@@ -136,28 +144,61 @@ async function main(): Promise<void> {
     if (existing) return existing;
     ensureCatchupBoundary(channel.id);
     const task = (async (): Promise<void> => {
-      await captureCatchup(catchupBoundaries.get(channel.id) ?? null,
-        async (before) => [...(await channel.messages.fetch({ limit: 100, before })).values()],
-        (message) => archiveMessage(message, "catchup"));
-      // Reconcile recent stored messages, including every bot reply chunk, where Discord still
-      // permits a direct fetch. A live event always wins over a fetch.
-      const context = contexts.has(channel.id) ? contexts.get(channel.id) : null;
-      const recent = context?.snapshot().flatMap((e) => e.ids).slice(-100) ?? [];
-      for (const id of recent) {
+      const context = contexts.get(channel.id);
+      const retainedIds = context.snapshot().flatMap((e) => e.ids);
+      const after = catchupBoundaries.get(channel.id) ?? null;
+      const observations = new Map<string, Message>();
+      const newest = await captureCatchup(after,
+        async (before) => [...(await channel.messages.fetch({ limit: 100, before, cache: false })).values()],
+        (message) => {
+          archiveMessage(message, "catchup");
+          observations.set(message.id, message);
+        });
+      // Reconcile every retained backing ID, including bot reply chunks.
+      // Page observations already cover some IDs; absence is not deletion.
+      const deleted: string[] = [];
+      for (const id of new Set(retainedIds)) {
+        if (stopping || deletedChannelIds.has(channel.id)) throw new InterruptedError();
         if (!id || liveMessageIds.has(id)) continue;
         try {
-          const message = await channel.messages.fetch({ message: id, force: true });
+          const message = observations.get(id) ?? await channel.messages.fetch({ message: id, force: true, cache: false });
           if (liveMessageIds.has(id)) continue;
           archiveMessage(message, "reconcile");
-          if (context && client.user) syncMessageUpdate(context, message, client.user.id, client.user.username);
+          observations.set(id, message);
         } catch (err) {
           if ((err as { code?: unknown }).code === 10008 && !liveMessageIds.has(id)) {
-            archive.record("discord.deleted", { channelId: channel.id, messageId: id }, { source: "reconcile" });
-            context?.removeById(id);
+            deleted.push(id);
           } else throw err;
         }
       }
-      archive.record("catchup.finished", { channelId: channel.id }, {});
+      if (stopping || deletedChannelIds.has(channel.id) || !client.user) throw new InterruptedError();
+      for (const id of deleted) {
+        if (liveMessageIds.has(id)) continue;
+        archive.record("discord.deleted", { channelId: channel.id, messageId: id }, { source: "reconcile" });
+        context.removeById(id);
+      }
+      const fetched = [...observations.values()].sort((a, b) => compareDiscordIds(a.id, b.id));
+      for (const message of fetched) {
+        if (!liveMessageIds.has(message.id) && context.has(message.id)) {
+          syncMessageUpdate(context, message, client.user.id, client.user.username);
+        }
+      }
+      // A brand-new channel keeps its configured bounded seed. Restored
+      // channels import the entire offline gap, regardless of the seed window.
+      const history = after === null ? fetched.slice(-Math.min(cfg.model.contextMaxMessages, 100)) : fetched;
+      mergeDiscordHistory(context, history.map(toMessageLike), {
+        botId: client.user.id,
+        botName: client.user.username,
+        acceptSeed: (id) => !liveMessageIds.has(id) && !gate.isPending(id) && !archive.wasTracked(channel.id, id),
+      });
+      const deferredIds = fetched.filter((message) => !context.has(message.id) &&
+        !archive.wasTracked(channel.id, message.id) && liveMessageIds.has(message.id) &&
+        (context.getClearedAt() === null || message.createdTimestamp > context.getClearedAt()!))
+        .map((message) => message.id);
+      const through = coveredDiscordCursor(after, newest, deferredIds);
+      // seedFrom checkpoints synchronously; finish only after history is durable.
+      archive.record("catchup.finished", { channelId: channel.id }, { through });
+      refreshCursors.set(channel.id, through);
     })();
     catchups.set(channel.id, task);
     void task.catch(() => { catchups.delete(channel.id); });
@@ -291,9 +332,11 @@ async function main(): Promise<void> {
       return;
     }
     const textChannel = channel;
-    await captureChannel(textChannel).catch((err) => {
-      log.warn(`archive catch-up for ${channelId}: ${errMsg(err)}; continuing with available context, gap retained for retry`);
-    });
+    try { await captureChannel(textChannel); }
+    catch (err) {
+      log.warn(`archive catch-up for ${channelId}: ${errMsg(err)}; skipping incomplete context, gap retained for retry`);
+      return;
+    }
     const turnId = randomUUID();
     archive.record("turn.started", { channelId, turnId, messageId: turn.id }, turn);
 
@@ -304,7 +347,7 @@ async function main(): Promise<void> {
 
     try {
       for (let attempt = 0; ; attempt++) {
-        if (stopping) return;
+        if (stopping || deletedChannelIds.has(channelId)) return;
         const scope = { channelId, turnId, messageId: turn.id, attempt };
         const callModel: ChatFn = (msgs, cbs, t, signal, options) => {
           if (stopping) throw new Error("bot is shutting down");
@@ -373,11 +416,13 @@ async function main(): Promise<void> {
           // Every attempt, including mentions, starts from a quiet REST snapshot.
           await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
           if (attemptController.signal.aborted) throw new InterruptedError();
-          const trackedIds = context.snapshot().flatMap((e) => e.ids).slice(-100);
-          const newestTrackedId = [...trackedIds].sort(compareDiscordIds).at(-1);
+          const trackedIds = context.snapshot().flatMap((e) => e.ids);
+          const after = refreshCursors.get(channelId) ?? null;
+          archive.record("catchup.started", { channelId }, { after });
           const fresh = await fetchFreshMessages(trackedIds,
             async (before) => [...(await textChannel.messages.fetch({ limit: 100, before, cache: false })).values()],
-            (id) => textChannel.messages.fetch({ message: id, force: true, cache: false }), attemptController.signal);
+            (id) => textChannel.messages.fetch({ message: id, force: true, cache: false }), attemptController.signal, after);
+          if (stopping || deletedChannelIds.has(channelId)) return;
           // A gateway event wins over every observation in an in-flight snapshot.
           if (attemptController.signal.aborted) throw new InterruptedError();
           for (const id of fresh.deleted) {
@@ -388,21 +433,27 @@ async function main(): Promise<void> {
           }
           const refreshBot = client.user;
           if (!refreshBot) return;
+          let deferred = false;
           for (const message of fresh.messages) {
             if (!context.has(message.id) && !isTrackable(message, refreshBot.id, cfg.discord.guildId)) continue;
             archiveMessage(message, "refresh");
             if (context.has(message.id)) {
-              const previous = JSON.stringify(context.find(message.id));
-              syncMessageUpdate(context, message, refreshBot.id, refreshBot.username);
-              if (previous !== JSON.stringify(context.find(message.id))) channelActivity.note(channelId);
-            } else if (newestTrackedId && compareDiscordIds(message.id, newestTrackedId) > 0 &&
+              if (syncMessageUpdate(context, message, refreshBot.id, refreshBot.username)) channelActivity.note(channelId);
+            } else if (gate.isPending(message.id)) {
+              if (gate.isHeld(message.id)) gate.arrive(message);
+              deferred = true;
+            } else if ((after === null || compareDiscordIds(message.id, after) > 0) &&
                 !gate.isPending(message.id) && !archive.wasTracked(channelId, message.id) &&
                 (context.getClearedAt() === null || message.createdTimestamp > context.getClearedAt()!)) {
               gate.arrive(message);
               channelActivity.note(channelId, !message.author.bot && isMentionOf(message, refreshBot.id));
             }
           }
+          if (deferred) channelActivity.note(channelId);
           if (attemptController.signal.aborted) throw new InterruptedError();
+          const through = coveredDiscordCursor(after, fresh.newestId, []);
+          archive.record("catchup.finished", { channelId }, { through });
+          refreshCursors.set(channelId, through);
           // Build the context before the typing indicator starts: it is a
           // channel fetch (+ image downloads, + one summarization call when the
           // context compacts), not the reply generation itself.
@@ -424,8 +475,9 @@ async function main(): Promise<void> {
           // Shared by the first build and (after an overflow) the rebuild: same
           // window, budget, and summarizer.
           const ctxOpts: ContextOptions = {
+            signal: attemptController.signal,
             attachmentStore: archiveAttachments(archive, scope),
-            acceptSeed: (id) => !archive.wasTracked(channelId, id),
+            acceptSeed: (id) => !archive.wasTracked(channelId, id) && !gate.isPending(id) && !liveMessageIds.has(id),
             botId,
             botName: botUser.username,
             systemPrompt,
@@ -783,6 +835,11 @@ async function main(): Promise<void> {
       // the context (with the content the API saw at seed time), so refresh
       // it in place instead of appending a duplicate entry.
       syncMessageUpdate(ctx, message, botId, botUser.username);
+    } else if (ctx.snapshot().some((entry) => entry.ids.some((id) => compareDiscordIds(id, message.id) > 0))) {
+      // REST can recover an older missed arrival after a newer trigger has
+      // committed. Insert it chronologically, keeping tool groups together.
+      const entry = toSeedEntry(toMessageLike(message), botId, botUser.username);
+      if (entry) ctx.seedFrom([entry], undefined, false);
     } else {
       ctx.pushUser(
         name,
@@ -904,7 +961,7 @@ async function main(): Promise<void> {
     const botId = client.user?.id;
     if (!botId) return;
     if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
-      liveMessageIds.add(message.id);
+      noteLiveMessage(message.id);
       archiveMessage(message, "create");
     }
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
@@ -933,11 +990,35 @@ async function main(): Promise<void> {
     if (!botId || !botUser) return;
     const channelId = message.channel?.id;
     if (!channelId) return;
-    if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
-      liveMessageIds.add(message.id);
-      archiveMessage(message, "update");
-    }
-    if (gate.isPending(message.id)) {
+    if (message.channel.type !== ChannelType.GuildText ||
+      (cfg.discord.guildId !== "" && message.guildId !== cfg.discord.guildId)) return;
+    noteLiveMessage(message.id);
+    archiveMessage(message, "update");
+    if (message.partial) {
+      gate.hold(message.id);
+      const task = messageObservations.fetch(message.id, () =>
+        message.channel.messages.fetch({ message: message.id, force: true, cache: false }))
+        .then((fresh) => {
+          if (!fresh || stopping || deletedChannelIds.has(channelId)) return;
+          archiveMessage(fresh, "update.refresh");
+          // This fetch is from the guild text channel checked above.
+          if (gate.isPending(fresh.id)) gate.arrive(fresh as GateMessage);
+          else {
+            const conv = conversationFor(channelId);
+            if (conv) syncMessageUpdate(conv, fresh, botId, botUser.username);
+          }
+          if (fresh.author.id !== botId) channelActivity.note(channelId);
+        }).catch((err) => {
+          if (stopping || deletedChannelIds.has(channelId)) return;
+          if ((err as { code?: unknown }).code === 10008) {
+            archive.record("discord.deleted", { channelId, messageId: message.id }, { source: "update.refresh" });
+            gate.drop(message.id);
+            conversationFor(channelId)?.removeById(message.id);
+          } else log.warn(`could not refresh partial message update: ${errMsg(err)}`);
+        });
+      activeTurns.add(task);
+      void task.finally(() => { activeTurns.delete(task); });
+    } else if (gate.isPending(message.id)) {
       gate.arrive(message);
     } else {
       const conv = conversationFor(channelId);
@@ -948,8 +1029,7 @@ async function main(): Promise<void> {
     // The note comes after the gate refresh, so a still-pending message
     // commits a hair before the quiet wait can resolve — the retry's
     // context carries it.
-    if (message.channel.type === ChannelType.GuildText &&
-      (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId) && message.author?.id !== botId) {
+    if (message.author?.id !== botId) {
       channelActivity.note(channelId, gate.isPending(message.id) && !!message.author && !message.author.bot && isMentionOf(message, botId));
     }
   });
@@ -960,18 +1040,24 @@ async function main(): Promise<void> {
     if (stopping || message.channel.type !== ChannelType.GuildText ||
         (cfg.discord.guildId !== "" && message.guildId !== cfg.discord.guildId)) return;
     const channelId = message.channelId;
-    liveMessageIds.add(message.id);
+    noteLiveMessage(message.id);
     const external = userId !== client.user?.id;
     if (external) channelActivity.note(channelId);
     archive.record("discord.reaction", { channelId, messageId: message.id }, { source, userId, emoji });
     const clearedAt = contexts.get(channelId).getClearedAt();
     const previous = reactionTasks.get(message.id) ?? Promise.resolve();
     const task = previous.catch(() => {}).then(async (): Promise<void> => {
-      const fresh = await message.channel.messages.fetch({ message: message.id, force: true, cache: false });
-      if (stopping || !client.user) return;
+      const fresh = await messageObservations.fetch(message.id, () =>
+        message.channel.messages.fetch({ message: message.id, force: true, cache: false }));
+      if (!fresh || stopping || !client.user || deletedChannelIds.has(channelId)) return;
       const context = contexts.get(channelId);
       if (context.getClearedAt() !== clearedAt) return;
       archiveMessage(fresh, source);
+      // A reaction event may supersede an in-flight partial-update fetch.
+      // Its complete observation must also restore text/attachments or resume
+      // the held gate, so the discarded fetch cannot leave history stuck.
+      if (gate.isHeld(fresh.id)) gate.arrive(fresh as GateMessage);
+      if (context.has(fresh.id)) syncMessageUpdate(context, fresh, client.user.id, client.user.username);
       if (!context.has(fresh.id) && !gate.isPending(fresh.id) &&
           !archive.wasTracked(channelId, fresh.id) &&
           (clearedAt === null || fresh.createdTimestamp > clearedAt)) {
@@ -1018,7 +1104,7 @@ async function main(): Promise<void> {
     const channelId = message.channel?.id;
     if (!channelId) return;
     if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
-      liveMessageIds.add(message.id);
+      noteLiveMessage(message.id);
       archive.record("discord.deleted", { channelId, messageId: message.id }, {});
       if (message.author?.id !== client.user?.id) channelActivity.note(channelId);
     }
@@ -1031,7 +1117,7 @@ async function main(): Promise<void> {
     const conv = conversationFor(channel.id);
     for (const m of messages.values()) {
       if (channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || channel.guildId === cfg.discord.guildId)) {
-        liveMessageIds.add(m.id);
+        noteLiveMessage(m.id);
         archive.record("discord.deleted", { channelId: channel.id, messageId: m.id }, { bulk: true });
         if (m.author?.id !== client.user?.id) channelActivity.note(channel.id);
       }
@@ -1044,6 +1130,8 @@ async function main(): Promise<void> {
   // (in memory and in the persistence file).
   client.on("channelDelete", (channel) => {
     if (stopping) return;
+    deletedChannelIds.add(channel.id);
+    channelActivity.note(channel.id);
     if (archive.messageCursors().has(channel.id) || contexts.has(channel.id)) archive.record("channel.deleted", { channelId: channel.id }, {});
     contexts.clear(channel.id);
     persistence.remove(channel.id);

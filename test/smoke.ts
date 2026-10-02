@@ -42,8 +42,9 @@ import { Script } from "node:vm";
 import { recoverTurns } from "../src/llm/recovery.js";
 import { archiveTools } from "../src/tools/archive.js";
 import { archiveAttachments } from "../src/bot/attachment-store.js";
-import { captureCatchup } from "../src/bot/catchup.js";
+import { captureCatchup, coveredDiscordCursor } from "../src/bot/catchup.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
+import { MessageObservations } from "../src/bot/observations.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
 import { chimeReplyChat } from "../src/bot/chime-reply.js";
 import { executeReplyChime, chimeTools, CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
@@ -55,7 +56,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, contextToMessages, prefixEndIndex, syncMessageUpdate, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, contextToMessages, mergeDiscordHistory, prefixEndIndex, syncMessageUpdate, type ContextOptions, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn, type ToolRound } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -450,6 +451,38 @@ const ok = (name: string): void => {
   ok("gate: a stable message commits exactly once with its final state");
 
   {
+    const fired: string[] = [];
+    const timers = makeTimers();
+    const gate = new MessageGate({ stableMs: 2000, onCommit: (m) => fired.push(m.content),
+      schedule: timers.schedule, cancel: timers.cancel });
+    gate.arrive(fakeMsg("1", "c1", "old partial text"));
+    gate.arrive(fakeMsg("2", "c1", "later mention"));
+    const observations = new MessageObservations();
+    observations.note("1");
+    let releasePartial!: (message: GateMessage) => void;
+    const partial = observations.fetch("1", () => new Promise<GateMessage>((resolve) => { releasePartial = resolve; }));
+    const [first, second] = [...timers.live.keys()];
+    gate.hold("1");
+    timers.cbs.get(first)!();
+    timers.cbs.get(second)!();
+    assert.deepEqual(fired, [], "a held partial update blocks newer commits and invalidates its old timer");
+    assert.equal(gate.isHeld("1"), true);
+    observations.note("1"); // a reaction refresh overtakes the partial fetch
+    const complete = await observations.fetch("1", async () => fakeMsg("1", "c1", "complete fetched text"));
+    assert(complete);
+    gate.arrive(complete);
+    releasePartial(fakeMsg("1", "c1", "stale partial response"));
+    assert.equal(await partial, null);
+    assert.equal(gate.isHeld("1"), false);
+    const resumed = [...timers.live.keys()].at(-1)!;
+    timers.cbs.get(resumed)!();
+    assert.deepEqual(fired, ["complete fetched text", "later mention"]);
+    gate.hold("absent");
+    assert.equal(gate.size, 0);
+    ok("gate: incomplete updates hold commits until a complete snapshot resumes stability in channel order");
+  }
+
+  {
     const fired: GateMessage[] = [];
     const timers = makeTimers();
     const gate = new MessageGate({ stableMs: 2000, onCommit: (m) => fired.push(m), schedule: timers.schedule, cancel: timers.cancel });
@@ -562,6 +595,25 @@ const ok = (name: string): void => {
 
 // Fresh REST observations include gaps, edits, and confirmed deletions.
 {
+  const observations = new MessageObservations();
+  observations.note("1");
+  let resolve!: (text: string) => void;
+  const older = observations.fetch("1", () => new Promise<string>((done) => { resolve = done; }));
+  observations.note("1");
+  const newer = await observations.fetch("1", async () => "complete newer update");
+  resolve("stale earlier update");
+  assert.equal(await older, null);
+  assert.equal(newer, "complete newer update");
+  let reject!: (error: Error) => void;
+  const deleted = observations.fetch("1", () => new Promise<string>((_done, fail) => { reject = fail; }));
+  observations.note("1"); // deletion or another gateway event supersedes the request
+  reject(Object.assign(new Error("unknown message"), { code: 10008 }));
+  assert.equal(await deleted, null, "a stale REST error cannot delete a newer live entry");
+  await assert.rejects(observations.fetch("1", async () => { throw new Error("forbidden"); }), /forbidden/);
+  ok("observations: out-of-order partial-message fetches and stale failures cannot overwrite newer events");
+}
+
+{
   const pages: Array<string | undefined> = [];
   const fresh = await fetchFreshMessages(["1", "2", "3"], async (before) => {
     pages.push(before);
@@ -584,10 +636,82 @@ const ok = (name: string): void => {
     abort.abort();
     return [{ id: "1" }];
   }, async (id) => ({ id }), abort.signal), InterruptedError);
+  const reconcileAbort = new AbortController();
+  const reconciled: string[] = [];
+  await assert.rejects(fetchFreshMessages(["1", "2", "3"], async () => [], async (id) => {
+    reconciled.push(id);
+    reconcileAbort.abort();
+    return { id };
+  }, reconcileAbort.signal), InterruptedError);
+  assert.deepEqual(reconciled, ["1"], "activity stops reconciliation before another REST request");
   ok("refresh: paginates gaps, reconciles edits/deletes, rejects failures and activity during fetch");
 }
 
+{
+  const history = Array.from({ length: 201 }, (_, i) => ({ id: String(i + 1), content: `message ${i + 1}` }));
+  const pages: Array<string | undefined> = [];
+  const fresh = await fetchFreshMessages(["1", "201"], async (before) => {
+    pages.push(before);
+    return history.filter((m) => !before || BigInt(m.id) < BigInt(before)).slice(-100).reverse();
+  }, async (id) => ({ id, content: "direct" }), undefined, "1");
+  assert.deepEqual(pages, [undefined, "102", "2"]);
+  assert.deepEqual(fresh.messages.map((m) => m.id), history.map((m) => m.id));
+  assert.equal(fresh.newestId, "201");
+  const fallback = await fetchFreshMessages(["1", "201"], async (before) =>
+    history.filter((m) => !before || BigInt(m.id) < BigInt(before)).slice(-100), async (id) => ({ id, content: "direct" }));
+  assert.equal(fallback.messages.length, 201, "without a cursor, the oldest retained ID protects the gap");
+  ok("refresh: a new trigger cannot hide missed messages before it");
+
+  const requested: string[] = [];
+  const older = await fetchFreshMessages(history.map((m) => m.id), async () => history.slice(-100), async (id) => {
+    requested.push(id);
+    if (id === "2") throw Object.assign(new Error("unknown message"), { code: 10008 });
+    return { id, content: id === "1" ? "old message edited offline" : "direct" };
+  }, undefined, "201");
+  assert.equal(requested.length, 101, "every retained ID outside the page is reconciled");
+  assert.equal(older.messages[0].content, "old message edited offline");
+  assert.deepEqual(older.deleted, ["2"]);
+  ok("refresh: retained edits and deletions outside the latest 100 IDs are reconciled");
+}
+
 // ----------------------------------------------------------------- quiet --
+{
+  const opts: ContextOptions = {
+    botId: "bot", botName: "Glove", systemPrompt: "", maxMessages: 20,
+    enableImages: false, imagesMaxBytes: 1024, enableFileContents: false,
+    fileContentsMaxBytes: 1024, maxTokens: 100_000, keepMessages: 10,
+    summarize: async () => "unused",
+  };
+  const message = (id: string) => ({ id, content: "old text", createdTimestamp: Number(id),
+    author: { id: "user", bot: false, username: "Alice" }, attachments: new Map(),
+    reactions: { cache: new Map() } });
+  let release: (messages: ReturnType<typeof message>[]) => void = () => {};
+  const channel = { messages: { fetch: async () => new Promise((resolve) => {
+    release = (messages) => resolve({ values: () => messages.values() });
+  }) } } as unknown as GuildTextBasedChannel;
+  const context = new ChannelContext();
+  context.pushUser("Alice", "trigger", "1", 1, []);
+  const controller = new AbortController();
+  const building = buildChannelContext(channel, context, "1", { ...opts, signal: controller.signal });
+  controller.abort(); // an untracked message was deleted; no context entry existed to remove
+  release([message("1"), message("2")]);
+  await assert.rejects(building, InterruptedError);
+  assert.equal(context.has("2"), false, "a deleted untracked message is not resurrected from the stale seed");
+  assert.equal(context.seeded, false, "an invalidated seed remains eligible for retry");
+
+  const second = buildChannelContext(channel, context, "1", opts);
+  const reactions = [{ id: null, emoji: "👍", name: "thumbs up", count: 3 }];
+  context.updateReactions("1", reactions);
+  release([message("1")]);
+  await assert.rejects(second, InterruptedError);
+  assert.deepEqual(context.find("1")?.reactions?.["1"], reactions, "stale REST reactions cannot overwrite a newer update");
+  const retry = buildChannelContext(channel, context, "1", opts);
+  release([]);
+  assert.notEqual(await retry, null);
+  assert.equal(context.seeded, true);
+  ok("seed: activity and newer context mutations reject stale snapshots without marking coverage complete");
+}
+
 {
   // The channel-activity tracker (driven with an injected clock and sleeper
   // — no real waiting): a channel is quiet once it has been unchanged for
@@ -1351,7 +1475,8 @@ const ok = (name: string): void => {
   ];
   const seedChan = {
     messages: {
-      fetch: async (o: { limit?: number }) => {
+      fetch: async (o: { limit?: number; cache?: boolean }) => {
+        assert.equal(o.cache, false, "seed observations must not mutate gateway-cached messages");
         seedLimit = o.limit;
         return { values: () => seedMsgs.values() };
       },
@@ -5807,6 +5932,11 @@ const ok = (name: string): void => {
     const unavailable = async (): Promise<Response> => { throw new Error("CDN expired"); };
     assert.deepEqual(await fetchMessageFiles([att], 1000, { storage, fetchImpl: unavailable }), saved);
     assert.deepEqual(await fetchMessageImages([imageAtt], 1000, { storage, fetchImpl: unavailable }), imageResult);
+    const refreshed = { ...att, url: `${att.url}?ex=123&is=456&hm=new-signature` };
+    assert.deepEqual(await fetchMessageFiles([refreshed], 1000, { storage, fetchImpl: unavailable }), saved,
+      "a refreshed Discord signature still resolves archived bytes after restart");
+    assert.equal(storage.load({ ...att, url: `${att.url}?other=variant` }), null,
+      "non-signature parameters remain part of attachment identity");
     assert.equal((await fetchMessageFiles([att], 1, { storage, fetchImpl: unavailable })).files.length, 0, "cache does not bypass byte caps");
     await assert.rejects(fetchMessageFiles([{ ...att, url: att.url + "?new" }], 1000, {
       storage: { load: () => null, save: () => { throw new Error("disk full"); } }, fetchImpl: async () => new Response(bytes),
@@ -5852,7 +5982,7 @@ const ok = (name: string): void => {
   const messages = Array.from({ length: 251 }, (_, i) => ({ id: String(1000 + i) }));
   const seen: string[] = [];
   let fetches = 0;
-  await captureCatchup("1000", async (before) => {
+  const newest = await captureCatchup("1000", async (before) => {
     fetches++;
     return messages.filter((m) => !before || BigInt(m.id) < BigInt(before)).slice(-100).reverse();
   }, (message) => { seen.push(message.id); });
@@ -5860,11 +5990,89 @@ const ok = (name: string): void => {
   assert.equal(seen.length, 250);
   assert.equal(new Set(seen).size, 250);
   assert.ok(!seen.includes("1000"));
+  assert.equal(newest, "1250");
+  const context = new ChannelContext();
+  context.pushUser("Alice", "before shutdown", "1000", 1000, []);
+  context.pushUser("Alice", "new trigger", "1251", 1251, []);
+  const attachment = { url: "https://cdn.discordapp.com/attachments/a/b/file.txt", name: "file.txt", size: 10, contentType: "text/plain" };
+  mergeDiscordHistory(context, seen.map((id) => ({
+    id, content: `offline ${id}`, createdTimestamp: Number(id),
+    author: { id: "user", bot: false, name: "Alice" },
+    attachments: id === "1100" ? [attachment] : [],
+  })), { botId: "bot", botName: "Glove" });
+  assert.deepEqual(context.snapshot().flatMap((entry) => entry.ids), [...messages.map((m) => m.id), "1251"],
+    "every offline page enters model context before the new trigger, in Discord order");
+  assert.deepEqual(context.find("1100")?.attachments, [attachment]);
+  assert.equal(context.find("1251")?.content, "new trigger");
+  assert.equal(context.seeded, true);
+  assert.equal(ChannelContext.restore(context.serialize()).length, 252);
   let firstRunFetches = 0;
   await captureCatchup(null, async () => { firstRunFetches++; return messages.slice(-100); }, () => {});
   assert.equal(firstRunFetches, 1, "first archive baseline is bounded");
   await assert.rejects(captureCatchup("1000", async () => messages.slice(-100), () => {}), /did not advance/);
+  assert.equal(coveredDiscordCursor("1000", "1250", ["1200", "1100"]), "1099",
+    "pending arrivals keep the durable cursor before the earliest uncommitted observation");
+  assert.equal(coveredDiscordCursor("1250", "1200", []), "1250", "deleted newest messages do not regress coverage");
   ok("archive: offline catch-up paginates beyond 100 messages and rejects nonadvancing pages");
+
+  const filtered = new ChannelContext();
+  filtered.reset();
+  const watermark = filtered.getClearedAt()!;
+  filtered.pushUser("Alice", "live version", "10", watermark + 10, []);
+  const observation = (id: string, content: string, authorId = "user"): MessageLike => ({
+    id, content, createdTimestamp: watermark + Number(id), attachments: [],
+    author: { id: authorId, bot: authorId === "bot", name: "Alice" },
+  });
+  mergeDiscordHistory(filtered, [observation("0", "before clear"), observation("10", "stale REST version"),
+    observation("11", "retired"), observation("12", "pending"), observation("13", "🤔 *thinking*", "bot"),
+    observation("14", "offline message")], {
+    botId: "bot", botName: "Glove", acceptSeed: (id) => id !== "11" && id !== "12",
+  });
+  assert.deepEqual(filtered.snapshot().flatMap((entry) => entry.ids), ["10", "14"]);
+  assert.equal(filtered.find("10")?.content, "live version");
+  ok("history merge: clear watermarks, live versions, retired IDs, pending messages and bot UI remain protected");
+}
+
+{
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "glove-context-cursor-"));
+  let archive: ConversationArchive | undefined;
+  try {
+    archive = new ConversationArchive(directory, undefined, true);
+    const context = new ChannelContext();
+    context.pushUser("Alice", "oldest retained message", "100", 100, []);
+    context.pushUser("Alice", "new trigger after missed messages", "300", 300, []);
+    archive.record("context.checkpoint", { channelId: "c" }, context.serialize());
+    archive.record("context.checkpoint", { channelId: "legacy" }, context.serialize());
+    assert.equal(archive.catchupCursors().get("legacy"), "100", "JSON migration needs no observed Discord event to protect its gap");
+    const cleared = new ChannelContext();
+    cleared.reset();
+    archive.record("context.checkpoint", { channelId: "cleared" }, cleared.serialize());
+    assert.equal(archive.catchupCursors().get("cleared"),
+      ((BigInt(cleared.getClearedAt()!) - 1_420_070_400_000n) << 22n).toString(),
+      "an imported empty clear uses its watermark rather than a last-page baseline");
+    archive.record("discord.message", { channelId: "c", messageId: "300" }, {});
+    assert.equal(archive.catchupCursors().get("c"), "100", "legacy observed cursors cannot hide earlier gaps");
+    archive.record("catchup.started", { channelId: "c" }, { after: "100" });
+    archive.record("catchup.finished", { channelId: "c" }, { through: "300" });
+    archive.record("discord.message", { channelId: "c", messageId: "600" }, {});
+    archive.close();
+    archive = new ConversationArchive(directory, undefined, true);
+    assert.equal(archive.messageCursors().get("c"), "600");
+    assert.equal(archive.catchupCursors().get("c"), "300", "gateway observations cannot advance durable REST coverage");
+    archive.record("catchup.started", { channelId: "c" }, { after: "300" });
+    archive.record("discord.message", { channelId: "c", messageId: "700" }, {});
+    archive.close();
+    archive = new ConversationArchive(directory);
+    assert.equal(archive.catchupCursors().get("c"), "300", "a crash during refresh preserves its original boundary");
+    archive.record("catchup.finished", { channelId: "c" }, { through: "700" });
+    archive.close();
+    archive = new ConversationArchive(directory, undefined, true);
+    assert.equal(archive.catchupCursors().get("c"), "700");
+    ok("archive: completed REST cursors survive warm/full recovery and never skip unfinished context gaps");
+  } finally {
+    archive?.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 {
@@ -6063,7 +6271,14 @@ const ok = (name: string): void => {
   assert.equal(downloads, 2, "rendered attachments need no further downloads");
   assert.ok(context.estimateTokens(opts.systemPrompt, 1, 1024) >= 1000, "retained image still counts outside the admission window");
   const restored = ChannelContext.restore(JSON.parse(JSON.stringify(context.serialize())));
-  restored.updateAttachments("1", [{ ...attachment, url: attachment.url.replace("ex=1&is=2&hm=old", "ex=3&is=4&hm=new") }, image]);
+  restored.setMeasuredTokens(321);
+  const epoch = restored.getMeasurementEpoch();
+  const refreshedAttachments = [{ ...attachment, url: attachment.url.replace("ex=1&is=2&hm=old", "ex=3&is=4&hm=new") }, image];
+  assert.equal(syncMessageUpdate(restored, { id: "1", content: "read these", attachments: refreshedAttachments }, "bot", "Glove"), false,
+    "CDN signature refreshes do not interrupt model attempts as semantic activity");
+  assert.equal(restored.getMeasurementEpoch(), epoch);
+  assert.equal(restored.getMeasuredTokens(), 321);
+  assert.deepEqual(restored.find("1")?.attachments, refreshedAttachments, "updated CDN metadata still persists");
   const unavailable = async (): Promise<Response> => { throw new Error("CDN unavailable"); };
   assert.deepEqual((await contextToMessages(restored, { ...opts, imageFetch: unavailable, fileFetch: unavailable })).slice(0, original.length), original,
     "restart and signed-URL refresh preserve exact attachment parts even without the CDN");
@@ -6504,6 +6719,7 @@ const ok = (name: string): void => {
 {
   const client = createDiscordClient();
   assert(client.options.intents.has(GatewayIntentBits.GuildMessageReactions));
+  assert(client.options.intents.has(GatewayIntentBits.GuildMessageTyping));
   assert(client.options.partials.includes(Partials.Message));
   assert(client.options.partials.includes(Partials.Reaction));
   await client.destroy();

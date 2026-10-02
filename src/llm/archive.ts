@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import path from "node:path";
 import type { SerializedChannelContext, ContextEntry } from "./context.js";
+import { attachmentIdentity } from "./client.js";
 
 /** Identifiers shared by related journal records; never endpoint credentials. */
 export interface ArchiveScope {
@@ -60,8 +61,10 @@ export class ConversationArchive {
   private readonly requests = new Map<string, ArchiveRecord>();
   private readonly turns = new Map<string, ArchiveRecord>();
   private readonly attachments = new Map<string, string>();
+  private readonly attachmentIdentities = new Map<string, string>();
   private readonly tracked = new Map<string, Set<string>>();
   private readonly catchups = new Map<string, string | null>();
+  private readonly reconciledCursors = new Map<string, string | null>();
   private readonly recordedTurns = new Set<string>();
   private readonly indexedEntries = new Set<string>();
   private recovered = false;
@@ -78,6 +81,7 @@ export class ConversationArchive {
       syncDirectory(path.dirname(path.resolve(directory)));
       const offset = this.fastRecovery ? this.loadIndex() : 0;
       this.recoveredTail = this.recover(offset);
+      for (const [url, blob] of this.attachments) this.attachmentIdentities.set(attachmentIdentity(url), blob);
       this.recovered = true;
       if (this.fastRecovery) this.saveIndex();
     } catch (err) {
@@ -225,9 +229,16 @@ export class ConversationArchive {
     if (record.type === "attachment.saved") {
       const { url, blob } = this.readData<{ url: string; blob: string }>(record);
       this.attachments.set(url, blob);
+      this.attachmentIdentities.set(attachmentIdentity(url), blob);
     }
     if (channelId && record.type === "catchup.started") this.catchups.set(channelId, this.readData<{ after: string | null }>(record).after);
-    if (channelId && record.type === "catchup.finished") this.catchups.delete(channelId);
+    if (channelId && record.type === "catchup.finished") {
+      const { through } = this.readData<{ through?: string | null }>(record);
+      if (through === null || (typeof through === "string" && /^\d+$/.test(through))) {
+        this.reconciledCursors.set(channelId, through);
+      }
+      this.catchups.delete(channelId);
+    }
   }
 
   // The disposable index caches derived state, never replaces journal evidence.
@@ -250,6 +261,7 @@ export class ConversationArchive {
       checkpoints: [...this.checkpoints], cursors: [...this.cursors],
       unfinished: [...this.unfinished], requests: [...this.requests], turns: [...this.turns],
       attachments: [...this.attachments], catchups: [...this.catchups],
+      reconciledCursors: [...this.reconciledCursors],
       tracked: [...this.tracked].map(([id, ids]) => [id, [...ids]] as const),
       recordedTurns: [...this.recordedTurns],
     };
@@ -273,6 +285,7 @@ export class ConversationArchive {
         new Map(state.requests), new Map(state.turns), new Map(state.attachments), new Map(state.catchups),
         new Map(state.tracked.map(([id, ids]) => [id, new Set(ids)]))] as const;
       const recordedTurns = new Set(state.recordedTurns);
+      const reconciledCursors = new Map(state.reconciledCursors ?? []);
       if (!Number.isSafeInteger(state.seq) || state.seq < 0 || typeof state.previous !== "string") return 0;
       const copy = <K, V>(target: Map<K, V>, source: Map<K, V>): void => {
         for (const [key, value] of source) target.set(key, value);
@@ -280,6 +293,7 @@ export class ConversationArchive {
       copy(this.checkpoints, maps[0]); copy(this.cursors, maps[1]); copy(this.unfinished, maps[2]);
       copy(this.requests, maps[3]); copy(this.turns, maps[4]); copy(this.attachments, maps[5]);
       copy(this.catchups, maps[6]); copy(this.tracked, maps[7]);
+      copy(this.reconciledCursors, reconciledCursors);
       for (const id of recordedTurns) this.recordedTurns.add(id);
       this.seq = state.seq;
       this.previous = state.previous;
@@ -350,9 +364,34 @@ export class ConversationArchive {
   /** Highest captured Discord snowflake per channel, for offline catch-up. */
   messageCursors(): Map<string, string> { return new Map(this.cursors); }
 
-  /** Unfinished catch-up retains its original boundary across another crash. */
+  /** Completed REST coverage, never advanced by gateway observations alone. */
   catchupCursors(): Map<string, string | null> {
-    return new Map([...this.cursors, ...this.catchups]);
+    // Legacy archives had only an observed cursor, which could hide gaps before
+    // a newly received mention. Reconcile once from their oldest tracked ID.
+    const boundaries = new Map<string, string | null>();
+    for (const channelId of new Set([...this.cursors.keys(), ...this.checkpoints.keys()])) {
+      if (this.reconciledCursors.has(channelId)) continue;
+      let oldest: string | null = null;
+      for (const id of this.tracked.get(channelId) ?? []) {
+        if (/^\d+$/.test(id) && (oldest === null || BigInt(id) < BigInt(oldest))) oldest = id;
+      }
+      if (oldest === null) {
+        const checkpoint = this.checkpoints.get(channelId);
+        if (checkpoint) {
+          const { clearedAt } = this.readData<SerializedChannelContext>({ data: checkpoint });
+          // An imported empty clear has no observed message ID. Derive the
+          // snowflake floor at its watermark to paginate its offline gap too.
+          const discordEpoch = 1_420_070_400_000;
+          if (typeof clearedAt === "number" && Number.isSafeInteger(clearedAt) && clearedAt > discordEpoch) {
+            oldest = ((BigInt(clearedAt) - BigInt(discordEpoch)) << 22n).toString();
+          }
+        }
+      }
+      boundaries.set(channelId, oldest);
+    }
+    for (const [id, cursor] of this.reconciledCursors) boundaries.set(id, cursor);
+    for (const [id, cursor] of this.catchups) boundaries.set(id, cursor);
+    return boundaries;
   }
 
   /** Do not re-seed entries already cleared, deleted, or folded out of context. */
@@ -384,7 +423,7 @@ export class ConversationArchive {
 
   /** Read previously captured attachment bytes without relying on a live CDN URL. */
   attachment(url: string): Buffer | null {
-    const hash = this.attachments.get(url);
+    const hash = this.attachments.get(url) ?? this.attachmentIdentities.get(attachmentIdentity(url));
     return hash ? this.readBlob(hash) : null;
   }
 
@@ -404,8 +443,10 @@ export class ConversationArchive {
     this.requests.clear();
     this.turns.clear();
     this.attachments.clear();
+    this.attachmentIdentities.clear();
     this.tracked.clear();
     this.catchups.clear();
+    this.reconciledCursors.clear();
     this.recordedTurns.clear();
     this.indexedEntries.clear();
     const lock = path.join(this.directory, ".lock");

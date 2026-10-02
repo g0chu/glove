@@ -87,6 +87,12 @@ without the affected tensor/MTP combination.
   replaced by a summary the model itself writes and the newest
   `CONTEXT_COMPACTION_KEEP_MESSAGES` messages stay verbatim. An optional
   `MODEL_SYSTEM_PROMPT` is prepended to every request.
+  On restart, all available messages since the last completed REST snapshot
+  are merged in Discord order. Before every model attempt, REST refresh fills
+  missed gateway gaps and reconciles every retained message's current content,
+  attachments, reactions and deletion state. These requests are sequential;
+  longer retained conversations take more time to reconcile. Partial gateway
+  updates are fetched completely before replacing stored content.
 - **Streaming:** by default the answer is built up live: typing indicator
   while generating, message created on the first chunk, edits throttled to
   at least `DISCORD_STREAM_UPDATE_THROTTLE_MS` apart. Set `MODEL_STREAM=false`
@@ -211,7 +217,7 @@ and/or `MEMORYTOOLS_ENABLED=true` in `.env` and restart the bot.
 
 ## Message reactions
 
-The model sees each message's current emoji reactions, with readable emoji names and counts. Adds, removals and clearing reactions update the stored conversation, including reactions on the bot's replies and uncached older messages. Reaction changes interrupt an active model request so it can rebuild from the updated context; they do not queue a new reply by themselves. Startup catch-up and the pre-turn refresh also reconcile reactions on up to 100 recent stored messages, and fetched channel history includes existing reactions. Cleared, deleted or compacted messages are not resurrected by reactions.
+The model sees each message's current emoji reactions, with readable emoji names and counts. Adds, removals and clearing reactions update the stored conversation, including reactions on the bot's replies and uncached older messages. Reaction changes interrupt an active model request so it can rebuild from the updated context; they do not queue a new reply by themselves. Startup catch-up and the pre-turn refresh also reconcile reactions on every retained Discord message, and fetched channel history includes existing reactions. Cleared, deleted or compacted messages are not resurrected by reactions.
 
 With `MODEL_ENABLE_IMAGES=true`, reaction pictures are included even on messages outside the attachment image window. Custom emoji use a static first-frame PNG from Discord's CDN; standard emoji use [Twemoji](https://github.com/jdecked/twemoji) artwork (CC BY 4.0) from a fixed GitHub source. Each picture is labeled with its emoji name and message ID. Downloads have a 10-second deadline, reject redirects and respect `MODEL_IMAGES_MAX_BYTES`; unavailable pictures leave a note. Names/counts remain visible with images disabled. Rendered pictures and download failures persist across restarts. Unicode names come from Unicode 16.0, under the [Unicode data license](src/bot/UNICODE-LICENSE.txt).
 

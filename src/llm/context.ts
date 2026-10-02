@@ -1,6 +1,6 @@
 import type { ReactionSnapshot } from "../bot/reactions.js";
 import type { ChatMessage, MessageAttachmentLike, ToolCall } from "./client.js";
-import { isImageAttachment, isInterruptedError } from "./client.js";
+import { attachmentIdentity, isImageAttachment, isInterruptedError } from "./client.js";
 
 /** The role of one context entry (the request `messages` array uses it). */
 export type Role = "system" | "user" | "assistant" | "tool";
@@ -182,6 +182,11 @@ export class ChannelContext {
     if (!this.batching) this.onChange?.();
   }
 
+  /** Revision of all context mutations, used to reject stale REST observations. */
+  getRevision(): number {
+    return this.revision;
+  }
+
   /** Append an arrival (a human's or another bot's message; `bot` labels it "(bot)" in the context). */
   pushUser(
     name: string,
@@ -332,8 +337,11 @@ export class ChannelContext {
   updateAttachments(messageId: string, attachments: MessageAttachmentLike[]): void {
     const entry = this.find(messageId);
     if (entry && JSON.stringify(entry.attachments) !== JSON.stringify(attachments)) {
+      const identity = (items: MessageAttachmentLike[]): string => JSON.stringify(items.map((att) =>
+        [attachmentIdentity(att.url), att.name, att.size, att.contentType]));
+      const changed = identity(entry.attachments) !== identity(attachments);
       entry.attachments = [...attachments];
-      this.invalidateMeasurement();
+      if (changed) this.invalidateMeasurement();
       this.changed();
     }
   }

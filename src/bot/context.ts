@@ -1,6 +1,7 @@
 import { snapshotReactions, fetchReactionImage, reactionImageUrl, type ReactionMessage } from "./reactions.js";
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
+import { attachmentIdentity, InterruptedError } from "../llm/client.js";
 import {
   compareDiscordIds,
   COMPACTION_SYSTEM_PROMPT,
@@ -13,7 +14,6 @@ import { fetchMessageFiles, type FileFetch } from "./files.js";
 import {
   fetchMessageImages,
   isImageAttachment,
-  isDiscordCdnUrl,
   type AttachmentImage,
   type ImageFetch,
   type MessageAttachmentLike,
@@ -59,6 +59,8 @@ export function toMessageLike(m: Message): MessageLike {
 }
 
 export interface ContextOptions {
+  /** Activity during REST seeding invalidates the fetched snapshot before merging. */
+  signal?: AbortSignal;
   /** Durable attachment bytes shared across requests and restarts. */
   attachmentStore?: AttachmentStore;
   /** Reject a seed entry previously retired from the working context. */
@@ -139,7 +141,10 @@ export async function buildChannelContext(
 ): Promise<ChatMessage[] | null> {
   if (!context.has(mentionId)) return null; // deleted before its turn ran
   if (!context.seeded) {
+    const revision = context.getRevision();
     const seed = await seedMessages(channel, opts.maxMessages);
+    if (opts.signal?.aborted) throw new InterruptedError();
+    if (!context.seeded && context.getRevision() !== revision) throw new InterruptedError();
     if (seed !== null && !context.seeded) {
       // A !clear committed while the fetch was in flight wins: its reset()
       // already marked the seed as taken, so the late fetch must not undo
@@ -211,15 +216,18 @@ export async function buildChannelContext(
  * is re-derived from the chunks (see ChannelContext.updateChunk). The
  * single-message entry's attachment metadata follows the edit too (the
  * image/file pipelines download from the stored metadata at turn time).
+ * Returns whether model-visible context changed; signature-only CDN URL
+ * refreshes persist metadata without changing the prompt or token measurement.
  */
 export function syncMessageUpdate(
   context: ChannelContext,
   message: { id: string; content: string; attachments: { values(): Iterable<MessageAttachmentLike> }; mentions?: { users: { values(): Iterable<{ id: string; username: string }> }; members: { get(id: string): { displayName: string } | undefined } | null } } & ReactionMessage,
   botId: string,
   botName: string,
-): void {
+): boolean {
   const entry = context.find(message.id);
-  if (!entry) return; // not in this channel's context
+  if (!entry) return false; // not in this channel's context
+  const epoch = context.getMeasurementEpoch();
   if (message.reactions) context.updateReactions(message.id, snapshotReactions(message));
   if (entry.ids.length === 1) {
     const mentionNames = message.mentions
@@ -243,6 +251,7 @@ export function syncMessageUpdate(
       context.updateChunk(message.id, message.content);
     }
   }
+  return context.getMeasurementEpoch() !== epoch;
 }
 
 /**
@@ -294,7 +303,7 @@ export function prefixEndIndex(
 async function seedMessages(channel: GuildTextBasedChannel, limit: number): Promise<MessageLike[] | null> {
   const n = Math.min(limit, DISCORD_FETCH_LIMIT);
   try {
-    const col = await channel.messages.fetch({ limit: n });
+    const col = await channel.messages.fetch({ limit: n, cache: false });
     return [...col.values()]
       .sort((a, b) => a.createdTimestamp - b.createdTimestamp || compareDiscordIds(a.id, b.id))
       .map(toMessageLike);
@@ -321,6 +330,22 @@ export function toSeedEntry(m: MessageLike, botId: string, botName: string): See
     entry.bot = m.author.bot;
   }
   return entry;
+}
+
+/** Merge fetched history chronologically without queuing turns or restoring retired IDs. */
+export function mergeDiscordHistory(
+  context: ChannelContext,
+  messages: MessageLike[],
+  opts: Pick<ContextOptions, "botId" | "botName" | "acceptSeed">,
+  markSeeded = true,
+): void {
+  const clearedAt = context.getClearedAt();
+  const entries = messages
+    .filter((m) => opts.acceptSeed?.(m.id) !== false)
+    .map((m) => toSeedEntry(m, opts.botId, opts.botName))
+    .filter((e): e is SeedEntry => e !== null)
+    .filter((e) => clearedAt === null || e.ts > clearedAt);
+  if (entries.length > 0 || (markSeeded && !context.seeded)) context.seedFrom(entries, undefined, markSeeded);
 }
 
 /**
@@ -466,12 +491,6 @@ function attachmentPromptKey(
 ): string {
   return JSON.stringify([1, opts.enableImages, opts.imagesMaxBytes, opts.enableFileContents, opts.fileContentsMaxBytes,
     !!opts.imageFetch, !!opts.fileFetch, attachments.map((att) => {
-      let url = att.url;
-      if (isDiscordCdnUrl(url)) {
-        const parsed = new URL(url);
-        for (const param of ["ex", "is", "hm"]) parsed.searchParams.delete(param);
-        url = parsed.href;
-      }
-      return [url, att.name, att.size, att.contentType];
+      return [attachmentIdentity(att.url), att.name, att.size, att.contentType];
     })]);
 }

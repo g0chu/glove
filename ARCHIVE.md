@@ -92,12 +92,26 @@ or removed trigger prevents restoring old working history. Shutdown aborts work
 and waits up to 30 seconds for active turns/catch-up before exiting. Work still
 unfinished at that point remains identifiable in the archive.
 
-Offline capture paginates beyond Discord's 100-message page limit to the previous
-durable cursor. Its original boundary survives a crash during catch-up. Recent
-stored user messages (up to 100) are fetched individually to reconcile offline
-edits/deletions; live events take precedence. A newly archived channel takes one
-baseline page. Network/permission failures leave catch-up pending for retry.
-Retired working-context IDs are excluded from subsequent seeding.
+Offline capture paginates beyond Discord's 100-message page limit to the last
+completed REST cursor. All available messages in that gap enter working context
+chronologically; historical mentions do not queue replies. Every retained
+Discord message ID (including bot reply chunks) is reconciled for edits,
+attachments, reactions and deletions, using page observations first and direct
+fetches for missing IDs. Live events take precedence. A newly archived channel
+takes one baseline page, with the working seed bounded by
+`MODEL_CONTEXT_MAX_MESSAGES` (at most 100).
+
+Before each model attempt, refresh repeats reconciliation and paginates from
+the last completed REST cursor. New gateway messages do not advance that cursor,
+so a new mention cannot hide missed messages before it. Interrupted or failed
+refreshes retain their original boundary across a crash. Completion is recorded
+only after context checkpoints, and pending arrivals keep the cursor behind
+their uncommitted IDs. Legacy archives reconcile once from their oldest tracked
+ID to repair earlier gaps. Retired IDs and clear watermarks prevent resurrection.
+Network/permission failures leave catch-up pending for retry; incomplete startup
+catch-up skips the turn. Fetches are sequential and respect Discord rate limits;
+long retained conversations require more REST requests than the former 100-ID
+reconciliation window.
 
 ## Inspect and export
 

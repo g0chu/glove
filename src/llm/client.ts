@@ -25,6 +25,17 @@ export interface MessageAttachmentLike {
   contentType: string | null;
 }
 
+/** Immutable Discord attachment identity, excluding expiring CDN signatures. */
+export function attachmentIdentity(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" || parsed.hostname !== "cdn.discordapp.com" ||
+        !parsed.pathname.startsWith("/attachments/")) return url;
+    for (const parameter of ["ex", "is", "hm"]) parsed.searchParams.delete(parameter);
+    return parsed.href;
+  } catch { return url; }
+}
+
 /** MIME types a Chat Completions endpoint can take as image_url. */
 export const SUPPORTED_IMAGE_TYPES: Record<string, string> = {
   "image/png": "image/png",

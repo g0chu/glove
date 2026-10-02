@@ -30,6 +30,7 @@ interface GateEntry {
   channelId: string;
   timer: GateTimer;
   ready: boolean;
+  held: boolean;
 }
 
 /**
@@ -70,7 +71,7 @@ export class MessageGate {
   arrive(message: GateMessage): void {
     const prev = this.pending.get(message.id);
     if (prev) this.cancel(prev.timer);
-    const entry: GateEntry = { message, channelId: message.channel?.id ?? "", timer: undefined, ready: false };
+    const entry: GateEntry = { message, channelId: message.channel?.id ?? "", timer: undefined, ready: false, held: false };
     entry.timer = this.schedule(() => {
       // Only the entry that is still stored for this id commits: an edit
       // replaced it (this timer was cancelled) or a delete/channel-delete
@@ -99,6 +100,20 @@ export class MessageGate {
   /** True while the message is in its stability window (edits refresh the gate, not the context). */
   isPending(messageId: string): boolean {
     return this.pending.has(messageId);
+  }
+
+  /** Pause a pending commit until an incomplete Discord update has been fetched. */
+  hold(messageId: string): void {
+    const entry = this.pending.get(messageId);
+    if (!entry) return;
+    this.cancel(entry.timer);
+    // Replacing the entry also invalidates a cancelled callback that fires late.
+    this.pending.set(messageId, { ...entry, timer: undefined, ready: false, held: true });
+  }
+
+  /** True when a pending message needs a complete REST observation to resume. */
+  isHeld(messageId: string): boolean {
+    return this.pending.get(messageId)?.held ?? false;
   }
 
   /**
