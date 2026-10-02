@@ -6516,11 +6516,17 @@ const ok = (name: string): void => {
   assert.equal(snapshot.find((r) => r.id === null)?.name, "thumbs up");
   assert.equal(reactionImageUrl(snapshot.find((r) => r.id === "123")!), "https://cdn.discordapp.com/emojis/123.png?size=64");
   assert(reactionImageUrl(snapshot.find((r) => r.id === null)!).endsWith("/1f44d.png"));
+  const unicodeReaction = { id: null, name: "", count: 1, emoji: "🏳️‍🌈" };
+  assert(reactionImageUrl(unicodeReaction).endsWith("/1f3f3-fe0f-200d-1f308.png"));
+  assert(reactionImageUrl({ ...unicodeReaction, emoji: "❤️" }).endsWith("/2764.png"));
+  assert(reactionImageUrl({ ...unicodeReaction, emoji: "👩‍⚕️" }).endsWith("/1f469-200d-2695-fe0f.png"));
   const context = new ChannelContext();
   context.pushUser("person", "an old message", "1", 1, []);
   context.pushAssistant("reply", ["2", "3"]);
   context.setMeasuredTokens(123);
   context.updateReactions("1", snapshot);
+  // Cached failures from the old URL builder must not suppress corrected downloads.
+  context.setReactionImage(context.find("1")!, JSON.stringify(["👍", 100, true]), null);
   assert.equal(context.getMeasuredTokens(), null);
   context.updateReactions("3", snapshot.slice(0, 1));
   let downloads = 0;

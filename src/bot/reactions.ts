@@ -25,7 +25,9 @@ export function snapshotReactions(message: ReactionMessage): ReactionSnapshot[] 
 /** Fixed image sources only; custom emoji use a static PNG of their first frame. */
 export function reactionImageUrl(reaction: ReactionSnapshot): string {
   if (reaction.id && /^\d+$/.test(reaction.id)) return `https://cdn.discordapp.com/emojis/${reaction.id}.png?size=64`;
-  const points = [...reaction.emoji].filter((c) => c !== "\ufe0f").map((c) => c.codePointAt(0)!.toString(16)).join("-");
+  // Twemoji keeps variation selectors in joined sequences (for example rainbow flags).
+  const emoji = reaction.emoji.includes("\u200d") ? reaction.emoji : reaction.emoji.replace(/\ufe0f/g, "");
+  const points = [...emoji].map((c) => c.codePointAt(0)!.toString(16)).join("-");
   return `https://raw.githubusercontent.com/jdecked/twemoji/v16.0.1/assets/72x72/${points}.png`;
 }
 

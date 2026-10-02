@@ -1,4 +1,4 @@
-import { snapshotReactions, fetchReactionImage, type ReactionMessage } from "./reactions.js";
+import { snapshotReactions, fetchReactionImage, reactionImageUrl, type ReactionMessage } from "./reactions.js";
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
 import {
@@ -426,7 +426,7 @@ export async function contextToMessages(
       for (const reaction of reactions) {
         reactionLines.push(`[reaction on message ${messageId}: ${reaction.name} (${reaction.emoji}) × ${reaction.count}]`);
         if (opts.enableImages) {
-          const key = JSON.stringify([reaction.id ?? reaction.emoji, opts.imagesMaxBytes, !!opts.imageFetch]);
+          const key = JSON.stringify([reaction.id ?? reaction.emoji, opts.imagesMaxBytes, !!opts.imageFetch, reactionImageUrl(reaction)]);
           if (!Object.hasOwn(e.reactionImages ?? {}, key)) {
             context.setReactionImage(e, key, await fetchReactionImage(reaction, opts.imagesMaxBytes, opts.imageFetch));
           }
