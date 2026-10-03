@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import path from "node:path";
 import type { SerializedChannelContext, ContextEntry } from "./context.js";
 import { attachmentIdentity } from "./client.js";
+import { ArchiveLayout, archiveName } from "./archive-layout.js";
+import { ArchiveLines } from "./archive-lines.js";
 
 /** Identifiers shared by related journal records; never endpoint credentials. */
 export interface ArchiveScope {
@@ -16,9 +18,9 @@ export interface ArchiveScope {
   purpose?: "reply" | "reply-candidate" | "chime" | "compaction";
 }
 
-/** One committed journal record. Payloads live in immutable SHA-256 blobs. */
+/** One committed journal record; v1 references blobs, v2 includes JSON payloads. */
 export interface ArchiveRecord {
-  version: 1;
+  version: 1 | 2;
   seq: number;
   time: string;
   type: string;
@@ -26,6 +28,8 @@ export interface ArchiveRecord {
   data: string;
   previous: string;
   hash: string;
+  /** Version 2 stores JSON directly in the journal. */
+  payload?: unknown;
 }
 
 // Only the deduplication accelerator is evictable; recovery IDs are durable state.
@@ -68,6 +72,7 @@ export class ConversationArchive {
   private readonly recordedTurns = new Set<string>();
   private readonly indexedEntries = new Set<string>();
   private recovered = false;
+  private layout: ArchiveLayout | undefined;
   readonly recoveredTail: string | null;
 
   constructor(readonly directory: string, private readonly onFailure?: (error: Error) => void, private readonly fastRecovery = false) {
@@ -83,8 +88,12 @@ export class ConversationArchive {
       this.recoveredTail = this.recover(offset);
       for (const [url, blob] of this.attachments) this.attachmentIdentities.set(attachmentIdentity(url), blob);
       this.recovered = true;
+      this.layout = new ArchiveLayout(directory);
+      this.layout.restore(this);
       if (this.fastRecovery) this.saveIndex();
     } catch (err) {
+      this.layout = undefined;
+      this.recovered = false;
       this.close();
       throw err;
     }
@@ -128,11 +137,13 @@ export class ConversationArchive {
   }
 
   /** Save exact bytes once; the returned hash is also the blob's filename. */
-  putBlob(bytes: Uint8Array): string {
+  putBlob(bytes: Uint8Array, json = false): string {
     this.check();
     try {
       const hash = digest(bytes);
-      const file = path.join(this.directory, "blobs", hash);
+      const folder = path.join(this.directory, json ? "json" : "blobs");
+      fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+      const file = path.join(folder, json ? `${hash}.json` : hash);
       if (fs.existsSync(file)) {
         if (digest(fs.readFileSync(file)) !== hash) throw new Error(`archive blob is corrupt: ${hash}`);
         return hash;
@@ -145,29 +156,72 @@ export class ConversationArchive {
       } finally { fs.closeSync(fd); }
       fs.renameSync(temp, file);
       syncDirectory(path.dirname(file));
+      syncDirectory(this.directory);
       return hash;
     } catch (err) { return this.fail(err); }
   }
 
-  /** Read and verify a blob, rejecting path traversal and corrupted bytes. */
-  readBlob(hash: string): Buffer {
+  /** Locate content by checksum across legacy blobs, JSON files and named attachments. */
+  blobFile(hash: string): string {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error("invalid archive blob hash");
-    const bytes = fs.readFileSync(path.join(this.directory, "blobs", hash));
+    const legacy = path.join(this.directory, "blobs", hash);
+    const json = path.join(this.directory, "json", `${hash}.json`);
+    const attachment = path.join(this.directory, "attachments", hash);
+    return fs.existsSync(legacy) ? legacy : fs.existsSync(json) ? json :
+      path.join(attachment, fs.readdirSync(attachment).filter(name => !/\.[a-f0-9-]{36}\.tmp$/.test(name)).sort()[0]);
+  }
+
+  /** Read and verify stored content, rejecting path traversal and corrupted bytes. */
+  readBlob(hash: string): Buffer {
+    const bytes = fs.readFileSync(this.blobFile(hash));
     if (digest(bytes) !== hash) throw new Error(`archive blob is corrupt: ${hash}`);
     return bytes;
   }
 
-  /** Decode one record's immutable JSON payload. */
-  readData<T = unknown>(record: Pick<ArchiveRecord, "data">): T {
-    const data = JSON.parse(this.readBlob(record.data).toString("utf8"));
-    if (data?.archiveFormat === "context-v1") {
+  /** Save original attachment bytes under a safe original-format filename. */
+  putAttachment(bytes: Uint8Array, name: string): string {
+    this.check();
+    try {
+      const hash = digest(bytes);
+      const folder = path.join(this.directory, "attachments", hash);
+      fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+      const file = path.join(folder, archiveName(name));
+      if (fs.existsSync(file)) {
+        if (digest(fs.readFileSync(file)) !== hash) throw new Error("archive attachment is corrupt");
+      } else {
+        const sibling = fs.readdirSync(folder).find(entry => !/\.[a-f0-9-]{36}\.tmp$/.test(entry));
+        if (sibling) {
+          const existing = path.join(folder, sibling);
+          if (digest(fs.readFileSync(existing)) !== hash) throw new Error("archive attachment is corrupt");
+          fs.linkSync(existing, file);
+          syncDirectory(folder);
+          return hash;
+        }
+        const temporary = `${file}.${randomUUID()}.tmp`;
+        const fd = fs.openSync(temporary, "wx", 0o600);
+        try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+        fs.renameSync(temporary, file);
+        syncDirectory(folder);
+        syncDirectory(path.dirname(folder));
+        syncDirectory(this.directory);
+      }
+      return hash;
+    } catch (err) { return this.fail(err); }
+  }
+
+  /** Decode and verify a payload, expanding shared checkpoint entries by default. */
+  readData<T = unknown>(record: Pick<ArchiveRecord, "data" | "payload">, expandContext = true): T {
+    const bytes = record.payload === undefined ? this.readBlob(record.data) : Buffer.from(JSON.stringify(record.payload));
+    if (digest(bytes) !== record.data) throw new Error("archive payload is corrupt");
+    const data = JSON.parse(bytes.toString("utf8"));
+    if (expandContext && data?.archiveFormat === "context-v1") {
       return { ...data.metadata, entries: data.entries.map((hash: string) => this.readData({ data: hash })) } as T;
     }
     return data as T;
   }
 
   /** Append and fsync one event, after its immutable payload is durable. */
-  record(type: string, scope: ArchiveScope, data: unknown): number {
+  record(type: string, scope: ArchiveScope, data: unknown, time = new Date().toISOString()): number {
     this.check();
     try {
       // Checkpoints share immutable entry blobs; growing conversations do
@@ -176,14 +230,17 @@ export class ConversationArchive {
       if (type === "context.checkpoint") {
         const { entries, ...metadata } = data as SerializedChannelContext;
         stored = { archiveFormat: "context-v1", metadata,
-          entries: entries.map((entry) => this.putBlob(Buffer.from(JSON.stringify(entry)))) };
+          entries: entries.map((entry) => this.putBlob(Buffer.from(JSON.stringify(entry)), true)) };
       }
-      const payload = this.putBlob(Buffer.from(JSON.stringify(stored)));
-      const body = { version: 1 as const, seq: this.seq + 1, time: new Date().toISOString(), type, scope, data: payload, previous: this.previous };
+      const bytes = Buffer.from(JSON.stringify(stored));
+      // Only checkpoint manifests need a separate file for indexed random access.
+      const payload = type === "context.checkpoint" ? this.putBlob(bytes, true) : digest(bytes);
+      const body = { version: 2 as const, seq: this.seq + 1, time, type, scope, data: payload, previous: this.previous, payload: JSON.parse(bytes.toString("utf8")) as unknown };
       const record = { ...body, hash: digest(JSON.stringify(body)) };
       fs.writeFileSync(this.fd, JSON.stringify(record) + "\n");
       fs.fsyncSync(this.fd);
       this.accept(record);
+      this.layout?.append(this, record);
       return record.seq;
     } catch (err) { return this.fail(err); }
   }
@@ -195,13 +252,14 @@ export class ConversationArchive {
     if (channelId && record.type === "context.checkpoint") {
       this.checkpoints.set(channelId, record.data);
       const ids = this.tracked.get(channelId) ?? new Set<string>();
-      const stored = JSON.parse(this.readBlob(record.data).toString("utf8"));
+      const stored = record.payload ?? JSON.parse(this.readBlob(record.data).toString("utf8"));
       const track = (entry: ContextEntry): void => {
         for (const id of entry.ids) ids.add(id);
         if (entry.turnId) this.recordedTurns.add(entry.turnId);
       };
-      if (stored.archiveFormat === "context-v1") {
-        for (const hash of stored.entries as string[]) {
+      const manifest = stored as { archiveFormat?: string; entries: string[] | ContextEntry[] };
+      if (manifest.archiveFormat === "context-v1") {
+        for (const hash of manifest.entries as string[]) {
           const key = `${channelId}:${hash}`;
           if (this.indexedEntries.has(key)) continue;
           track(this.readData<ContextEntry>({ data: hash }));
@@ -211,7 +269,7 @@ export class ConversationArchive {
           }
         }
       } else {
-        for (const entry of stored.entries as ContextEntry[]) track(entry);
+        for (const entry of manifest.entries as ContextEntry[]) track(entry);
       }
       this.tracked.set(channelId, ids);
     }
@@ -321,31 +379,30 @@ export class ConversationArchive {
 
   private recover(offset = 0): string | null {
     const buf = Buffer.alloc(64 * 1024);
-    let pending = Buffer.alloc(0);
+    const lines = new ArchiveLines();
     let position = offset;
     let committedBytes = offset;
     for (;;) {
       const n = fs.readSync(this.fd, buf, 0, buf.length, position);
       if (n === 0) break;
       position += n;
-      pending = Buffer.concat([pending, buf.subarray(0, n)]);
-      let nl: number;
-      while ((nl = pending.indexOf(10)) !== -1) {
-        const line = pending.subarray(0, nl).toString("utf8");
-        const record = JSON.parse(line) as ArchiveRecord;
+      for (const line of lines.push(buf.subarray(0, n))) {
+        const record = JSON.parse(line.toString("utf8")) as ArchiveRecord;
         const { hash, ...body } = record;
-        if (record.version !== 1 || record.seq !== this.seq + 1 || record.previous !== this.previous ||
+        if (![1, 2].includes(record.version) || record.seq !== this.seq + 1 || record.previous !== this.previous ||
           typeof record.type !== "string" || !record.scope || hash !== digest(JSON.stringify(body))) {
           throw new Error(`archive journal is corrupt at sequence ${this.seq + 1}`);
         }
         // Ensure committed payloads are readable before accepting recovery.
-        const data = JSON.parse(this.readBlob(record.data).toString("utf8")) as { blob?: string };
-        if (record.type === "model.bytes" || record.type === "attachment.saved") this.readBlob(data.blob ?? "");
+        const data = this.readData<{ blob?: string }>(record, false);
+        if (record.type === "model.bytes") this.responseBytes(data);
+        if (record.type === "attachment.saved") this.readBlob(data.blob ?? "");
+        if (record.type === "context.checkpoint") this.readBlob(record.data);
         this.accept(record);
-        committedBytes += nl + 1;
-        pending = pending.subarray(nl + 1);
+        committedBytes += line.length + 1;
       }
     }
+    const pending = lines.tail();
     if (pending.length === 0) return null;
     const tail = path.join(this.directory, `torn-tail-${randomUUID()}.bin`);
     const fd = fs.openSync(tail, "wx", 0o600);
@@ -363,6 +420,9 @@ export class ConversationArchive {
 
   /** Highest captured Discord snowflake per channel, for offline catch-up. */
   messageCursors(): Map<string, string> { return new Map(this.cursors); }
+
+  /** Current verified journal head, for disposable readable views. */
+  head(): { seq: number; hash: string } { return { seq: this.seq, hash: this.previous }; }
 
   /** Completed REST coverage, never advanced by gateway observations alone. */
   catchupCursors(): Map<string, string | null> {
@@ -407,16 +467,13 @@ export class ConversationArchive {
     this.check();
     const end = fs.fstatSync(this.fd).size;
     const buf = Buffer.alloc(64 * 1024);
-    let pending = Buffer.alloc(0);
+    const lines = new ArchiveLines();
     for (let position = 0; position < end;) {
       const n = fs.readSync(this.fd, buf, 0, Math.min(buf.length, end - position), position);
       if (!n) break;
       position += n;
-      pending = Buffer.concat([pending, buf.subarray(0, n)]);
-      let nl: number;
-      while ((nl = pending.indexOf(10)) !== -1) {
-        yield JSON.parse(pending.subarray(0, nl).toString("utf8")) as ArchiveRecord;
-        pending = pending.subarray(nl + 1);
+      for (const line of lines.push(buf.subarray(0, n))) {
+        yield JSON.parse(line.toString("utf8")) as ArchiveRecord;
       }
     }
   }
@@ -427,6 +484,48 @@ export class ConversationArchive {
     return hash ? this.readBlob(hash) : null;
   }
 
+  /** Append exact response bytes to one file per request, before journaling their range. */
+  appendResponse(scope: ArchiveScope, bytes: Uint8Array, time?: string): void {
+    this.check();
+    try {
+      if (!scope.requestId) throw new Error("response capture requires a request id");
+      const folder = path.join(this.directory, "responses");
+      fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+      const file = `responses/${digest(scope.requestId)}.bin`;
+      const fd = fs.openSync(path.join(this.directory, file), "a+", 0o600);
+      let offset: number;
+      try {
+        offset = fs.fstatSync(fd).size;
+        fs.writeFileSync(fd, bytes);
+        fs.fsyncSync(fd);
+      } finally { fs.closeSync(fd); }
+      if (offset === 0) { syncDirectory(folder); syncDirectory(this.directory); }
+      this.record("model.bytes", scope, { file, offset, size: bytes.byteLength, sha256: digest(bytes) }, time);
+    } catch (err) { this.fail(err); }
+  }
+
+  /** Verify a response range; legacy blob-based captures remain readable. */
+  responseBytes(value: unknown): Buffer {
+    const data = value as { blob?: string; file?: string; offset?: number; size?: number; sha256?: string };
+    if (data.blob) return this.readBlob(data.blob);
+    if (!data.file || !/^responses\/[a-f0-9]{64}\.bin$/.test(data.file) ||
+      !Number.isSafeInteger(data.offset) || data.offset! < 0 || !Number.isSafeInteger(data.size) || data.size! < 0) {
+      throw new Error("invalid archive response range");
+    }
+    const fd = fs.openSync(path.join(this.directory, data.file), "r");
+    try {
+      if (data.offset! + data.size! > fs.fstatSync(fd).size) throw new Error("archive response is truncated");
+      const bytes = Buffer.alloc(data.size!);
+      for (let n = 0; n < bytes.length;) {
+        const read = fs.readSync(fd, bytes, n, bytes.length - n, data.offset! + n);
+        if (!read) throw new Error("archive response is truncated");
+        n += read;
+      }
+      if (digest(bytes) !== data.sha256) throw new Error("archive response is corrupt");
+      return bytes;
+    } finally { fs.closeSync(fd); }
+  }
+
   /** Incomplete operations are evidence only; never automatically replay them. */
   incomplete(): { tools: ArchiveRecord[]; requests: ArchiveRecord[]; turns: ArchiveRecord[] } {
     return { tools: [...this.unfinished.values()], requests: [...this.requests.values()], turns: [...this.turns.values()] };
@@ -434,7 +533,13 @@ export class ConversationArchive {
 
   /** Close the writer and release this process's lock. All writes already fsynced. */
   close(): void {
-    if (this.fd >= 0 && this.fastRecovery && this.recovered && !this.failure) this.saveIndex();
+    let layoutError: unknown;
+    const lock = path.join(this.directory, ".lock");
+    const ownsDirectory = fs.existsSync(lock) && fs.readFileSync(lock, "utf8") === this.owner;
+    if (this.fd >= 0 && this.recovered && !this.failure && ownsDirectory) {
+      try { this.layout?.finish(this); } catch (err) { layoutError = err; }
+    }
+    if (this.fd >= 0 && this.fastRecovery && this.recovered && !this.failure && ownsDirectory) this.saveIndex();
     if (this.fd >= 0) fs.closeSync(this.fd);
     this.fd = -1;
     this.checkpoints.clear();
@@ -449,7 +554,7 @@ export class ConversationArchive {
     this.reconciledCursors.clear();
     this.recordedTurns.clear();
     this.indexedEntries.clear();
-    const lock = path.join(this.directory, ".lock");
     if (fs.existsSync(lock) && fs.readFileSync(lock, "utf8") === this.owner) fs.unlinkSync(lock);
+    if (layoutError) throw layoutError;
   }
 }

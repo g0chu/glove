@@ -89,6 +89,11 @@ export interface ModelConfig {
   chatsFile: string;
   /** Durable append-only history, independent of working-context compaction. */
   archiveDir: string;
+  /** Capture attachments independently of the model's image/file settings. */
+  archiveAttachmentsEnabled: boolean;
+  archiveAttachmentMaxBytes: number;
+  archiveAttachmentsMaxPerMessage: number;
+  archiveAttachmentTimeoutMs: number;
 }
 
 /** Web tool family (in-process: the bot does the search/fetch itself, no sidecar). */
@@ -288,6 +293,10 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       timeoutMs: intEnv("MODEL_TIMEOUT_S", 120, 1) * 1000,
       chatsFile: optional("CHATS_FILE", "./data/chats.json"),
       archiveDir: optional("CHATS_ARCHIVE_DIR", "./data/archive"),
+      archiveAttachmentsEnabled: boolEnv("ARCHIVE_ATTACHMENTS_ENABLED", true),
+      archiveAttachmentMaxBytes: intEnv("ARCHIVE_ATTACHMENT_MAX_BYTES", 25_000_000, 1),
+      archiveAttachmentsMaxPerMessage: intEnv("ARCHIVE_ATTACHMENTS_MAX_PER_MESSAGE", 10, 1),
+      archiveAttachmentTimeoutMs: intEnv("ARCHIVE_ATTACHMENT_TIMEOUT_S", 30, 1) * 1000,
     },
     tools: {
       // Off by default: not every Chat Completions endpoint supports

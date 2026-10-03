@@ -20,7 +20,7 @@ export function archiveChat(archive: ConversationArchive, scope: ArchiveScope, c
           callbacks?.onResponse?.(status);
         },
         onResponseBytes: (bytes) => {
-          archive.record("model.bytes", request, { blob: archive.putBlob(bytes), size: bytes.byteLength });
+          archive.appendResponse(request, bytes);
           callbacks?.onResponseBytes?.(bytes);
         },
       }, tools, signal, options);

@@ -1,5 +1,6 @@
 import type { ArchiveScope, ConversationArchive } from "../llm/archive.js";
 import type { MessageAttachmentLike } from "../llm/client.js";
+import { archiveName } from "../llm/archive-layout.js";
 
 /** Optional durable byte store, independent of attachment network validation. */
 export interface AttachmentStore {
@@ -12,8 +13,8 @@ export function archiveAttachments(archive: ConversationArchive, scope: ArchiveS
   return {
     load: (att) => archive.attachment(att.url),
     save: (att, bytes) => {
-      const blob = archive.putBlob(bytes);
-      archive.record("attachment.saved", scope, { ...att, blob, downloadedBytes: bytes.length });
+      const blob = archive.putAttachment(bytes, att.name);
+      archive.record("attachment.saved", scope, { ...att, blob, file: `attachments/${blob}/${archiveName(att.name)}`, downloadedBytes: bytes.length });
     },
   };
 }

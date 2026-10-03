@@ -18,6 +18,7 @@ import { ChatPersistence } from "./llm/persist.js";
 import { ConversationArchive } from "./llm/archive.js";
 import { archiveChat } from "./llm/archived-chat.js";
 import { archiveAttachments } from "./bot/attachment-store.js";
+import { ArchiveAttachmentCapture } from "./bot/archive-capture.js";
 import { captureCatchup, coveredDiscordCursor } from "./bot/catchup.js";
 import { archiveTools } from "./tools/archive.js";
 import { recoverTurns } from "./llm/recovery.js";
@@ -79,6 +80,12 @@ async function main(): Promise<void> {
     process.exit(1);
   }, true);
   log.info(`durable archive: ${cfg.model.archiveDir}`);
+  const attachmentCapture = new ArchiveAttachmentCapture(archive, {
+    enabled: cfg.model.archiveAttachmentsEnabled,
+    maxBytes: cfg.model.archiveAttachmentMaxBytes,
+    maxPerMessage: cfg.model.archiveAttachmentsMaxPerMessage,
+    timeoutMs: cfg.model.archiveAttachmentTimeoutMs,
+  }, (error) => log.warn(`archive attachment capture: ${errMsg(error)}`));
   if (archive.recoveredTail) log.warn(`quarantined incomplete archive tail: ${archive.recoveredTail}`);
   const incomplete = archive.incomplete();
   if (incomplete.tools.length || incomplete.requests.length || incomplete.turns.length) {
@@ -135,9 +142,14 @@ async function main(): Promise<void> {
     ensureCatchupBoundary(channelId);
     archive.record("discord.message", { channelId, messageId: message.id }, {
       source,
+      channel: { id: channelId, guildId: message.guildId,
+        name: "name" in message.channel ? message.channel.name : null },
       displayName: message.member?.displayName ?? message.author?.username,
       message: message.toJSON(),
     });
+    attachmentCapture.observe({ channelId, messageId: message.id }, [...message.attachments.values()].map(a => ({
+      url: a.url, name: a.name, size: a.size, contentType: a.contentType ?? null,
+    })));
   };
   const captureChannel = (channel: GuildTextBasedChannel): Promise<void> => {
     const existing = catchups.get(channel.id);
@@ -1154,7 +1166,7 @@ async function main(): Promise<void> {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
-          Promise.allSettled([...activeTurns, ...catchups.values()]),
+          Promise.allSettled([...activeTurns, ...catchups.values(), attachmentCapture.stop()]),
           new Promise<void>((resolve) => { timer = setTimeout(resolve, 30_000); }),
         ]);
       } finally { if (timer) clearTimeout(timer); }

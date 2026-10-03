@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { open, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ArchiveRecord, ArchiveScope } from "../llm/archive.js";
+import { ArchiveLines } from "../llm/archive-lines.js";
 
 interface Interaction {
   id: string;
@@ -9,13 +10,19 @@ interface Interaction {
   scope: ArchiveScope;
   state: "pending" | "finished" | "failed";
   updated: number;
-  records: ArchiveRecord[];
+  records: InteractionRecord[];
+}
+
+interface InteractionRecord extends ArchiveRecord {
+  journalOffset: number;
+  journalLength: number;
 }
 
 /** Read-only, incremental journal view; never acquires the bot's writer lock. */
 export class InteractionReader {
   private offset = 0;
-  private tail = Buffer.alloc(0);
+  private consumed = 0;
+  private readonly lines = new ArchiveLines();
   private previous = "";
   private sequence = 0;
   private readonly interactions = new Map<string, Interaction>();
@@ -44,18 +51,17 @@ export class InteractionReader {
         const { bytesRead } = await file.read(buffer, 0, buffer.length, this.offset);
         if (!bytesRead) break;
         this.offset += bytesRead;
-        this.tail = Buffer.concat([this.tail, buffer.subarray(0, bytesRead)]);
-        let end: number;
-        while ((end = this.tail.indexOf(10)) !== -1) {
-          const record = JSON.parse(this.tail.subarray(0, end).toString("utf8")) as ArchiveRecord;
+        for (const line of this.lines.push(buffer.subarray(0, bytesRead))) {
+          const journalOffset = this.consumed;
+          this.consumed += line.length + 1;
+          const record = JSON.parse(line.toString("utf8")) as ArchiveRecord;
           const { hash, ...body } = record;
-          if (record.version !== 1 || record.seq !== this.sequence + 1 || record.previous !== this.previous ||
+          if (![1, 2].includes(record.version) || record.seq !== this.sequence + 1 || record.previous !== this.previous ||
             createHash("sha256").update(JSON.stringify(body)).digest("hex") !== hash) {
             throw new Error("archive journal verification failed");
           }
           this.sequence = record.seq;
           this.previous = hash;
-          this.tail = this.tail.subarray(end + 1);
           const id = record.scope.requestId;
           if (!id || !record.type.startsWith("model.")) continue;
           let item = this.interactions.get(id);
@@ -63,7 +69,10 @@ export class InteractionReader {
             item = { id, time: record.time, scope: record.scope, state: "pending", updated: record.seq, records: [] };
             this.interactions.set(id, item);
           }
-          item.records.push(record);
+          // Keep only references in the live index; large inline requests and
+          // image data are loaded from the journal when a user opens a request.
+          const { payload: _payload, ...reference } = record;
+          item.records.push({ ...reference, journalOffset, journalLength: line.length });
           item.updated = record.seq;
           if (record.type === "model.finished") item.state = "finished";
           if (record.type === "model.failed") item.state = "failed";
@@ -97,13 +106,50 @@ export class InteractionReader {
     let requestBytes: Buffer | undefined;
     const events: { type: string; time: string; data: unknown }[] = [];
     for (const record of [...item.records]) {
-      const payload = await this.blob(record.data);
+      const payload = record.version === 1 ? await this.blob(record.data) : await this.inlinePayload(record);
+      if (createHash("sha256").update(payload).digest("hex") !== record.data) throw new Error("archive payload verification failed");
       const data = JSON.parse(payload.toString("utf8"));
       if (record.type === "model.request") requestBytes = payload;
-      if (record.type === "model.bytes") chunks.push(await this.blob(data.blob));
+      if (record.type === "model.bytes") chunks.push(data.blob ? await this.blob(data.blob) : await this.response(data));
       else events.push({ type: record.type, time: record.time, data });
     }
     return { ...metadata, events, rawRequest: requestBytes?.toString("utf8") ?? "", requestBytes: requestBytes?.length ?? 0, rawResponse: Buffer.concat(chunks).toString("utf8"),
       responseBase64: Buffer.concat(chunks).toString("base64"), responseBytes: chunks.reduce((n, chunk) => n + chunk.length, 0) };
+  }
+
+  private async inlinePayload(record: InteractionRecord): Promise<Buffer> {
+    const file = await open(path.join(this.directory, "events.jsonl"), "r");
+    try {
+      if (record.journalOffset + record.journalLength > (await file.stat()).size) throw new Error("archive journal was truncated");
+      const bytes = Buffer.alloc(record.journalLength);
+      for (let n = 0; n < bytes.length;) {
+        const { bytesRead } = await file.read(bytes, n, bytes.length - n, record.journalOffset + n);
+        if (!bytesRead) throw new Error("archive journal was truncated");
+        n += bytesRead;
+      }
+      const current = JSON.parse(bytes.toString("utf8")) as ArchiveRecord;
+      const { hash, ...body } = current;
+      if (hash !== record.hash || createHash("sha256").update(JSON.stringify(body)).digest("hex") !== hash) {
+        throw new Error("archive journal verification failed");
+      }
+      return Buffer.from(JSON.stringify(current.payload));
+    } finally { await file.close(); }
+  }
+
+  private async response(data: { file: string; offset: number; size: number; sha256: string }): Promise<Buffer> {
+    if (!/^responses\/[a-f0-9]{64}\.bin$/.test(data.file) || !Number.isSafeInteger(data.offset) || data.offset < 0 ||
+      !Number.isSafeInteger(data.size) || data.size < 0) throw new Error("invalid archive response range");
+    const file = await open(path.join(this.directory, data.file), "r");
+    try {
+      if (data.offset + data.size > (await file.stat()).size) throw new Error("archive response is truncated");
+      const bytes = Buffer.alloc(data.size);
+      for (let n = 0; n < bytes.length;) {
+        const { bytesRead } = await file.read(bytes, n, bytes.length - n, data.offset + n);
+        if (!bytesRead) throw new Error("archive response is truncated");
+        n += bytesRead;
+      }
+      if (createHash("sha256").update(bytes).digest("hex") !== data.sha256) throw new Error("archive response verification failed");
+      return bytes;
+    } finally { await file.close(); }
   }
 }

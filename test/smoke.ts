@@ -29,6 +29,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
@@ -38,10 +39,14 @@ import { ChatPersistence } from "../src/llm/persist.js";
 import { ConversationArchive, type ArchiveRecord } from "../src/llm/archive.js";
 import { archiveChat } from "../src/llm/archived-chat.js";
 import { startInspector } from "../src/ui/server.js";
+import { InteractionReader } from "../src/ui/archive-reader.js";
 import { Script } from "node:vm";
 import { recoverTurns } from "../src/llm/recovery.js";
 import { archiveTools } from "../src/tools/archive.js";
 import { archiveAttachments } from "../src/bot/attachment-store.js";
+import { captureArchiveAttachments, ArchiveAttachmentCapture } from "../src/bot/archive-capture.js";
+import { exportArchive, archiveName } from "../src/llm/archive-layout.js";
+import { migrateArchive } from "../src/llm/archive-migration.js";
 import { captureCatchup, coveredDiscordCursor } from "../src/bot/catchup.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { MessageObservations } from "../src/bot/observations.js";
@@ -120,6 +125,18 @@ const ok = (name: string): void => {
   assert.equal(config.model.contextMaxMessages, 7);
   assert.equal(config.model.apiKey, "k1");
   assert.equal(config.model.archiveDir, "./data/archive");
+  assert.equal(config.model.archiveAttachmentsEnabled, true);
+  assert.equal(config.model.archiveAttachmentMaxBytes, 25_000_000);
+  const captureConfig = parseConfig({ DISCORD_TOKEN: "tok", MODEL_API_URL: "http://localhost/chat", ARCHIVE_ATTACHMENTS_ENABLED: "false",
+    ARCHIVE_ATTACHMENT_MAX_BYTES: "42", ARCHIVE_ATTACHMENTS_MAX_PER_MESSAGE: "2", ARCHIVE_ATTACHMENT_TIMEOUT_S: "3" });
+  assert.deepEqual(captureConfig.errors, []);
+  assert.equal(captureConfig.config.model.archiveAttachmentsEnabled, false);
+  assert.equal(captureConfig.config.model.archiveAttachmentMaxBytes, 42);
+  assert.equal(captureConfig.config.model.archiveAttachmentsMaxPerMessage, 2);
+  assert.equal(captureConfig.config.model.archiveAttachmentTimeoutMs, 3000);
+  for (const name of ["ARCHIVE_ATTACHMENTS_ENABLED", "ARCHIVE_ATTACHMENT_MAX_BYTES", "ARCHIVE_ATTACHMENTS_MAX_PER_MESSAGE", "ARCHIVE_ATTACHMENT_TIMEOUT_S"]) {
+    assert.ok(parseConfig({ [name]: "invalid" }).errors.some(e => e.includes(name)));
+  }
   assert.equal(parseConfig({ DISCORD_TOKEN: "tok", MODEL_API_URL: "http://localhost:8080/v1/chat/completions", CHATS_ARCHIVE_DIR: "/tmp/custom-archive" }).config.model.archiveDir, "/tmp/custom-archive");
   assert.equal(config.model.enableImages, false); // default
   assert.equal(config.model.imagesMaxBytes, 2048);
@@ -5951,7 +5968,7 @@ const ok = (name: string): void => {
     await assert.rejects(partialChat([]), /connection lost/);
     const partial = records().filter((r) => r.scope.turnId === "partial");
     assert.ok(partial.some((r) => r.type === "model.failed"));
-    assert.ok(archive.readBlob(archive.readData<{ blob: string }>(partial.find((r) => r.type === "model.bytes")!).blob).includes("unfinished thought"));
+    assert.ok(archive.responseBytes(archive.readData(partial.find((r) => r.type === "model.bytes")!)).includes("unfinished thought"));
     ok("archive: failed generations retain received reasoning bytes and failure identity");
   } finally {
     archive.close();
@@ -5963,6 +5980,7 @@ const ok = (name: string): void => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-corrupt-"));
   try {
     const archive = new ConversationArchive(dir);
+    archive.record("context.checkpoint", { channelId: "c" }, new ChannelContext().serialize());
     archive.record("test", {}, { preserved: true });
     archive.close();
     const journal = path.join(dir, "events.jsonl");
@@ -5971,8 +5989,8 @@ const ok = (name: string): void => {
     assert.throws(() => new ConversationArchive(dir), /corrupt/);
     assert.equal(fs.readFileSync(journal, "utf8"), original.replace('"seq":1', '"seq":2'), "complete corrupt records are never silently truncated");
     fs.writeFileSync(journal, original);
-    const row = JSON.parse(original) as ArchiveRecord;
-    fs.writeFileSync(path.join(dir, "blobs", row.data), "corrupt");
+    const row = JSON.parse(original.split("\n")[0]) as ArchiveRecord;
+    fs.writeFileSync(path.join(dir, "json", `${row.data}.json`), "corrupt");
     assert.throws(() => new ConversationArchive(dir), /blob is corrupt/);
     ok("archive: journal and payload corruption fail closed without destroying evidence");
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -6203,7 +6221,7 @@ const ok = (name: string): void => {
       else assert.equal((await pending).reasoning, mode === "stream" ? "full thought" : "json thought");
       const events = [...archive.records()].filter((r) => r.scope.turnId === mode);
       assert.deepEqual(archive.readData(events.find((r) => r.type === "model.request")!), JSON.parse(wireRequest));
-      const received = Buffer.concat(events.filter((r) => r.type === "model.bytes").map((r) => archive.readBlob(archive.readData<{ blob: string }>(r).blob))).toString("utf8");
+      const received = Buffer.concat(events.filter((r) => r.type === "model.bytes").map((r) => archive.responseBytes(archive.readData(r)))).toString("utf8");
       if (mode === "broken") assert.match(received, /unfinished reasoning/);
       else assert.equal(received, mode === "stream" ? sse : json, "exact response bytes preserved, including SSE framing and Unicode");
     }
@@ -6233,6 +6251,16 @@ const ok = (name: string): void => {
     const exported = cli("export", dir, "--channel=c");
     assert.equal(exported.status, 0, String(exported.stderr));
     assert.equal(JSON.parse(String(exported.stdout)).payload.content, "export me");
+    const folder = path.join(parent, "conversation");
+    assert.equal(cli("export", dir, "--channel=c", `--output=${folder}`).status, 0);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(folder, "events.jsonl"), "utf8")).payload.content, "export me");
+    assert.notEqual(cli("export", dir, `--output=${folder}`).status, 0, "folder export cannot overwrite existing output");
+    assert.notEqual(cli("migrate", dir).status, 0, "migration requires a separate output path");
+    const migrated = path.join(parent, "migrated");
+    const migration = cli("migrate", dir, `--output=${migrated}`);
+    assert.equal(migration.status, 0, String(migration.stderr));
+    assert.equal(JSON.parse(String(migration.stdout)).events, 1);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(migrated, "migration.json"), "utf8")).verified, true);
     assert.notEqual(cli("purge", dir).status, 0);
     assert.ok(fs.existsSync(dir), "purge without confirmation keeps archive intact");
     const locked = new ConversationArchive(dir);
@@ -6242,7 +6270,7 @@ const ok = (name: string): void => {
     assert.equal(cli("purge", dir, "--confirm").status, 0);
     assert.ok(!fs.existsSync(dir));
     assert.equal(fs.readFileSync(path.join(parent, "chats.json"), "utf8"), "working context");
-    ok("archive: inspect/export work; purge requires explicit confirmation and refuses an active writer");
+    ok("archive CLI: inspect, JSONL/folder export and verified migration work; outputs refuse overwrite and purge requires confirmation and an idle writer");
   } finally { fs.rmSync(parent, { recursive: true, force: true }); }
 }
 
@@ -6848,6 +6876,182 @@ const ok = (name: string): void => {
     }
   }
   ok("tool schema audit: all 19 tools have unique names, object schemas, valid required fields and dedicated Wikipedia operations");
+}
+
+// ------------------------------------------------ readable archive upgrade --
+{
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "glove-readable-archive-"));
+  const dir = path.join(parent, "legacy");
+  fs.mkdirSync(path.join(dir, "blobs"), { recursive: true });
+  const hash = (bytes: string | Buffer): string => createHash("sha256").update(bytes).digest("hex");
+  const blob = (bytes: string | Buffer): string => {
+    const id = hash(bytes);
+    fs.writeFileSync(path.join(dir, "blobs", id), bytes);
+    return id;
+  };
+  let seq = 0;
+  let previous = "";
+  const legacy = (type: string, scope: ArchiveRecord["scope"], payload: unknown): void => {
+    const body = { version: 1, seq: ++seq, time: "2026-01-02T03:04:05.000Z", type, scope,
+      data: blob(JSON.stringify(payload)), previous };
+    previous = hash(JSON.stringify(body));
+    fs.appendFileSync(path.join(dir, "events.jsonl"), JSON.stringify({ ...body, hash: previous }) + "\n");
+  };
+  const context = new ChannelContext();
+  context.pushUser("Alice", "keep my original", "100", 100, []);
+  legacy("context.checkpoint", { channelId: "c" }, context.serialize());
+  legacy("discord.message", { channelId: "c", messageId: "100" }, { content: "original message" });
+  const scope = { channelId: "c", messageId: "100", turnId: "turn", requestId: "request" };
+  legacy("turn.started", scope, { id: "100", chime: false });
+  legacy("model.started", scope, { messages: [] });
+  legacy("model.request", scope, { messages: [{ role: "user", content: "original request" }], stream: true });
+  const response = [Buffer.from("data: "), Buffer.from("unfinished 🌎\n\n")];
+  for (const bytes of response) legacy("model.bytes", scope, { blob: blob(bytes), size: bytes.length });
+  legacy("tool.started", { ...scope, executionId: "unknown" }, { call: { id: "call", name: "echo", arguments: "{}" } });
+  const attachment = { url: "https://cdn.discordapp.com/attachments/c/200/paper.pdf", name: "paper.pdf", contentType: "application/pdf", size: 6 };
+  const bytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0, 255]);
+  legacy("attachment.saved", { channelId: "c", messageId: "100" }, { ...attachment, blob: blob(bytes) });
+  const evidence = fs.readFileSync(path.join(dir, "events.jsonl"));
+  const archive = new ConversationArchive(dir);
+  try {
+    assert.equal(fs.readFileSync(path.join(dir, "channels", "c", "context.json"), "utf8").includes("keep my original"), true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "channels", "c", "turns", "turn.json"), "utf8")).status, "incomplete");
+    const upgraded = path.join(parent, "upgraded");
+    assert.equal(migrateArchive(archive, upgraded).events, seq);
+    assert.deepEqual(fs.readFileSync(path.join(dir, "events.jsonl")), evidence, "migration preserves all original journal bytes");
+    const migrated = new ConversationArchive(upgraded, undefined, true);
+    try {
+      assert.ok([...migrated.records()].every(r => r.version === 2 && r.payload !== undefined));
+      assert.equal(migrated.incomplete().tools[0].scope.executionId, "unknown");
+      assert.equal(migrated.incomplete().requests.length, 1);
+      assert.equal(migrated.incomplete().turns.length, 1);
+      assert.deepEqual(migrated.restoreContexts().get("c"), archive.restoreContexts().get("c"));
+      assert.deepEqual(migrated.attachment(attachment.url), bytes);
+      assert.deepEqual(Buffer.concat([...migrated.records()].filter(r => r.type === "model.bytes").map(r => migrated.responseBytes(migrated.readData(r)))), Buffer.concat(response));
+      assert.equal(fs.readdirSync(path.join(upgraded, "responses")).length, 1, "one raw file holds every response fragment");
+      assert.equal(fs.readdirSync(path.join(upgraded, "blobs")).length, 0, "new JSON and attachment storage need no opaque blobs");
+      assert.ok(fs.existsSync(path.join(upgraded, "attachments", hash(bytes), "paper.pdf")));
+      migrated.record("discord.message", { channelId: "c", messageId: "101" }, { content: "new inline payload" });
+      assert.equal(JSON.parse(fs.readFileSync(path.join(upgraded, "events.jsonl"), "utf8").trim().split("\n").at(-1)!).payload.content, "new inline payload");
+    } finally { migrated.close(); }
+    assert.throws(() => migrateArchive(archive, upgraded), /already exists/);
+    assert.throws(() => migrateArchive(archive, path.join(dir, "nested")), /separate/);
+    ok("archive upgrade: legacy evidence migrates to readable JSON and named attachments with exact bytes, checkpoints and unfinished work preserved");
+
+    archive.record("model.failed", scope, { error: "legacy request interrupted" });
+    const mixed = new InteractionReader(dir);
+    await mixed.refresh();
+    const mixedDetail = await mixed.detail("request") as { state: string; rawResponse: string };
+    assert.equal(mixedDetail.state, "failed");
+    assert.equal(mixedDetail.rawResponse, Buffer.concat(response).toString("utf8"));
+
+    const exported = path.join(parent, "export");
+    exportArchive(archive, exported, "c");
+    const rows = fs.readFileSync(path.join(exported, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.ok(rows.every(r => r.scope.channelId === "c"));
+    assert.equal(rows.find(r => r.type === "context.checkpoint").payload.entries[0].content, "keep my original");
+    assert.deepEqual(fs.readFileSync(path.join(exported, rows.find(r => r.type === "attachment.saved").payload.file)), bytes);
+    const chunks = rows.filter(r => r.type === "model.bytes").map(r => {
+      const payload = r.payload;
+      const all = fs.readFileSync(path.join(exported, payload.file));
+      return all.subarray(payload.offset, payload.offset + payload.size);
+    });
+    assert.deepEqual(Buffer.concat(chunks), Buffer.concat(response));
+    assert.throws(() => exportArchive(archive, exported), /EEXIST/);
+    ok("archive export: channel folders contain complete JSON, original binary attachments, incomplete turns and exact response bytes without source references");
+  } finally { archive.close(); fs.rmSync(parent, { recursive: true, force: true }); }
+}
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-capture-"));
+  const archive = new ConversationArchive(dir);
+  const scope = { channelId: "c", messageId: "100" };
+  const binary = { url: "https://cdn.discordapp.com/attachments/c/1/binary.zip", name: "binary.zip", size: 3, contentType: "application/zip" };
+  const options = { enabled: true, maxBytes: 4, maxPerMessage: 2, timeoutMs: 1000 };
+  let requests = 0;
+  try {
+    await captureArchiveAttachments(archive, scope, [binary], { ...options, enabled: false, fetchImpl: async () => { throw new Error("must not fetch"); } });
+    assert.equal([...archive.records()].length, 0);
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      requests++;
+      assert.equal(init?.redirect, "error", "archive capture refuses redirects");
+      return new Response(Buffer.from([0, 255, 1]));
+    };
+    const capture = new ArchiveAttachmentCapture(archive, { ...options, fetchImpl }, err => { throw err; });
+    capture.observe(scope, [binary]);
+    capture.observe(scope, [binary]);
+    await ticks(8);
+    assert.equal(requests, 1, "repeated observations share one download");
+    assert.deepEqual(archive.attachment(binary.url), Buffer.from([0, 255, 1]), "binary attachments are archived without model file/image admission");
+    capture.observe(scope, [binary]);
+    await ticks(3);
+    await capture.stop();
+    assert.equal([...archive.records()].filter(r => r.type === "attachment.saved").length, 1);
+    await captureArchiveAttachments(archive, { ...scope, messageId: "101" }, [{ ...binary, url: `${binary.url}?ex=2&is=3&hm=new` }], { ...options, fetchImpl });
+    assert.equal(requests, 1, "signature refreshes and shared attachments reuse saved original bytes");
+    const bad = [{ ...binary, url: "https://evil.example/file" }, { ...binary, url: binary.url + "?large", size: 10 }, binary];
+    await captureArchiveAttachments(archive, scope, bad, { ...options, fetchImpl });
+    assert.equal(requests, 1);
+    const skips = [...archive.records()].filter(r => r.type === "attachment.skipped").map(r => archive.readData<{ reason: string }>(r).reason);
+    assert.ok(skips.includes("not a discord attachment"));
+    assert.ok(skips.includes("attachment exceeds archive byte limit"));
+    assert.ok(skips.includes("per-message attachment limit"));
+    const uncached = { ...binary, url: binary.url + "?uncached" };
+    await captureArchiveAttachments(archive, scope, [uncached], { ...options, fetchImpl: async () => new Response(Buffer.alloc(5)) });
+    assert.equal(archive.attachment(uncached.url), null, "actual received bytes enforce the limit even when metadata understates size");
+    const abort = new AbortController();
+    abort.abort();
+    await captureArchiveAttachments(archive, scope, [uncached], { ...options, fetchImpl }, abort.signal);
+    assert.equal(requests, 1, "shutdown skips unstarted network work");
+    const first = { ...binary, name: "a" };
+    const second = { ...binary, name: "a.json" };
+    archiveAttachments(archive, scope).save(first, Buffer.from([0, 255, 1]));
+    archiveAttachments(archive, scope).save(second, Buffer.from([0, 255, 1]));
+    assert.ok(!archiveName("../../escape.pdf").includes("/"));
+    assert.equal(path.extname(archiveName("../../escape.pdf")), ".pdf");
+    assert.equal(path.extname(archiveName("my photo.png")), ".png");
+    assert.equal(path.extname(archiveName("a".repeat(300) + ".pdf")), ".pdf");
+    ok("archive capture: binary downloads are independent, bounded, deduplicated, CDN-only, redirect-free and shutdown-aware; attachment metadata cannot collide with filenames");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-response-"));
+  let archive = new ConversationArchive(dir);
+  try {
+    const scope = { channelId: "c", turnId: "t", requestId: "r" };
+    archive.record("turn.started", scope, {});
+    const large = "🌎".repeat(50_000);
+    archive.record("model.started", scope, { messages: [{ role: "user", content: large }] });
+    archive.appendResponse(scope, Buffer.from("first"));
+    archive.appendResponse(scope, Buffer.from("🌎second"));
+    archive.record("model.finished", scope, { content: "answer", reasoning: "thought", toolCalls: [] });
+    archive.record("turn.finished", scope, {});
+    const reader = new InteractionReader(dir);
+    await reader.refresh();
+    const detail = await reader.detail("r") as { rawResponse: string; responseBytes: number; events: { data: { messages: { content: string }[] } }[] };
+    assert.equal(detail.rawResponse, "first🌎second");
+    assert.equal(detail.responseBytes, Buffer.byteLength(detail.rawResponse));
+    assert.equal(detail.events[0].data.messages[0].content, large, "inline requests spanning read buffers retain exact Unicode content");
+    const captured = [...archive.records()].filter(r => r.type === "model.bytes");
+    const range = archive.readData<{ file: string; offset: number; size: number; sha256: string }>(captured[1]);
+    assert.equal(range.offset, 5);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "channels", "c", "turns", "t.json"), "utf8")).status, "finished");
+    archive.close();
+    // A dirty layout or partial derived event file must be repaired from verified evidence.
+    fs.writeFileSync(path.join(dir, "layout.json"), "crashed");
+    fs.appendFileSync(path.join(dir, "channels", "c", "events", captured[0].time.slice(0, 10) + ".jsonl"), "torn-view");
+    archive = new ConversationArchive(dir);
+    assert.ok(!fs.readFileSync(path.join(dir, "channels", "c", "events", captured[0].time.slice(0, 10) + ".jsonl"), "utf8").includes("torn-view"));
+    assert.equal([...archive.records()].length, 6, "rebuilding views adds no journal events");
+    assert.throws(() => archive.responseBytes({ ...range, file: "../secret" }), /invalid/);
+    const before = fs.readFileSync(path.join(dir, range.file));
+    fs.writeFileSync(path.join(dir, range.file), Buffer.alloc(before.length));
+    assert.throws(() => archive.responseBytes(range), /corrupt/);
+    archive.close();
+    assert.throws(() => new ConversationArchive(dir), /corrupt/);
+    fs.writeFileSync(path.join(dir, range.file), before.subarray(0, 2));
+    assert.throws(() => new ConversationArchive(dir), /truncated/);
+    ok("archive response: consolidated byte ranges verify checksums and truncation; damaged readable views rebuild without altering recovery history");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 console.log(`\n${checks} check groups passed`);

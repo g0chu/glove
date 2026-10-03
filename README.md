@@ -135,8 +135,11 @@ without the affected tensor/MTP combination.
 - **Archive:** `CHATS_ARCHIVE_DIR` (default `./data/archive`) preserves captured
   messages and edits, model requests/responses and reasoning, individual tool
   starts/results, and fetched attachment bytes independently of compaction.
+  Channel folders contain readable JSON/JSONL, complete turn records, and
+  attachments with their original extensions. Attachment capture is enabled
+  independently of model image/file input (`ARCHIVE_ATTACHMENTS_ENABLED`).
   Recovery restores completed work without repeating tools or Discord posts.
-  See [ARCHIVE.md](ARCHIVE.md) for retention, recovery, export, and purge.
+  See [ARCHIVE.md](ARCHIVE.md) for limits, recovery, folder export, migration, and purge.
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 
