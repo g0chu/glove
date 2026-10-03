@@ -452,7 +452,7 @@ async function main(): Promise<void> {
             if (context.has(message.id)) {
               if (syncMessageUpdate(context, message, refreshBot.id, refreshBot.username)) channelActivity.note(channelId);
             } else if (gate.isPending(message.id)) {
-              if (gate.isHeld(message.id)) gate.arrive(message);
+              gate.observe(message);
               deferred = true;
             } else if ((after === null || compareDiscordIds(message.id, after) > 0) &&
                 !gate.isPending(message.id) && !archive.wasTracked(channelId, message.id) &&
@@ -1068,7 +1068,7 @@ async function main(): Promise<void> {
       // A reaction event may supersede an in-flight partial-update fetch.
       // Its complete observation must also restore text/attachments or resume
       // the held gate, so the discarded fetch cannot leave history stuck.
-      if (gate.isHeld(fresh.id)) gate.arrive(fresh as GateMessage);
+      gate.observe(fresh as GateMessage);
       if (context.has(fresh.id)) syncMessageUpdate(context, fresh, client.user.id, client.user.username);
       if (!context.has(fresh.id) && !gate.isPending(fresh.id) &&
           !archive.wasTracked(channelId, fresh.id) &&

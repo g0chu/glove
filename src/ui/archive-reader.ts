@@ -3,6 +3,7 @@ import { open, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ArchiveRecord, ArchiveScope } from "../llm/archive.js";
 import { ArchiveLines } from "../llm/archive-lines.js";
+import { archiveJournalPath, archiveSystemDirectory } from "../llm/archive-paths.js";
 
 interface Interaction {
   id: string;
@@ -37,7 +38,7 @@ export class InteractionReader {
   }
 
   private async scan(): Promise<void> {
-    const journal = path.join(this.directory, "events.jsonl");
+    const journal = archiveJournalPath(this.directory);
     let size: number;
     try { size = (await stat(journal)).size; } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT" && this.offset === 0) return;
@@ -83,7 +84,7 @@ export class InteractionReader {
 
   private async blob(hash: string): Promise<Buffer> {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error("invalid archive blob hash");
-    const bytes = await readFile(path.join(this.directory, "blobs", hash));
+    const bytes = await readFile(path.join(archiveSystemDirectory(this.directory), "blobs", hash));
     if (createHash("sha256").update(bytes).digest("hex") !== hash) throw new Error("archive blob verification failed");
     return bytes;
   }
@@ -118,7 +119,7 @@ export class InteractionReader {
   }
 
   private async inlinePayload(record: InteractionRecord): Promise<Buffer> {
-    const file = await open(path.join(this.directory, "events.jsonl"), "r");
+    const file = await open(archiveJournalPath(this.directory), "r");
     try {
       if (record.journalOffset + record.journalLength > (await file.stat()).size) throw new Error("archive journal was truncated");
       const bytes = Buffer.alloc(record.journalLength);
@@ -137,7 +138,7 @@ export class InteractionReader {
   }
 
   private async response(data: { file: string; offset: number; size: number; sha256: string }): Promise<Buffer> {
-    if (!/^responses\/[a-f0-9]{64}\.bin$/.test(data.file) || !Number.isSafeInteger(data.offset) || data.offset < 0 ||
+    if (!/^(?:_system\/)?responses\/[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\.bin$/.test(data.file) || !Number.isSafeInteger(data.offset) || data.offset < 0 ||
       !Number.isSafeInteger(data.size) || data.size < 0) throw new Error("invalid archive response range");
     const file = await open(path.join(this.directory, data.file), "r");
     try {

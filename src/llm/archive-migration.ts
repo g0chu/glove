@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { ConversationArchive } from "./archive.js";
+import { archiveSystemDirectory } from "./archive-paths.js";
 
 /** Reject output paths that could overwrite or become part of the source archive. */
 export function validateArchiveOutput(source: string, output: string): void {
@@ -51,7 +52,7 @@ export function migrateArchive(source: ConversationArchive, output: string): { e
         JSON.stringify(before) !== JSON.stringify(after)) throw new Error("migration payload verification failed");
     }
     if (!next.next().done) throw new Error("migration contains unexpected events");
-    fs.writeFileSync(path.join(staging, "migration.json"), JSON.stringify({ version: 1, source: path.resolve(source.directory),
+    fs.writeFileSync(path.join(archiveSystemDirectory(staging), "migration.json"), JSON.stringify({ version: 1, source: path.resolve(source.directory),
       sourceHead: source.head(), events: count, verified: true }, null, 2) + "\n", { mode: 0o600 });
   } finally { verified.close(); }
   // Reserve an empty destination exclusively; never replace someone else's folder.

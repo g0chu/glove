@@ -40,28 +40,40 @@ back into every prompt or add an archive-search tool.
 
 ## Durability and recovery
 
-New writes use version 2: `events.jsonl` contains sequential, hash-chained records
+New writes use version 2: `_system/events.jsonl` contains sequential, hash-chained records
 with JSON payloads directly inside each record. No database or new dependency
 is required. A typical archive looks like this:
 
 ```text
 archive/
-  events.jsonl                  # authoritative events, with inline JSON
-  json/<sha256>.json            # shared checkpoint entries and manifests
-  attachments/<sha256>/file.pdf # immutable original attachment bytes
-  responses/<request-hash>.bin  # exact received HTTP body, including SSE
-  channels/<channel-id>/
+  README.md                    # short guide to the folders
+  channels/general--<channel-id>/
     channel.json                # available channel name / guild metadata
     context.json                # latest working context (null after deletion)
     events/YYYY-MM-DD.jsonl     # readable channel event history
-    turns/<turn-id>.jsonl       # incremental turn events
-    turns/<turn-id>.json        # complete or recovered/incomplete turn
+    turns/YYYY-MM-DD/HH-mm-ss.sss--reply--<turn-id>/
+      events.jsonl              # incremental turn events
+      turn.json                 # complete or recovered/incomplete turn
     attachments/<message-id>/
-      <id>--<checksum>--file.pdf
+      Meeting notes--<id>--<checksum>.pdf
       metadata/<filename>.json
-  recovery-index.json
-  layout.json
+  _system/
+    events.jsonl                # authoritative events, with inline JSON
+    checkpoints/<sha256>.json   # shared checkpoint entries and manifests
+    attachments/<sha256>/Meeting notes.pdf # immutable original attachment bytes
+    responses/<request-id>.bin  # exact received HTTP body, including SSE
+    recovery-index.json
+    layout.json
+    quarantine/torn-tail-<id>.bin # incomplete journal tails, when present
 ```
+
+Channel folder names use the first observed Discord name plus the channel ID;
+the ID distinguishes channels with identical names. Folders stay stable across
+channel renames, while `channel.json` reflects the current name. A channel without
+name metadata uses `channel--<id>`. Turn folders use the UTC start date/time and a
+`reply` or `chime` label; a turn crossing midnight keeps its original folder.
+Original attachment filenames retain spaces, Unicode and extensions where portable;
+unsafe or overly long names are encoded without losing the original name in metadata.
 
 Channel views are derived from the verified journal. `context.json` is a convenient
 view, not the recovery source. Completed turn JSON includes model exchanges,
@@ -86,7 +98,7 @@ continuing with unrecorded model/tool work. Use a local filesystem with reliable
 software durability. The archive grows until explicitly purged; there is no
 automatic retention limit.
 
-Bot startup uses a disposable, checksummed `recovery-index.json`. It verifies the
+Bot startup uses a disposable, checksummed `_system/recovery-index.json`. It verifies the
 entire indexed journal prefix with SHA-256, restores derived recovery state, then
 fully verifies and replays any newer records. The first startup (or a missing,
 damaged, incompatible, or invalidated index) performs the full scan. The index is
@@ -97,7 +109,7 @@ durable journal intact and only affect startup speed.
 Clean warm startup does not reread every historical payload. Content is hash-verified when
 read, including restored working contexts and attachments. Readable views rebuild
 on first upgrade or after an unclean session; this reads historical payloads and
-can take longer for a large archive. Removing `layout.json` while stopped also
+can take longer for a large archive. Removing `_system/layout.json` while stopped also
 forces a view rebuild. To check all recorded
 payloads and response/attachment bytes for disk corruption, stop the bot and run
 `npm run archive -- inspect`; CLI commands always use exhaustive recovery.
@@ -110,13 +122,13 @@ archive releases all in-memory indexes. Required retired-message IDs, recorded
 turn IDs, attachment references and recovery metadata still grow with history;
 dropping these would break recovery or revive cleared history.
 
-Only one process may own an archive. `.lock` records its PID and a unique owner ID.
-A dead PID's lock is reclaimed on restart. `.claim` serializes lock acquisition;
+Only one process may own an archive. `_system/.lock` records its PID and a unique owner ID.
+A dead PID's lock is reclaimed on restart. `_system/.claim` serializes lock acquisition;
 if a process dies during that short acquisition step, inspect the archive and
-verify that no writer is running before manually removing `.claim`. A live or
+verify that no writer is running before manually removing `_system/.claim`. A live or
 reused PID blocks acquisition rather than risking two writers.
 
-A partial final journal line is copied to a `torn-tail-*.bin` file, then removed
+A partial final journal line is copied to `_system/quarantine/torn-tail-*.bin`, then removed
 from the active journal. Complete corrupt records fail startup; missing/corrupt referenced payloads fail
 when verified (during exhaustive recovery, suffix replay, or content access),
 without silently replacing history with an empty archive.
@@ -173,12 +185,14 @@ Omit `--channel` to export all events. Without `--output`, the command retains i
 JSONL stdout behavior; decoded checkpoint manifests expand to complete entries.
 This stream alone does not include attachment or response bytes. Version 1
 `model.bytes` payloads refer to `blobs/<hash>`; version 2 payloads identify a range
-in `responses/<request-hash>.bin`. Concatenate the committed ranges in event order
+in `_system/responses/<request-id>.bin`. Concatenate the committed ranges in event order
 to reconstruct the received HTTP body.
 
 With `--output`, export creates a self-contained folder containing expanded JSON
 events, channel/turn views, original-format attachment copies, metadata and response
-files. Attachment `file` paths and response ranges resolve within the export.
+files, using the same named channel and dated turn folders. Internal export files
+live under `_system/`; its `events.jsonl` contains expanded events and `export.json`
+identifies the export format. Attachment `file` paths and response ranges resolve within the export.
 The output must not exist and must be separate from the source archive. Folder
 exports are for browsing and sharing; they are not bot recovery archives. Copy
 the whole native archive directory for a recovery backup.
@@ -219,7 +233,7 @@ npm run archive -- migrate ./data/archive --output=./data/archive-v2
 Migration preserves event order, timestamps, scopes, checkpoints, original bytes
 and unfinished operations. It invokes no model, tool or Discord send. The copy
 is exhaustively verified and compared with the source before publication;
-`migration.json` records the source head and verification. Existing outputs and
+`_system/migration.json` records the source head and verification. Existing outputs and
 paths inside the source are refused. Failed migrations may leave a sibling
 `.migrating-*` directory for inspection; the original archive is retained.
 

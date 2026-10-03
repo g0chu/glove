@@ -4,6 +4,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { ConversationArchive } from "./llm/archive.js";
+import { archiveJournalPath } from "./llm/archive-paths.js";
 import { exportArchive } from "./llm/archive-layout.js";
 import { migrateArchive, validateArchiveOutput } from "./llm/archive-migration.js";
 import { errMsg, log } from "./log.js";
@@ -13,7 +14,7 @@ const directory = path.resolve(args.find((arg) => !arg.startsWith("--")) ?? proc
 
 try {
   if (!["inspect", "export", "migrate", "purge"].includes(command)) throw new Error("usage: archive <inspect|export|migrate|purge> [directory] [--channel=ID] [--output=DIR] [--confirm]");
-  if (!fs.existsSync(path.join(directory, "events.jsonl"))) throw new Error("directory does not contain an archive journal");
+  if (!fs.existsSync(archiveJournalPath(directory))) throw new Error("directory does not contain an archive journal");
   if (command === "purge" && !args.includes("--confirm")) throw new Error("purge requires --confirm; stop the bot first");
   const archive = new ConversationArchive(directory);
   try {

@@ -45,7 +45,8 @@ import { recoverTurns } from "../src/llm/recovery.js";
 import { archiveTools } from "../src/tools/archive.js";
 import { archiveAttachments } from "../src/bot/attachment-store.js";
 import { captureArchiveAttachments, ArchiveAttachmentCapture } from "../src/bot/archive-capture.js";
-import { exportArchive, archiveName } from "../src/llm/archive-layout.js";
+import { exportArchive, archiveName, archiveTurnFolder, attachmentViewPath } from "../src/llm/archive-layout.js";
+import { archiveChannelName, archiveJournalPath, archiveSystemDirectory } from "../src/llm/archive-paths.js";
 import { migrateArchive } from "../src/llm/archive-migration.js";
 import { captureCatchup, coveredDiscordCursor } from "../src/bot/catchup.js";
 import { MessageGate, type GateMessage } from "../src/bot/gate.js";
@@ -90,6 +91,33 @@ const ok = (name: string): void => {
   checks++;
   console.log(`  ok  ${name}`);
 };
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-discord-flow-"));
+  try {
+    const runFlow = (mode: string) => spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"),
+      path.resolve("test/discord-flow.ts")], {
+      cwd: dir, encoding: "utf8", timeout: 30_000,
+      env: { ...process.env, DISCORD_TOKEN: "fake-token", DISCORD_GUILD_ID: "guild",
+        MODEL_API_URL: "http://localhost:1/v1/chat/completions", DISCORD_MESSAGE_STABLE_MS: "200",
+        CHATS_FILE: path.join(dir, "chats.json"), CHATS_ARCHIVE_DIR: path.join(dir, "archive"),
+        ARCHIVE_ATTACHMENTS_ENABLED: "false", MODEL_METRICS_ENABLED: "false",
+        MODEL_ENABLE_IMAGES: "false", MODEL_ENABLE_FILE_CONTENTS: "false", BOT_CHIME_ENABLED: mode === "chime" ? "true" : "false",
+        WEBTOOLS_ENABLED: "false", FILETOOLS_ENABLED: "false", SHELLTOOLS_ENABLED: "false",
+        ZIMTOOLS_ENABLED: "false", VAULTTOOLS_ENABLED: "false", MEMORYTOOLS_ENABLED: "false",
+        CONTEXT_COMPACTION_MAX_TOKENS: "100000", MODEL_SYSTEM_PROMPT: "test prompt", FLOW_MODE: mode },
+    });
+    for (const mode of ["live", "restart", "chime"]) {
+      if (mode === "chime") {
+        fs.rmSync(path.join(dir, "chats.json"), { force: true });
+        fs.rmSync(path.join(dir, "archive"), { recursive: true, force: true });
+      }
+      const flow = runFlow(mode);
+      assert.equal(flow.status, 0, `Discord entrypoint ${mode} regression failed:\n${flow.stdout}\n${flow.stderr}\n${flow.error ?? ""}`);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  ok("Discord entrypoint: ordered stability, REST/reaction races, typing, interruptions, deletes, clear, paginated restart and chime");
+}
 
 // ---------------------------------------------------------------- config --
 {
@@ -466,6 +494,53 @@ const ok = (name: string): void => {
     assert.equal(fired.length, 1, "the commit is a no-op after the entry is gone");
   }
   ok("gate: a stable message commits exactly once with its final state");
+
+  {
+    const fired: string[] = [];
+    const timers = makeTimers();
+    const gate = new MessageGate({ stableMs: 2000, onCommit: (m) => fired.push(m.content),
+      schedule: timers.schedule, cancel: timers.cancel });
+    const message = fakeMsg("1", "c1", "partial");
+    gate.arrive(message);
+    const first = [...timers.live.keys()][0];
+    gate.observe(fakeMsg("1", "c1", "partial"));
+    assert.deepEqual([...timers.live.keys()], [first], "identical REST observations do not prolong stability");
+    message.content = "complete";
+    gate.observe(message);
+    const second = [...timers.live.keys()][0];
+    assert.notEqual(second, first, "a missed edit restarts stability even when Discord mutated the original object");
+    timers.cbs.get(first)!();
+    assert.deepEqual(fired, [], "the old timer cannot commit stale text");
+    timers.cbs.get(second)!();
+    assert.deepEqual(fired, ["complete"]);
+  }
+  ok("gate: REST observations recover missed edits without prolonging unchanged messages");
+
+  {
+    const timers = makeTimers();
+    const fired: GateMessage[] = [];
+    const gate = new MessageGate({ stableMs: 2000, onCommit: (m) => fired.push(m),
+      schedule: timers.schedule, cancel: timers.cancel });
+    const attachment = { id: "a", url: "https://cdn.discordapp.com/attachments/1/2/file.txt?ex=1&hm=old",
+      name: "file.txt", size: 10, contentType: "text/plain" };
+    const message = Object.assign(fakeMsg("1", "c1", "read attachment"), { attachments: [attachment] });
+    gate.arrive(message);
+    const original = [...timers.live.keys()][0];
+    attachment.url = attachment.url.replace("ex=1&hm=old", "ex=2&hm=new");
+    gate.observe(message);
+    assert.deepEqual([...timers.live.keys()], [original], "CDN signatures do not extend the wait");
+    attachment.name = "replacement.txt";
+    gate.observe(message);
+    const changed = [...timers.live.keys()][0];
+    assert.notEqual(changed, original, "attachment-only edits restart stability");
+    gate.hold(message.id);
+    timers.cbs.get(changed)!();
+    assert.deepEqual(fired, []);
+    gate.observe(message);
+    timers.cbs.get([...timers.live.keys()][0])!();
+    assert.deepEqual(fired, [message], "a complete unchanged REST snapshot resumes a held message");
+  }
+  ok("gate: REST attachment changes wait again, CDN refreshes preserve stability, held observations resume");
 
   {
     const fired: string[] = [];
@@ -5781,8 +5856,8 @@ const ok = (name: string): void => {
 // Recovery indexes are disposable; the journal remains authoritative.
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-index-"));
-  const index = path.join(dir, "recovery-index.json");
-  const journal = path.join(dir, "events.jsonl");
+  const index = path.join(archiveSystemDirectory(dir), "recovery-index.json");
+  const journal = archiveJournalPath(dir);
   let archive = new ConversationArchive(dir, undefined, true);
   try {
     const context = new ChannelContext();
@@ -5845,7 +5920,7 @@ const ok = (name: string): void => {
       "changed indexed prefix invalidates the cache and fails closed");
     fs.writeFileSync(journal, original);
     // Old unused bytes are checked on access or exhaustive inspection, not warm startup.
-    fs.writeFileSync(path.join(dir, "blobs", blob), "damaged");
+    fs.writeFileSync(path.join(archiveSystemDirectory(dir), "blobs", blob), "damaged");
     archive = new ConversationArchive(dir, undefined, true);
     assert.throws(() => archive.attachment("attachment-url"), /corrupt/);
     archive.close();
@@ -5857,7 +5932,7 @@ const ok = (name: string): void => {
 // ------------------------------------------------------- durable archive --
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-"));
-  const journal = path.join(dir, "events.jsonl");
+  const journal = archiveJournalPath(dir);
   const records = (): ArchiveRecord[] => fs.readFileSync(journal, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as ArchiveRecord);
   let archive = new ConversationArchive(dir);
   try {
@@ -5983,14 +6058,14 @@ const ok = (name: string): void => {
     archive.record("context.checkpoint", { channelId: "c" }, new ChannelContext().serialize());
     archive.record("test", {}, { preserved: true });
     archive.close();
-    const journal = path.join(dir, "events.jsonl");
+    const journal = archiveJournalPath(dir);
     const original = fs.readFileSync(journal, "utf8");
     fs.writeFileSync(journal, original.replace('"seq":1', '"seq":2'));
     assert.throws(() => new ConversationArchive(dir), /corrupt/);
     assert.equal(fs.readFileSync(journal, "utf8"), original.replace('"seq":1', '"seq":2'), "complete corrupt records are never silently truncated");
     fs.writeFileSync(journal, original);
     const row = JSON.parse(original.split("\n")[0]) as ArchiveRecord;
-    fs.writeFileSync(path.join(dir, "json", `${row.data}.json`), "corrupt");
+    fs.writeFileSync(path.join(archiveSystemDirectory(dir), "checkpoints", `${row.data}.json`), "corrupt");
     assert.throws(() => new ConversationArchive(dir), /blob is corrupt/);
     ok("archive: journal and payload corruption fail closed without destroying evidence");
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -6225,9 +6300,7 @@ const ok = (name: string): void => {
       if (mode === "broken") assert.match(received, /unfinished reasoning/);
       else assert.equal(received, mode === "stream" ? sse : json, "exact response bytes preserved, including SSE framing and Unicode");
     }
-    for (const file of fs.readdirSync(path.join(dir, "blobs"))) {
-      assert.ok(!fs.readFileSync(path.join(dir, "blobs", file)).includes("archive-test-secret-key"), "authorization headers are never archived");
-    }
+    assert.ok(!fs.readFileSync(archiveJournalPath(dir)).includes("archive-test-secret-key"), "authorization headers are never archived");
     ok("archive: real HTTP JSON/SSE requests, responses, reasoning, tool fragments and broken streams round-trip without auth headers");
   } finally {
     archive.close();
@@ -6253,14 +6326,14 @@ const ok = (name: string): void => {
     assert.equal(JSON.parse(String(exported.stdout)).payload.content, "export me");
     const folder = path.join(parent, "conversation");
     assert.equal(cli("export", dir, "--channel=c", `--output=${folder}`).status, 0);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(folder, "events.jsonl"), "utf8")).payload.content, "export me");
+    assert.equal(JSON.parse(fs.readFileSync(archiveJournalPath(folder), "utf8")).payload.content, "export me");
     assert.notEqual(cli("export", dir, `--output=${folder}`).status, 0, "folder export cannot overwrite existing output");
     assert.notEqual(cli("migrate", dir).status, 0, "migration requires a separate output path");
     const migrated = path.join(parent, "migrated");
     const migration = cli("migrate", dir, `--output=${migrated}`);
     assert.equal(migration.status, 0, String(migration.stderr));
     assert.equal(JSON.parse(String(migration.stdout)).events, 1);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(migrated, "migration.json"), "utf8")).verified, true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(archiveSystemDirectory(migrated), "migration.json"), "utf8")).verified, true);
     assert.notEqual(cli("purge", dir).status, 0);
     assert.ok(fs.existsSync(dir), "purge without confirmation keeps archive intact");
     const locked = new ConversationArchive(dir);
@@ -6729,7 +6802,7 @@ const ok = (name: string): void => {
     assert.equal(older.items.at(-1)!.state, "finished");
     const filtered = await (await fetch(base + "/api/requests?q=channel-1")).json() as typeof list;
     assert.deepEqual(filtered.items.map(i => i.id), ["request-1"]);
-    const journal = path.join(dir, "events.jsonl");
+    const journal = archiveJournalPath(dir);
     fs.appendFileSync(journal, '{"unfinished":');
     assert.equal((await fetch(base + "/api/requests")).status, 200, "a live partial journal line is left for the next refresh");
     fs.appendFileSync(journal, 'true}\n');
@@ -6878,6 +6951,68 @@ const ok = (name: string): void => {
   ok("tool schema audit: all 19 tools have unique names, object schemas, valid required fields and dedicated Wikipedia operations");
 }
 
+// ------------------------------------------------ readable archive layout --
+{
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "glove-organized-archive-"));
+  const dir = path.join(parent, "archive");
+  let archive = new ConversationArchive(dir, undefined, true);
+  const channelId = "123456789";
+  const channel = path.join(dir, "channels", "team-chat--123456789");
+  const scope = { channelId, messageId: "100", turnId: "turn-1", requestId: "request-1" };
+  const started = "2026-10-02T23:59:59.123Z";
+  const turn = path.join(channel, "turns", "2026-10-02", "23-59-59.123--chime--turn-1");
+  try {
+    archive.record("discord.message", { channelId, messageId: "100" }, { channel: { name: "Team Chat", guildId: "guild" } }, started);
+    archive.record("discord.message", { channelId: "987654321", messageId: "101" }, { channel: { name: "Team Chat" } }, started);
+    archive.record("turn.started", scope, { chime: true }, started);
+    archive.record("model.started", scope, { messages: [] }, started);
+    archive.appendResponse(scope, Buffer.from("original response"), "2026-10-03T00:00:01.000Z");
+    const bytes = Buffer.from("original attachment");
+    const blob = archive.putAttachment(bytes, "Meeting notes.txt");
+    archive.record("attachment.saved", { channelId, messageId: "100" }, {
+      id: "attachment-1", name: "Meeting notes.txt", blob, url: "https://cdn.discordapp.com/attachments/c/attachment-1/notes.txt",
+    }, started);
+    const attachmentRecord = [...archive.records()].find(r => r.type === "attachment.saved")!;
+    const attachmentData = archive.readData<{ url: string; name: string; blob: string; id: string }>(attachmentRecord);
+    const attachmentPath = attachmentViewPath(attachmentRecord, attachmentData, "team-chat--123456789");
+    assert(path.basename(attachmentPath).startsWith("Meeting notes--attachment-1--"));
+    assert(path.basename(attachmentPath).endsWith(".txt"));
+    assert.deepEqual(fs.readFileSync(path.join(dir, attachmentPath)), bytes);
+    assert(fs.existsSync(path.join(archiveSystemDirectory(dir), "attachments", blob, "Meeting notes.txt")));
+    assert.deepEqual(fs.readdirSync(dir).sort(), ["README.md", "_system", "channels"], "technical files do not clutter the root");
+    assert.deepEqual(fs.readdirSync(path.join(dir, "channels")).sort(), ["team-chat--123456789", "team-chat--987654321"]);
+    assert(fs.existsSync(path.join(archiveSystemDirectory(dir), "responses", "request-1.bin")));
+    archive.close();
+    assert.equal(JSON.parse(fs.readFileSync(path.join(turn, "turn.json"), "utf8")).status, "incomplete");
+    archive = new ConversationArchive(dir, undefined, true);
+    archive.record("model.finished", scope, { content: "done", toolCalls: [] }, "2026-10-03T00:00:02.000Z");
+    archive.record("turn.finished", scope, {}, "2026-10-03T00:00:03.000Z");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(turn, "turn.json"), "utf8")).events.length, 5,
+      "a turn crossing midnight and restart keeps its original folder and complete events");
+    assert.deepEqual(fs.readdirSync(path.join(channel, "turns")), ["2026-10-02"]);
+    archive.record("discord.message", { channelId, messageId: "102" }, { channel: { name: "Renamed Chat" } }, "2026-10-03T00:00:04.000Z");
+    assert(fs.existsSync(channel), "channel renames update metadata without breaking stored file references");
+    const output = path.join(parent, "export");
+    exportArchive(archive, output, channelId);
+    const exported = fs.readFileSync(archiveJournalPath(output), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const exportedFile = exported.find(r => r.type === "attachment.saved").payload.file;
+    assert(exportedFile.startsWith("channels/renamed-chat--123456789/"));
+    assert.deepEqual(fs.readFileSync(path.join(output, exportedFile)), bytes, "export references match the readable channel folder");
+    assert.deepEqual(fs.readdirSync(output).sort(), ["README.md", "_system", "channels"]);
+    archive.close();
+    fs.unlinkSync(path.join(archiveSystemDirectory(dir), "layout.json"));
+    archive = new ConversationArchive(dir);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(turn, "turn.json"), "utf8")).status, "finished");
+    assert.deepEqual(fs.readFileSync(path.join(dir, attachmentPath)), bytes, "rebuilding preserves channel and attachment names");
+    assert.equal(archiveName("Meeting notes.txt"), "Meeting notes.txt");
+    assert.equal(archiveName("日本語 notes.txt"), "日本語 notes.txt");
+    assert.notEqual(archiveName("CON.txt"), "CON.txt", "Windows device names are encoded");
+    assert(!archiveChannelName("../../escape", "../Team / Chat").includes("/"));
+    assert(Buffer.byteLength(archiveChannelName("a".repeat(300), "漢".repeat(60))) < 255);
+    ok("archive layout: readable unique channel/file names, internal storage, dated turns across restart, rebuild and export");
+  } finally { archive.close(); fs.rmSync(parent, { recursive: true, force: true }); }
+}
+
 // ------------------------------------------------ readable archive upgrade --
 {
   const parent = fs.mkdtempSync(path.join(os.tmpdir(), "glove-readable-archive-"));
@@ -6914,11 +7049,11 @@ const ok = (name: string): void => {
   const evidence = fs.readFileSync(path.join(dir, "events.jsonl"));
   const archive = new ConversationArchive(dir);
   try {
-    assert.equal(fs.readFileSync(path.join(dir, "channels", "c", "context.json"), "utf8").includes("keep my original"), true);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "channels", "c", "turns", "turn.json"), "utf8")).status, "incomplete");
+    assert.equal(fs.readFileSync(path.join(dir, "channels", archiveChannelName("c"), "context.json"), "utf8").includes("keep my original"), true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "channels", archiveChannelName("c"), "turns", "2026-01-02", "03-04-05.000--reply--turn", "turn.json"), "utf8")).status, "incomplete");
     const upgraded = path.join(parent, "upgraded");
     assert.equal(migrateArchive(archive, upgraded).events, seq);
-    assert.deepEqual(fs.readFileSync(path.join(dir, "events.jsonl")), evidence, "migration preserves all original journal bytes");
+    assert.deepEqual(fs.readFileSync(archiveJournalPath(dir)), evidence, "migration preserves all original journal bytes");
     const migrated = new ConversationArchive(upgraded, undefined, true);
     try {
       assert.ok([...migrated.records()].every(r => r.version === 2 && r.payload !== undefined));
@@ -6928,11 +7063,11 @@ const ok = (name: string): void => {
       assert.deepEqual(migrated.restoreContexts().get("c"), archive.restoreContexts().get("c"));
       assert.deepEqual(migrated.attachment(attachment.url), bytes);
       assert.deepEqual(Buffer.concat([...migrated.records()].filter(r => r.type === "model.bytes").map(r => migrated.responseBytes(migrated.readData(r)))), Buffer.concat(response));
-      assert.equal(fs.readdirSync(path.join(upgraded, "responses")).length, 1, "one raw file holds every response fragment");
-      assert.equal(fs.readdirSync(path.join(upgraded, "blobs")).length, 0, "new JSON and attachment storage need no opaque blobs");
-      assert.ok(fs.existsSync(path.join(upgraded, "attachments", hash(bytes), "paper.pdf")));
+      assert.equal(fs.readdirSync(path.join(archiveSystemDirectory(upgraded), "responses")).length, 1, "one raw file holds every response fragment");
+      assert.equal(fs.existsSync(path.join(archiveSystemDirectory(upgraded), "blobs")), false, "new JSON and attachment storage need no opaque blobs");
+      assert.ok(fs.existsSync(path.join(archiveSystemDirectory(upgraded), "attachments", hash(bytes), "paper.pdf")));
       migrated.record("discord.message", { channelId: "c", messageId: "101" }, { content: "new inline payload" });
-      assert.equal(JSON.parse(fs.readFileSync(path.join(upgraded, "events.jsonl"), "utf8").trim().split("\n").at(-1)!).payload.content, "new inline payload");
+      assert.equal(JSON.parse(fs.readFileSync(archiveJournalPath(upgraded), "utf8").trim().split("\n").at(-1)!).payload.content, "new inline payload");
     } finally { migrated.close(); }
     assert.throws(() => migrateArchive(archive, upgraded), /already exists/);
     assert.throws(() => migrateArchive(archive, path.join(dir, "nested")), /separate/);
@@ -6947,7 +7082,7 @@ const ok = (name: string): void => {
 
     const exported = path.join(parent, "export");
     exportArchive(archive, exported, "c");
-    const rows = fs.readFileSync(path.join(exported, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const rows = fs.readFileSync(archiveJournalPath(exported), "utf8").trim().split("\n").map(line => JSON.parse(line));
     assert.ok(rows.every(r => r.scope.channelId === "c"));
     assert.equal(rows.find(r => r.type === "context.checkpoint").payload.entries[0].content, "keep my original");
     assert.deepEqual(fs.readFileSync(path.join(exported, rows.find(r => r.type === "attachment.saved").payload.file)), bytes);
@@ -7034,13 +7169,13 @@ const ok = (name: string): void => {
     const captured = [...archive.records()].filter(r => r.type === "model.bytes");
     const range = archive.readData<{ file: string; offset: number; size: number; sha256: string }>(captured[1]);
     assert.equal(range.offset, 5);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "channels", "c", "turns", "t.json"), "utf8")).status, "finished");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "channels", archiveChannelName("c"), "turns", archiveTurnFolder([...archive.records()].find(r => r.type === "turn.started")!), "turn.json"), "utf8")).status, "finished");
     archive.close();
     // A dirty layout or partial derived event file must be repaired from verified evidence.
-    fs.writeFileSync(path.join(dir, "layout.json"), "crashed");
-    fs.appendFileSync(path.join(dir, "channels", "c", "events", captured[0].time.slice(0, 10) + ".jsonl"), "torn-view");
+    fs.writeFileSync(path.join(archiveSystemDirectory(dir), "layout.json"), "crashed");
+    fs.appendFileSync(path.join(dir, "channels", archiveChannelName("c"), "events", captured[0].time.slice(0, 10) + ".jsonl"), "torn-view");
     archive = new ConversationArchive(dir);
-    assert.ok(!fs.readFileSync(path.join(dir, "channels", "c", "events", captured[0].time.slice(0, 10) + ".jsonl"), "utf8").includes("torn-view"));
+    assert.ok(!fs.readFileSync(path.join(dir, "channels", archiveChannelName("c"), "events", captured[0].time.slice(0, 10) + ".jsonl"), "utf8").includes("torn-view"));
     assert.equal([...archive.records()].length, 6, "rebuilding views adds no journal events");
     assert.throws(() => archive.responseBytes({ ...range, file: "../secret" }), /invalid/);
     const before = fs.readFileSync(path.join(dir, range.file));

@@ -1,4 +1,5 @@
 import type { Message, OmitPartialGroupDMChannel } from "discord.js";
+import { attachmentIdentity } from "../llm/client.js";
 
 /**
  * A message as delivered by the Discord events the gate listens to
@@ -25,6 +26,8 @@ export interface GateOptions {
 }
 
 interface GateEntry {
+  /** Snapshot independently of Discord's mutable cached Message object. */
+  observation: string;
   /** The latest version of the message (edits replace it, so it is final when the timer fires). */
   message: GateMessage;
   channelId: string;
@@ -71,7 +74,7 @@ export class MessageGate {
   arrive(message: GateMessage): void {
     const prev = this.pending.get(message.id);
     if (prev) this.cancel(prev.timer);
-    const entry: GateEntry = { message, channelId: message.channel?.id ?? "", timer: undefined, ready: false, held: false };
+    const entry: GateEntry = { message, observation: messageObservation(message), channelId: message.channel?.id ?? "", timer: undefined, ready: false, held: false };
     entry.timer = this.schedule(() => {
       // Only the entry that is still stored for this id commits: an edit
       // replaced it (this timer was cancelled) or a delete/channel-delete
@@ -100,6 +103,14 @@ export class MessageGate {
   /** True while the message is in its stability window (edits refresh the gate, not the context). */
   isPending(messageId: string): boolean {
     return this.pending.has(messageId);
+  }
+
+  /** Reconcile pending REST data, restarting stability only for a changed or incomplete observation. */
+  observe(message: GateMessage): void {
+    const entry = this.pending.get(message.id);
+    if (!entry) return;
+    if (entry.held || entry.observation !== messageObservation(message)) this.arrive(message);
+    else entry.message = message; // retain fresh CDN URLs and reaction metadata
   }
 
   /** Pause a pending commit until an incomplete Discord update has been fetched. */
@@ -144,4 +155,11 @@ export class MessageGate {
     for (const entry of this.pending.values()) this.cancel(entry.timer);
     this.pending.clear();
   }
+}
+
+function messageObservation(message: GateMessage): string {
+  return JSON.stringify([message.content, message.editedTimestamp,
+    [...(message.attachments?.values() ?? [])].map((attachment) => [
+      attachment.id, attachmentIdentity(attachment.url), attachment.name, attachment.size, attachment.contentType,
+    ])]);
 }

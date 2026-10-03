@@ -5,6 +5,7 @@ import type { SerializedChannelContext, ContextEntry } from "./context.js";
 import { attachmentIdentity } from "./client.js";
 import { ArchiveLayout, archiveName } from "./archive-layout.js";
 import { ArchiveLines } from "./archive-lines.js";
+import { archiveSystemDirectory } from "./archive-paths.js";
 
 /** Identifiers shared by related journal records; never endpoint credentials. */
 export interface ArchiveScope {
@@ -54,6 +55,7 @@ function syncDirectory(dir: string): void {
  * No recovery operation invokes a model, tool, or Discord send.
  */
 export class ConversationArchive {
+  private readonly systemDirectory: string;
   private fd = -1;
   private seq = 0;
   private previous = "";
@@ -77,11 +79,13 @@ export class ConversationArchive {
 
   constructor(readonly directory: string, private readonly onFailure?: (error: Error) => void, private readonly fastRecovery = false) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(path.join(directory, "blobs"), { recursive: true, mode: 0o700 });
+    this.systemDirectory = archiveSystemDirectory(directory);
+    fs.mkdirSync(this.systemDirectory, { recursive: true, mode: 0o700 });
     this.claim();
     try {
-      const journal = path.join(directory, "events.jsonl");
+      const journal = path.join(this.systemDirectory, "events.jsonl");
       this.fd = fs.openSync(journal, "a+", 0o600);
+      syncDirectory(this.systemDirectory);
       syncDirectory(directory);
       syncDirectory(path.dirname(path.resolve(directory)));
       const offset = this.fastRecovery ? this.loadIndex() : 0;
@@ -102,9 +106,9 @@ export class ConversationArchive {
   private claim(): void {
     // Serialize stale-owner checks too: two simultaneous restarts must not
     // both unlink a dead owner's lock and accidentally admit two writers.
-    const claim = path.join(this.directory, ".claim");
+    const claim = path.join(this.systemDirectory, ".claim");
     const fd = fs.openSync(claim, "wx", 0o600);
-    const lock = path.join(this.directory, ".lock");
+    const lock = path.join(this.systemDirectory, ".lock");
     try {
       if (fs.existsSync(lock)) {
         const owner = fs.readFileSync(lock, "utf8");
@@ -141,7 +145,7 @@ export class ConversationArchive {
     this.check();
     try {
       const hash = digest(bytes);
-      const folder = path.join(this.directory, json ? "json" : "blobs");
+      const folder = path.join(this.systemDirectory, json ? "checkpoints" : "blobs");
       fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
       const file = path.join(folder, json ? `${hash}.json` : hash);
       if (fs.existsSync(file)) {
@@ -156,6 +160,7 @@ export class ConversationArchive {
       } finally { fs.closeSync(fd); }
       fs.renameSync(temp, file);
       syncDirectory(path.dirname(file));
+      syncDirectory(this.systemDirectory);
       syncDirectory(this.directory);
       return hash;
     } catch (err) { return this.fail(err); }
@@ -164,10 +169,11 @@ export class ConversationArchive {
   /** Locate content by checksum across legacy blobs, JSON files and named attachments. */
   blobFile(hash: string): string {
     if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error("invalid archive blob hash");
-    const legacy = path.join(this.directory, "blobs", hash);
-    const json = path.join(this.directory, "json", `${hash}.json`);
-    const attachment = path.join(this.directory, "attachments", hash);
-    return fs.existsSync(legacy) ? legacy : fs.existsSync(json) ? json :
+    const legacy = path.join(this.systemDirectory, "blobs", hash);
+    const json = path.join(this.systemDirectory, "checkpoints", `${hash}.json`);
+    const attachment = path.join(this.systemDirectory, "attachments", hash);
+    const oldJson = path.join(this.systemDirectory, "json", `${hash}.json`);
+    return fs.existsSync(legacy) ? legacy : fs.existsSync(json) ? json : fs.existsSync(oldJson) ? oldJson :
       path.join(attachment, fs.readdirSync(attachment).filter(name => !/\.[a-f0-9-]{36}\.tmp$/.test(name)).sort()[0]);
   }
 
@@ -183,7 +189,7 @@ export class ConversationArchive {
     this.check();
     try {
       const hash = digest(bytes);
-      const folder = path.join(this.directory, "attachments", hash);
+      const folder = path.join(this.systemDirectory, "attachments", hash);
       fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
       const file = path.join(folder, archiveName(name));
       if (fs.existsSync(file)) {
@@ -203,6 +209,7 @@ export class ConversationArchive {
         fs.renameSync(temporary, file);
         syncDirectory(folder);
         syncDirectory(path.dirname(folder));
+        syncDirectory(this.systemDirectory);
         syncDirectory(this.directory);
       }
       return hash;
@@ -327,7 +334,7 @@ export class ConversationArchive {
 
   private loadIndex(): number {
     try {
-      const file = path.join(this.directory, "recovery-index.json");
+      const file = path.join(this.systemDirectory, "recovery-index.json");
       if (fs.statSync(file).size > RECOVERY_INDEX_MAX_BYTES) return 0;
       const bytes = fs.readFileSync(file, "utf8");
       // A hash line followed by JSON avoids an escaped second copy of the state.
@@ -360,7 +367,7 @@ export class ConversationArchive {
   }
 
   private saveIndex(): void {
-    const file = path.join(this.directory, "recovery-index.json");
+    const file = path.join(this.systemDirectory, "recovery-index.json");
     const temp = `${file}.${randomUUID()}.tmp`;
     try {
       const offset = fs.fstatSync(this.fd).size;
@@ -370,7 +377,7 @@ export class ConversationArchive {
       try { fs.writeFileSync(fd, digest(body) + "\n"); fs.writeFileSync(fd, body); fs.fsyncSync(fd); }
       finally { fs.closeSync(fd); }
       fs.renameSync(temp, file);
-      syncDirectory(this.directory);
+      syncDirectory(this.systemDirectory);
     } catch {
       // Cache failure cannot compromise already-fsynced journal records.
       try { fs.unlinkSync(temp); } catch { /* no temporary file */ }
@@ -404,10 +411,13 @@ export class ConversationArchive {
     }
     const pending = lines.tail();
     if (pending.length === 0) return null;
-    const tail = path.join(this.directory, `torn-tail-${randomUUID()}.bin`);
+    const quarantine = path.join(this.systemDirectory, "quarantine");
+    fs.mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+    const tail = path.join(quarantine, `torn-tail-${randomUUID()}.bin`);
     const fd = fs.openSync(tail, "wx", 0o600);
     try { fs.writeFileSync(fd, pending); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    syncDirectory(this.directory);
+    syncDirectory(quarantine);
+    syncDirectory(this.systemDirectory);
     fs.ftruncateSync(this.fd, committedBytes);
     fs.fsyncSync(this.fd);
     return tail;
@@ -489,9 +499,10 @@ export class ConversationArchive {
     this.check();
     try {
       if (!scope.requestId) throw new Error("response capture requires a request id");
-      const folder = path.join(this.directory, "responses");
+      const folder = path.join(this.systemDirectory, "responses");
       fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
-      const file = `responses/${digest(scope.requestId)}.bin`;
+      const name = /^[a-zA-Z0-9_-]{1,120}$/.test(scope.requestId) ? scope.requestId : digest(scope.requestId);
+      const file = path.relative(this.directory, path.join(folder, `${name}.bin`)).split(path.sep).join("/");
       const fd = fs.openSync(path.join(this.directory, file), "a+", 0o600);
       let offset: number;
       try {
@@ -499,7 +510,7 @@ export class ConversationArchive {
         fs.writeFileSync(fd, bytes);
         fs.fsyncSync(fd);
       } finally { fs.closeSync(fd); }
-      if (offset === 0) { syncDirectory(folder); syncDirectory(this.directory); }
+      if (offset === 0) { syncDirectory(folder); syncDirectory(this.systemDirectory); syncDirectory(this.directory); }
       this.record("model.bytes", scope, { file, offset, size: bytes.byteLength, sha256: digest(bytes) }, time);
     } catch (err) { this.fail(err); }
   }
@@ -508,7 +519,7 @@ export class ConversationArchive {
   responseBytes(value: unknown): Buffer {
     const data = value as { blob?: string; file?: string; offset?: number; size?: number; sha256?: string };
     if (data.blob) return this.readBlob(data.blob);
-    if (!data.file || !/^responses\/[a-f0-9]{64}\.bin$/.test(data.file) ||
+    if (!data.file || !/^(?:_system\/)?responses\/[a-zA-Z0-9_-][a-zA-Z0-9_.-]*\.bin$/.test(data.file) ||
       !Number.isSafeInteger(data.offset) || data.offset! < 0 || !Number.isSafeInteger(data.size) || data.size! < 0) {
       throw new Error("invalid archive response range");
     }
@@ -534,7 +545,7 @@ export class ConversationArchive {
   /** Close the writer and release this process's lock. All writes already fsynced. */
   close(): void {
     let layoutError: unknown;
-    const lock = path.join(this.directory, ".lock");
+    const lock = path.join(this.systemDirectory, ".lock");
     const ownsDirectory = fs.existsSync(lock) && fs.readFileSync(lock, "utf8") === this.owner;
     if (this.fd >= 0 && this.recovered && !this.failure && ownsDirectory) {
       try { this.layout?.finish(this); } catch (err) { layoutError = err; }
