@@ -121,20 +121,22 @@ export class ArchiveLayout {
   }
 
   /** Materialize events, current context, completed turns and original-format attachments. */
-  append(archive: ConversationArchive, record: ArchiveRecord, rebuilding = false): void {
+  append(archive: ConversationArchive, record: ArchiveRecord, rebuilding = false, capturedPayload?: unknown): void {
     const channelId = record.scope.channelId;
     if (!channelId) return;
-    const data = archive.readData<any>(record, !rebuilding);
+    // Live records already have a serialized snapshot; disk/rebuild reads still verify it.
+    const data = capturedPayload === undefined ? archive.readData<any>(record, !rebuilding) : capturedPayload as any;
     const channel = this.channelDirectory(channelId, record.type === "discord.message" ? data.channel?.name : undefined);
     fs.mkdirSync(channel, { recursive: true, mode: 0o700 });
     const attachmentPath = record.type === "attachment.saved" ? attachmentViewPath(record, data, this.channelFolders.get(channelId)) : undefined;
     const event = { seq: record.seq, time: record.time, type: record.type, scope: record.scope,
       payload: record.type === "context.checkpoint" ? (record.payload ?? data) :
         record.type === "attachment.saved" ? { ...data, file: attachmentPath } : data };
+    const encodedEvent = JSON.stringify(event) + "\n";
     const events = path.join(channel, "events");
     fs.mkdirSync(events, { recursive: true, mode: 0o700 });
     const day = /^\d{4}-\d{2}-\d{2}/.exec(record.time)?.[0] ?? "undated";
-    fs.appendFileSync(path.join(events, `${day}.jsonl`), JSON.stringify(event) + "\n", { mode: 0o600 });
+    fs.appendFileSync(path.join(events, `${day}.jsonl`), encodedEvent, { mode: 0o600 });
     const metadata = path.join(channel, "channel.json");
     if (!fs.existsSync(metadata)) writeJson(metadata, { id: channelId });
     if (record.type === "discord.message" && data.channel) {
@@ -168,7 +170,7 @@ export class ArchiveLayout {
       this.pendingTurns.set(key, turn);
       const base = path.join(channel, "turns", turn.folder);
       fs.mkdirSync(base, { recursive: true, mode: 0o700 });
-      fs.appendFileSync(path.join(base, "events.jsonl"), JSON.stringify(event) + "\n", { mode: 0o600 });
+      fs.appendFileSync(path.join(base, "events.jsonl"), encodedEvent, { mode: 0o600 });
       if (record.type === "turn.finished" || record.type === "turn.recovered") {
         this.snapshotTurn(base, turnId, channelId, record.type === "turn.recovered" ? "recovered" : "finished");
         this.pendingTurns.delete(key);

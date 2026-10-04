@@ -12,11 +12,11 @@ of the compactable working context.
   observations, and deletions. Original content is retained before mention
   replacement. Own-message gateway observations include posted UI messages.
 - Every model call: reply rounds, chime decisions/repairs, and compaction. The
-  archive stores the input messages/options, exact JSON request body, response
-  status, received response body bytes, normalized result, and any failure.
-  This includes endpoint-provided reasoning, tool-call fragments, unfinished
-  streams, and unexecuted calls at the tool-round limit. Authorization headers
-  are excluded.
+  archive stores the structured request once, response status, parsed result,
+  and any failure. During streaming, `model.progress` batches retain text,
+  reasoning and indexed tool-call fragments. Completed results include reasoning
+  and unexecuted calls at the tool-round limit. HTTP/SSE framing, malformed or
+  incomplete wire frames, and authorization headers are not retained in new captures.
 - Tool execution intent before any handler starts, then each result as soon as
   that handler finishes. Concurrent tools have distinct execution IDs even if
   the endpoint repeats its own call IDs. Results preserve their original call
@@ -61,7 +61,7 @@ archive/
     events.jsonl                # authoritative events, with inline JSON
     checkpoints/<sha256>.json   # shared checkpoint entries and manifests
     attachments/<sha256>/Meeting notes.pdf # immutable original attachment bytes
-    responses/<request-id>.bin  # exact received HTTP body, including SSE
+    responses/<request-id>.bin  # legacy raw captures, when present
     recovery-index.json
     layout.json
     quarantine/torn-tail-<id>.bin # incomplete journal tails, when present
@@ -83,13 +83,27 @@ Native attachment views use hard links where supported, with copy fallback;
 exports always copy bytes so they are independent backups. Treat archive files as
 immutable, including hard-linked attachment views.
 
-Each request appends its response chunks to one file. Journal events identify
-the byte offset, length and SHA-256 of each committed range. This avoids a separate
-binary blob and JSON payload file for every network chunk, while retaining exact
-bytes from unfinished streams. Uncommitted trailing bytes are ignored. JSONL
-readers frame large inline requests without repeatedly copying the growing line.
-Checkpoint manifests reference shared `.json` entries, so repeated checkpoints
-do not duplicate every old entry in the journal.
+New model captures retain parsed output instead of exact HTTP response bytes.
+Text, reasoning and indexed tool-call fragments are batched for up to one second
+or 16 Ki characters, whichever comes first. Each committed batch is journaled
+and synced normally. Failures/interruption flush the pending batch before the
+failure record; successful completion writes the full parsed result instead of
+duplicating the pending batch. This removes per-network-chunk file writes,
+checksums, journal fsyncs and duplicated transport metadata. The request body is
+stored once rather than also copying the conversation into `model.started`.
+
+A sudden process crash can lose the unflushed partial-output batch (up to one
+second). Completed model results, tool intents/results and context checkpoints
+remain immediately durable. Wire-level debugging, including malformed or
+incomplete frames, is unavailable for new captures. Attachment bytes still
+retain their original formats for reuse after CDN URLs expire.
+
+Existing `model.bytes` records and response files remain readable and verifiable;
+no existing evidence is removed or rewritten. Legacy ranges carry byte offsets,
+lengths and SHA-256 checksums. JSONL readers frame large inline requests without
+repeatedly copying the growing line. Checkpoint manifests reference shared
+`.json` entries, so repeated checkpoints do not duplicate every old entry in
+the journal.
 
 Content files and directory entries are synced before the corresponding journal
 record is appended and synced. An archive write failure stops the bot instead of
@@ -183,7 +197,8 @@ node --import tsx src/archive-cli.ts export ./data/archive --channel=DISCORD_CHA
 
 Omit `--channel` to export all events. Without `--output`, the command retains its
 JSONL stdout behavior; decoded checkpoint manifests expand to complete entries.
-This stream alone does not include attachment or response bytes. Version 1
+New parsed progress/results are included directly. This stream alone does not
+include attachment or legacy response bytes. Version 1
 `model.bytes` payloads refer to `blobs/<hash>`; version 2 payloads identify a range
 in `_system/responses/<request-id>.bin`. Concatenate the committed ranges in event order
 to reconstruct the received HTTP body.

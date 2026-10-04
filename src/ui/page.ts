@@ -57,14 +57,9 @@ h2{font-size:24px;letter-spacing:-.7px;margin:0}
 .toolbar .spacer{flex:1}
 .toolbar button:hover,.secondary:hover{color:var(--text);border-color:#60758e}
 .body{padding:18px;max-height:70vh;overflow:auto;scrollbar-color:#334457 transparent}
-pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.85 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:2;color:#c1d0e2}
-.key{color:#92b9fa}
-.str{color:#a0ddc5}
-.num{color:#e9bd8b}
-.bool{color:#c1a0ec}
 .message{border:1px solid var(--border);border-radius:8px;margin-bottom:12px;overflow:hidden}
 .message summary{cursor:pointer;padding:10px 12px;background:#152131;font-size:12px}
-.message pre{padding:13px}
+.message .prose,.message .section-label{margin:12px}
 .role{color:var(--mint);text-transform:uppercase;font-size:10px;letter-spacing:1px;margin-right:9px}
 .prose{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;color:#d9e6f5;margin-bottom:16px}
 .section-label{color:var(--muted);font-size:10px;letter-spacing:1.4px;text-transform:uppercase;margin:8px 0 10px}
@@ -90,24 +85,49 @@ main{padding:20px}
 <header><div class="logo" aria-hidden="true">↗</div><div><h1>Glove <span class="brand-suffix">/ API Inspector</span></h1><div class="subtitle">A window into your model conversations</div></div><div class="live"><span class="dot"></span><span id="connection" role="status">Connecting</span></div></header>
 <div class="shell"><aside><div class="aside-head"><span class="eyebrow">Request timeline</span><span class="eyebrow" id="count"></span></div><input id="search" aria-label="Filter requests" placeholder="Search channel, purpose, status…"><div id="list"></div><button id="more" class="secondary" hidden>Load earlier requests</button></aside>
 <main><div class="toolbar controls"><label><input id="live" type="checkbox" checked>Live updates</label><label><input id="follow" type="checkbox" checked>Follow newest request</label><button id="refresh" type="button">Refresh now</button><span class="subtitle">Live captures update every 0.5s; pause to inspect.</span></div><div id="error" class="error" role="alert" hidden></div><div id="empty" class="empty"><div class="empty-icon">⌘</div><b>Every exchange, in view.</b>Select a request to explore its input and output.<br>Live mode follows new requests automatically.</div><div id="detail" hidden><div class="eyebrow">Chat Completions · request detail</div><div class="detail-head"><h2 id="title"></h2><span id="state" class="badge"></span></div><div id="meta" class="meta"></div><div class="panels">
-<section class="panel"><div class="panel-head"><span class="number">01</span><b>Request → API</b><span class="size" id="input-size"></span></div><div class="toolbar" id="input-toolbar"><button data-view="json" class="active">JSON</button><button data-view="messages">Prompt</button><button data-view="raw">Raw</button><span class="spacer"></span><button data-action="copy">Copy</button><button data-action="download">↓ Save</button></div><div id="input" class="body"></div></section>
-<section class="panel output"><div class="panel-head"><span class="number">02</span><b>Response ← API</b><span class="size" id="output-size"></span></div><div class="toolbar" id="output-toolbar"><button data-view="raw" class="active">Raw bytes / SSE</button><button data-view="json">JSON</button><button data-view="readable">Output</button><span class="spacer"></span><button data-action="copy">Copy</button><button data-action="download">↓ Save</button></div><div id="output" class="body"></div></section>
+<section class="panel"><div class="panel-head"><span class="number">01</span><b>Conversation sent</b><span class="size" id="input-size"></span></div><div class="toolbar" id="input-toolbar"><span class="spacer"></span><button data-action="copy">Copy text</button><button data-action="download">↓ Save text</button></div><div id="input" class="body"></div></section>
+<section class="panel output"><div class="panel-head"><span class="number">02</span><b>Assistant output</b><span class="size" id="output-size"></span></div><div class="toolbar" id="output-toolbar"><span class="spacer"></span><button data-action="copy">Copy text</button><button data-action="download">↓ Save text</button></div><div id="output" class="body"></div></section>
 </div><div class="foot"><span>Read-only archive · live updates optional · authorization headers excluded</span><span id="request-id"></span></div></div></main></div>
 <script nonce="${nonce}">
 const $ = id => document.getElementById(id);
-let items = [], selected = null, detail = null, next = null, inputView = 'json', outputView = 'raw', generation = 0, busy = false, searchTimer, filterRevision = 0;
+let items = [], selected = null, detail = null, next = null, generation = 0, busy = false, searchTimer, filterRevision = 0;
 function node(tag, text, cls) { const e = document.createElement(tag); if (text !== undefined)
     e.textContent = text; if (cls)
     e.className = cls; return e; }
-function json(value) { return JSON.stringify(value, null, 2); }
-function code(value, highlight = true) { const p = node('pre'); const text = typeof value === 'string' ? value : json(value); if (!highlight) {
-    p.textContent = text;
-    return p;
-} const regex = /("(?:\\.|[^"\\])*"\s*:)|("(?:\\.|[^"\\])*")|\b(true|false|null)\b|(-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)/g; let last = 0; for (const m of text.matchAll(regex)) {
-    p.append(document.createTextNode(text.slice(last, m.index)));
-    p.append(node('span', m[0], m[1] ? 'key' : m[2] ? 'str' : m[3] ? 'bool' : 'num'));
-    last = m.index + m[0].length;
-} p.append(document.createTextNode(text.slice(last))); return p; }
+function prose(value) { return node('div', String(value ?? ''), 'prose'); }
+function readableValue(value) {
+    const root = node('div');
+    if (Array.isArray(value)) for (const item of value) root.append(readableValue(item));
+    else if (value && typeof value === 'object') for (const [key, item] of Object.entries(value)) {
+        root.append(node('div', key.replace(/_/g, ' '), 'section-label'), readableValue(item));
+    }
+    else root.append(prose(value));
+    return root;
+}
+function toolCalls(calls) {
+    const root = node('div');
+    for (const call of calls) {
+        const card = node('details', undefined, 'message');
+        card.open = true;
+        const fn = call.function || call;
+        card.append(node('summary', fn.name || 'Tool call'));
+        const args = fn.arguments;
+        try { card.append(readableValue(typeof args === 'string' ? JSON.parse(args) : args)); }
+        catch { card.append(prose(args)); }
+        root.append(card);
+    }
+    return root;
+}
+function messageContent(content) {
+    const root = node('div');
+    if (typeof content === 'string') root.append(prose(content));
+    else if (Array.isArray(content)) for (const part of content) {
+        if (part.type === 'text') root.append(prose(part.text));
+        else if (part.type === 'image_url') root.append(prose('Image attached'));
+        else root.append(prose('Attachment: ' + (part.type || 'unknown type')));
+    }
+    return root;
+}
 async function api(url) { const res = await fetch(url); if (!res.ok)
     throw Error('Could not read archive (' + res.status + '). See the UI terminal for details.'); return res.json(); }
 function showError(e) { $('error').textContent = e.message; $('error').hidden = false; $('connection').textContent = 'Connection paused'; }
@@ -121,7 +141,7 @@ function timeline() { const root = $('list'); root.replaceChildren(); $('count')
     root.append(b);
 } }
 async function select(id) { selected = id; detail = null; const token = ++generation; timeline(); $('empty').hidden = false; $('empty').replaceChildren(node('b', 'Loading interaction…')); $('detail').hidden = true; try {
-    const d = await api('/api/requests/' + encodeURIComponent(id));
+    const d = await api('/api/requests/' + encodeURIComponent(id) + '?view=readable');
     if (token !== generation)
         return;
     detail = d;
@@ -136,7 +156,7 @@ function chip(label, value) { const c = node('div', label, 'chip'); c.append(nod
 function render() { if (!detail)
     return; $('empty').hidden = true; $('detail').hidden = false; $('title').textContent = (detail.scope.purpose || 'reply').replace(/-/g, ' ') + ' interaction'; $('state').textContent = detail.state; $('state').className = 'badge ' + detail.state; const meta = $('meta'); meta.replaceChildren(chip('Channel', detail.scope.channelId || '—'), chip('Time', new Date(detail.time).toLocaleString()), chip('HTTP', event('model.status')?.status || '—'), chip('Model', event('model.request')?.model || '—')); if (detail.scope.round !== undefined)
     meta.append(chip('Round', detail.scope.round)); if (event('model.finished')?.usage)
-    meta.append(chip('Usage', json(event('model.finished').usage))); $('request-id').textContent = detail.id; $('input-size').textContent = detail.requestBytes.toLocaleString() + ' bytes'; $('output-size').textContent = detail.responseBytes.toLocaleString() + ' bytes'; renderInput(); renderOutput(); }
+    meta.append(chip('Tokens', (event('model.finished').usage.input ?? '—') + ' input · ' + (event('model.finished').usage.output ?? '—') + ' output')); $('request-id').textContent = detail.id; $('input-size').textContent = (event('model.request')?.messages?.length || 0) + ' messages'; $('output-size').textContent = detail.state === 'pending' ? 'Generating…' : 'Captured'; renderInput(); renderOutput(); }
 function preservePanel(id, draw) {
     const root = $(id), top = root.scrollTop;
     const atEnd = root.scrollHeight - root.clientHeight - top < 24;
@@ -150,50 +170,29 @@ function renderOutput() { preservePanel('output', drawOutput); }
 function drawInput() { const root = $('input'); root.replaceChildren(); const request = event('model.request'); if (!request) {
     root.append(node('div', 'The request body was not sent or captured.', 'subtitle'));
     return;
-} if (inputView === 'raw')
-    root.append(code(detail.rawRequest, false));
-else if (inputView === 'json')
-    root.append(code(request));
-else {
-    const settings = { ...request };
-    delete settings.messages;
-    const settingsPanel = node('details', undefined, 'message');
-    settingsPanel.append(node('summary', 'Request settings & tool schemas'), code(settings));
-    root.append(settingsPanel);
+}
     root.append(node('div', 'Conversation · ' + (request.messages || []).length + ' messages', 'section-label'));
     for (const [i, m] of (request.messages || []).entries()) {
-        const d = node('details', undefined, 'message');
-        d.open = true;
+        const card = node('details', undefined, 'message');
+        card.open = true;
         const summary = node('summary');
-        summary.append(node('span', m.role, 'role'), document.createTextNode('Message ' + (i + 1) + (m.name ? ' · ' + m.name : '')));
-        d.append(summary, typeof m.content === 'string' ? code(m.content, false) : code(m.content));
-        const extra = { ...m };
-        delete extra.role;
-        delete extra.content;
-        if (Object.keys(extra).length)
-            d.append(code(extra));
-        root.append(d);
+        const role = { system: 'Instructions', user: 'User', assistant: 'Assistant', tool: 'Tool result' }[m.role] || m.role;
+        summary.append(node('span', role, 'role'), document.createTextNode('Message ' + (i + 1) + (m.name ? ' · ' + m.name : '')));
+        card.append(summary, messageContent(m.content));
+        if (m.reasoning_content) card.append(node('div', 'Reasoning', 'section-label'), prose(m.reasoning_content));
+        if (m.tool_calls?.length) card.append(toolCalls(m.tool_calls));
+        root.append(card);
     }
-} }
+    if (request.tools?.length) {
+        const tools = node('details', undefined, 'message');
+        tools.append(node('summary', 'Available tools'));
+        for (const tool of request.tools) tools.append(node('div', tool.function?.name || 'Tool', 'section-label'), prose(tool.function?.description || ''));
+        root.append(tools);
+    }
+}
+
 function drawOutput() { const root = $('output'); root.replaceChildren(); const result = event('model.finished'), failed = event('model.failed'); if (failed)
-    root.append(node('div', failed.error, 'error')); if (outputView === 'raw') {
-    root.append(code(detail.rawResponse || 'No response bytes captured yet.', false));
-    return;
-} if (outputView === 'json') {
-    try {
-        root.append(code(JSON.parse(detail.rawResponse)));
-    }
-    catch {
-        const frames = detail.rawResponse.split(/\r?\n/).filter(l => l.startsWith('data:')).map(l => { const raw = l.slice(5).trim(); try {
-            return JSON.parse(raw);
-        }
-        catch {
-            return raw;
-        } });
-        root.append(code(frames.length ? frames : result || { state: detail.state }));
-    }
-    return;
-} let content = result?.content || '', reasoning = result?.reasoning || '', calls = result?.toolCalls || []; if (!result) {
+    root.append(node('div', failed.error, 'error')); let content = result?.content || '', reasoning = result?.reasoning || '', calls = result?.toolCalls || []; if (!result) {
     const partialCalls = new Map();
     function consume(message, delta) {
         content += message?.content || '';
@@ -210,61 +209,59 @@ function drawOutput() { const root = $('output'); root.replaceChildren(); const 
             partialCalls.set(index, previous);
         }
     }
-    try { consume(JSON.parse(detail.rawResponse).choices?.[0]?.message, false); }
-    catch {
-        for (const line of detail.rawResponse.split(/\r?\n/)) {
-            if (!line.startsWith('data:')) continue;
-            try { consume(JSON.parse(line.slice(5)).choices?.[0]?.delta, true); }
-            catch { } // Incomplete frames remain visible in the raw view.
+    const progress = detail.events.filter(e => e.type === 'model.progress');
+    if (progress.length) {
+        for (const { data } of progress) {
+            content += data.content || '';
+            reasoning += data.reasoning || '';
+            for (const call of data.toolCalls || []) {
+                const previous = partialCalls.get(call.index) || { id: '', name: '', arguments: '' };
+                if (call.id) previous.id = call.id;
+                previous.name += call.name || '';
+                previous.arguments += call.arguments || '';
+                partialCalls.set(call.index, previous);
+            }
+        }
+    } else {
+        try { consume(JSON.parse(detail.rawResponse).choices?.[0]?.message, false); }
+        catch {
+            for (const line of detail.rawResponse.split(/\r?\n/)) {
+                if (!line.startsWith('data:')) continue;
+                try { consume(JSON.parse(line.slice(5)).choices?.[0]?.delta, true); }
+                catch { } // Wait for a complete frame before rendering.
+            }
         }
     }
     calls = Array.from(partialCalls.values());
 } if (reasoning) {
     const d = node('details', undefined, 'message');
     d.open = true;
-    d.append(node('summary', 'Reasoning'), code(reasoning, false));
+    d.append(node('summary', 'Reasoning'), prose(reasoning));
     root.append(d);
 } if (content)
     root.append(node('div', 'Assistant response', 'section-label'), node('div', content, 'prose')); if (calls.length)
-    root.append(node('div', 'Tool calls', 'section-label'), code(calls)); if (!content && !reasoning && !calls.length)
-    root.append(node('div', detail.state === 'pending' ? 'Prompt sent · waiting for the API to generate output…' : 'No assistant text. Inspect JSON or raw bytes for the complete exchange.', 'subtitle')); if (result) {
-    const extra = { ...result };
-    delete extra.content;
-    delete extra.reasoning;
-    delete extra.toolCalls;
-    if (Object.keys(extra).length)
-        root.append(node('div', 'Completion metadata', 'section-label'), code(extra));
-} }
+    root.append(node('div', 'Tool calls', 'section-label'), toolCalls(calls)); if (!content && !reasoning && !calls.length)
+    root.append(node('div', detail.state === 'pending' ? 'Prompt sent · waiting for the API to generate output…' : 'No assistant text was returned.', 'subtitle')); }
 for (const side of ['input', 'output']) {
-    $(side + '-toolbar').onclick = async (e) => { const b = e.target.closest('button'); if (!b || !detail)
-        return; if (b.dataset.view) {
-        if (side === 'input')
-            inputView = b.dataset.view;
-        else
-            outputView = b.dataset.view;
-        for (const t of $(side + '-toolbar').querySelectorAll('[data-view]'))
-            t.classList.toggle('active', t === b);
-        side === 'input' ? renderInput() : renderOutput();
-        return;
-    } const text = side === 'input' ? detail.rawRequest : detail.rawResponse; if (b.dataset.action === 'copy') {
-        try {
-            await navigator.clipboard.writeText(text);
-            b.textContent = 'Copied';
-            setTimeout(() => b.textContent = 'Copy', 1200);
+    $(side + '-toolbar').onclick = async (e) => {
+        const b = e.target.closest('button');
+        if (!b || !detail) return;
+        const text = $(side).innerText;
+        if (b.dataset.action === 'copy') {
+            try {
+                await navigator.clipboard.writeText(text);
+                b.textContent = 'Copied';
+                setTimeout(() => b.textContent = 'Copy text', 1200);
+            } catch { showError(Error('Clipboard unavailable. Use Save text instead.')); }
+        } else {
+            const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }));
+            const a = node('a');
+            a.href = url;
+            a.download = detail.id + '-' + side + '.txt';
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
         }
-        catch {
-            showError(Error('Clipboard unavailable. Use Save to download the captured body.'));
-        }
-    }
-    else {
-        const bytes = side === 'input' ? text : Uint8Array.from(atob(detail.responseBase64), c => c.charCodeAt(0));
-        const url = URL.createObjectURL(new Blob([bytes], { type: side === 'input' ? 'application/json' : 'application/octet-stream' }));
-        const a = node('a');
-        a.href = url;
-        a.download = detail.id + '-' + side + (side === 'input' ? '.json' : '.txt');
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } };
+    };
 }
 async function refresh(append = false, automatic = false) { if (busy)
     return; busy = true; let token = generation; const revision = filterRevision, query = $('search').value; try {
@@ -288,8 +285,8 @@ async function refresh(append = false, automatic = false) { if (busy)
     }
     if (selected && token === generation) {
         const current = items.find(i => i.id === selected);
-        if (!detail || detail.state === 'pending' || current?.updated !== detail.updated) {
-            const d = await api('/api/requests/' + encodeURIComponent(selected));
+        if (!detail || (current && current.updated !== detail.updated)) {
+            const d = await api('/api/requests/' + encodeURIComponent(selected) + '?view=readable');
             if (token === generation && revision === filterRevision) {
                 detail = d;
                 render();

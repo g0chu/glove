@@ -93,6 +93,82 @@ const ok = (name: string): void => {
 };
 
 {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-interleaved-"));
+  const archive = new ConversationArchive(dir);
+  try {
+    // More simultaneous captures than the descriptor limit exercise eviction/reopening.
+    for (let i = 0; i < 40; i++) {
+      const scope = { requestId: `r${i}` };
+      archive.record("model.started", scope, {});
+      archive.appendResponse(scope, Buffer.from(`first${i}`));
+    }
+    for (let i = 0; i < 40; i++) {
+      const scope = { requestId: `r${i}` };
+      archive.appendResponse(scope, Buffer.from("🌎last"));
+      archive.record(i % 2 ? "model.failed" : "model.finished", scope, {});
+    }
+    const reader = new InteractionReader(dir);
+    await reader.refresh();
+    assert.equal(reader.list("", Number.MAX_SAFE_INTEGER).items[0].id, "r39");
+    assert.equal(reader.list("failed", Number.MAX_SAFE_INTEGER).items.length, 20);
+    for (let i = 0; i < 40; i++) {
+      const detail = await reader.detail(`r${i}`) as { rawResponse: string; responseBase64: string };
+      assert.equal(detail.rawResponse, `first${i}🌎last`);
+      assert.deepEqual(Buffer.from(detail.responseBase64, "base64"), Buffer.from(detail.rawResponse));
+    }
+    const record = [...archive.records()].find(r => r.type === "model.bytes")!;
+    const range = archive.readData<{ file: string }>(record);
+    fs.writeFileSync(path.join(dir, range.file), "damaged");
+    await assert.rejects(reader.detail("r0"), /verification|truncated/);
+    ok("archive efficiency: interleaved captures survive descriptor eviction, terminal events, exact Unicode reads and later corruption checks");
+  } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-progress-"));
+  const archive = new ConversationArchive(dir);
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    let callbacks!: import("../src/llm/client.js").StreamCallbacks;
+    let reject!: (error: Error) => void;
+    const chat = archiveChat(archive, {}, async (_messages, cbs) => {
+      callbacks = cbs!;
+      return new Promise<ChatResult>((_resolve, fail) => { reject = fail; });
+    });
+    const pending = chat([]);
+    const checked = assert.rejects(pending, /connection lost/);
+    for (let i = 0; i < 100; i++) callbacks.onDelta?.("🌎");
+    callbacks.onReasoning?.("thinking");
+    callbacks.onToolCallDelta?.(0, { id: "call", name: "web_", arguments: '{"q":' });
+    assert.equal([...archive.records()].filter(r => r.type === "model.progress").length, 0);
+    mock.timers.tick(1000);
+    callbacks.onToolCallDelta?.(0, { name: "search", arguments: '"cats"}' });
+    callbacks.onDelta?.("last");
+    reject(new Error("connection lost"));
+    await checked;
+    mock.timers.tick(5000);
+    const records = [...archive.records()];
+    const batches = records.filter(r => r.type === "model.progress").map(r => archive.readData<import("../src/llm/archived-chat.js").ModelProgress>(r));
+    assert.equal(batches.length, 2, "hundreds of fragments require only a periodic batch and a failure flush");
+    assert.equal(batches.map(b => b.content).join(""), "🌎".repeat(100) + "last");
+    assert.equal(batches[0].reasoning, "thinking");
+    assert.equal(batches.map(b => b.toolCalls[0].name).join(""), "web_search");
+    assert.equal(batches.map(b => b.toolCalls[0].arguments).join(""), '{"q":"cats"}');
+    assert.equal(records.at(-1)!.type, "model.failed");
+    assert.ok(!fs.existsSync(path.join(archiveSystemDirectory(dir), "responses")));
+    const completed = archiveChat(archive, {}, async (_messages, cbs) => {
+      cbs?.onDelta?.("done");
+      return { content: "done", toolCalls: [] };
+    });
+    await completed([]);
+    mock.timers.tick(2000);
+    assert.equal([...archive.records()].filter(r => r.type === "model.progress").length, 2, "successful completion supersedes its unflushed batch");
+    ok("archive: parsed output batches retain Unicode, reasoning and tool fragments, flush on failure, stop timers and omit raw capture files");
+  } finally { mock.timers.reset(); archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-discord-flow-"));
   try {
     const runFlow = (mode: string) => spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"),
@@ -6037,14 +6113,14 @@ const ok = (name: string): void => {
 
     const partialChat = archiveChat(archive, { channelId: "c", turnId: "partial" }, async (_messages, cbs) => {
       cbs?.onRequest?.({ messages: [], stream: true });
-      cbs?.onResponseBytes?.(Buffer.from('data: {"choices":[{"delta":{"reasoning":"unfinished thought"}}]}\n\n'));
+      cbs?.onReasoning?.("unfinished thought");
       throw new Error("connection lost");
     });
     await assert.rejects(partialChat([]), /connection lost/);
     const partial = records().filter((r) => r.scope.turnId === "partial");
     assert.ok(partial.some((r) => r.type === "model.failed"));
-    assert.ok(archive.responseBytes(archive.readData(partial.find((r) => r.type === "model.bytes")!)).includes("unfinished thought"));
-    ok("archive: failed generations retain received reasoning bytes and failure identity");
+    assert.equal(archive.readData<{ reasoning: string }>(partial.find((r) => r.type === "model.progress")!).reasoning, "unfinished thought");
+    ok("archive: failed generations retain parsed reasoning and failure identity");
   } finally {
     archive.close();
     fs.rmSync(dir, { recursive: true, force: true });
@@ -6296,12 +6372,19 @@ const ok = (name: string): void => {
       else assert.equal((await pending).reasoning, mode === "stream" ? "full thought" : "json thought");
       const events = [...archive.records()].filter((r) => r.scope.turnId === mode);
       assert.deepEqual(archive.readData(events.find((r) => r.type === "model.request")!), JSON.parse(wireRequest));
-      const received = Buffer.concat(events.filter((r) => r.type === "model.bytes").map((r) => archive.responseBytes(archive.readData(r)))).toString("utf8");
-      if (mode === "broken") assert.match(received, /unfinished reasoning/);
-      else assert.equal(received, mode === "stream" ? sse : json, "exact response bytes preserved, including SSE framing and Unicode");
+      assert.ok(!events.some(r => r.type === "model.bytes"), "new captures omit SSE framing and raw body files");
+      assert.ok(!("messages" in archive.readData<object>(events.find(r => r.type === "model.started")!)), "input is captured only once");
+      if (mode === "broken") {
+        const progress = archive.readData<{ reasoning: string }>(events.find(r => r.type === "model.progress")!);
+        assert.equal(progress.reasoning, "unfinished reasoning");
+      } else {
+        const result = archive.readData<ChatResult>(events.find(r => r.type === "model.finished")!);
+        assert.equal(result.content, mode === "stream" ? "hello 🌍" : "json answer");
+        if (mode === "stream") assert.deepEqual(result.toolCalls, [{ id: "tc", name: "echo", arguments: "{}" }]);
+      }
     }
     assert.ok(!fs.readFileSync(archiveJournalPath(dir)).includes("archive-test-secret-key"), "authorization headers are never archived");
-    ok("archive: real HTTP JSON/SSE requests, responses, reasoning, tool fragments and broken streams round-trip without auth headers");
+    ok("archive: structured HTTP requests, parsed responses and failed stream reasoning survive without raw bytes or auth headers");
   } finally {
     archive.close();
     server.closeAllConnections();
@@ -6752,7 +6835,7 @@ const ok = (name: string): void => {
       + 'data: {"choices":';
     new Script(script + `
       detail = { rawResponse: ${JSON.stringify(partial)}, events: [] };
-      outputView = 'readable'; renderOutput();
+      renderOutput();
     `).runInNewContext(browser);
     const visibleText = (n: UiNode): string => n.textContent + n.children.map(visibleText).join(" ");
     assert.ok(visibleText(element("output")).includes("Thinking"));
@@ -6766,6 +6849,32 @@ const ok = (name: string): void => {
     assert.equal(element("output").querySelectorAll("details")[0].open, false);
     assert.equal(element("output").scrollTop, 15, "stream refresh preserves the reader's position");
     assert.ok(html.includes('id="live"') && html.includes('id="follow"'));
+    assert.ok(!html.includes('data-view=') && !html.includes('Raw bytes / SSE'));
+    new Script(`
+      detail = { events: [{ type: 'model.request', data: { messages: [
+        { role: 'user', content: [{ type: 'text', text: 'Read this' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,PRIVATE_IMAGE_BYTES' } }] },
+        { role: 'assistant', content: '', reasoning_content: 'A plan', tool_calls: [{ function: { name: 'web_search', arguments: '{"q":"cats"}' } }] },
+        { role: 'tool', content: 'Search found cats' }
+      ] } }] };
+      renderInput();
+    `).runInNewContext(browser);
+    const input = visibleText(element("input"));
+    for (const text of ["Read this", "Image attached", "A plan", "web_search", "cats", "Tool result", "Search found cats"]) assert.ok(input.includes(text));
+    assert.ok(!input.includes("PRIVATE_IMAGE_BYTES"));
+    new Script(`
+      detail = { state: 'failed', rawResponse: '', events: [
+        { type: 'model.progress', data: { content: 'Hello ', reasoning: 'Thinking', toolCalls: [{ index: 0, id: 'a', name: 'web_', arguments: '{"q":' }] } },
+        { type: 'model.progress', data: { content: 'world', reasoning: ' more', toolCalls: [{ index: 0, id: '', name: 'search', arguments: '"cats"}' }] } },
+        { type: 'model.failed', data: { error: 'connection lost' } }
+      ] };
+      renderOutput();
+    `).runInNewContext(browser);
+    const progressText = visibleText(element("output"));
+    for (const text of ["Hello world", "Thinking more", "web_search", "cats", "connection lost"]) assert.ok(progressText.includes(text));
+    new Script(`detail = { events: [{ type: 'model.finished', data: { content: 'Done', toolCalls: [{ id: 'a', name: 'web_search', arguments: '{"q":"cats"}' }] } }] }; renderOutput();`).runInNewContext(browser);
+    assert.ok(visibleText(element("output")).includes("web_search"));
+
+
 
     assert.equal((await fetch(base + "/api/requests", { headers: { Origin: "https://untrusted.example" } })).status, 403);
     const forbiddenHost = await new Promise<number | undefined>((resolve, reject) => {
@@ -6789,6 +6898,16 @@ const ok = (name: string): void => {
     assert.equal(d.responseBytes, raw.length);
     assert.deepEqual(d.events.find(e => e.type === "model.request")!.data, request);
     archive.record("model.finished", scope, { content: "Hello 🌎", reasoning: "test reasoning", toolCalls: [] });
+    const readableReader = new InteractionReader(dir);
+    await readableReader.refresh();
+    const readable = await readableReader.detail("request-1", true) as typeof d;
+    assert.equal(readable.rawRequest, "");
+    assert.equal(readable.rawResponse, "");
+    assert.equal(readable.responseBase64, "");
+    assert.ok(!readable.events.some(e => e.type === "model.started"));
+    assert.deepEqual(readable.events.find(e => e.type === "model.request")!.data, request);
+    assert.equal((readable.events.find(e => e.type === "model.finished")!.data as { content: string }).content, "Hello 🌎");
+
     for (let i = 0; i < 101; i++) {
       const s = { requestId: `older-${i}`, channelId: "other", purpose: "chime" as const };
       archive.record("model.started", s, {});

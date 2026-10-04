@@ -228,11 +228,11 @@ With `MODEL_ENABLE_IMAGES=true`, reaction pictures are included even on messages
 
 Run `npm run ui`, then open **http://127.0.0.1:3210**. The read-only web UI can run alongside the bot or browse its history while it is stopped. It reads `CHATS_ARCHIVE_DIR` from `.env` (default `./data/archive`) without acquiring the bot's archive lock. No Discord token or model connection is needed to run the UI. Set `WEB_UI_PORT` to change its port; after a build, run `node dist/ui-cli.js` instead.
 
-The request timeline filters by channel ID, request ID, purpose or status. Request JSON and raw response bytes/SSE appear side by side by default, with Prompt, Output and parsed JSON views available. Copy or save either body; response downloads preserve captured bytes exactly. Replies, chime decisions, repair attempts and compaction calls appear separately, including failed and unfinished requests.
+The request timeline filters by channel ID, request ID, purpose or status. Conversation messages and assistant output appear side by side as readable text, including reasoning, tool arguments, tool results and errors. Copy or save either panel as text. Replies, chime decisions, repair attempts and compaction calls appear separately, including failed and unfinished requests.
 
-**Live updates** refresh every half second, showing the prompt as soon as it is captured and response text, reasoning and tool-call arguments as they arrive. **Follow newest request** automatically opens new interactions; selecting a request turns following off so you can inspect it. Turn live updates off to freeze the view, or use **Refresh now** for a single update. Scrolled positions and expanded sections survive updates; output follows the end only while you are already at the bottom. The UI shows captured API activity, not endpoint-internal prompt-processing progress.
+**Live updates** refresh every half second, showing the prompt as soon as it is captured and response text, reasoning and tool-call arguments in batches up to one second apart. **Follow newest request** automatically opens new interactions; selecting a request turns following off so you can inspect it. Turn live updates off to freeze the view, or use **Refresh now** for a single update. Scrolled positions and expanded sections survive updates; output follows the end only while you are already at the bottom. The UI shows captured API activity, not endpoint-internal prompt-processing progress.
 
-The UI binds only to `127.0.0.1` and does not load external assets. Conversation content is visible to anyone who can access that local address; authorization headers are never archived or displayed. A pending request from an earlier bot session remains marked pending because the archive has no completion for it. Raw input is the serialized request body; raw output is the captured response body, not HTTP headers. Image data remains text and is never loaded into the page. Large bodies are loaded only when selected. Restart the UI after replacing or purging its archive.
+The UI binds only to `127.0.0.1` and does not load external assets. Conversation content is visible to anyone who can access that local address; authorization headers are never archived or displayed. A pending request from an earlier bot session remains marked pending because the archive has no completion for it. Structured requests and parsed responses remain in the archive; older raw captures are still readable. Images appear as attachment labels; image data is never loaded into the page. Large bodies are loaded only when selected. Restart the UI after replacing or purging its archive.
 
 ## Configuration
 
@@ -281,7 +281,7 @@ With no executable tools enabled, a reply receiving an explicit HTTP 400/422
 tool-compatibility rejection retries once without tool metadata. Other errors
 propagate, and configured executable tools are never silently disabled.
 Interruption signals apply to every repair/fallback; already executed tools
-are not replayed. Every raw request/result is archived and counted separately;
+are not replayed. Every structured request/parsed result is archived and counted separately;
 crash recovery uses the accepted reply with all its paired tool results, so
 rejected candidates cannot create duplicate rounds or mispaired tool results.
 

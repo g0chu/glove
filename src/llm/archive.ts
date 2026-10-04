@@ -57,6 +57,7 @@ function syncDirectory(dir: string): void {
 export class ConversationArchive {
   private readonly systemDirectory: string;
   private fd = -1;
+  private readonly responseFiles = new Map<string, { fd: number; offset: number; file: string }>();
   private seq = 0;
   private previous = "";
   private failure: Error | null = null;
@@ -243,11 +244,13 @@ export class ConversationArchive {
       // Only checkpoint manifests need a separate file for indexed random access.
       const payload = type === "context.checkpoint" ? this.putBlob(bytes, true) : digest(bytes);
       const body = { version: 2 as const, seq: this.seq + 1, time, type, scope, data: payload, previous: this.previous, payload: JSON.parse(bytes.toString("utf8")) as unknown };
-      const record = { ...body, hash: digest(JSON.stringify(body)) };
-      fs.writeFileSync(this.fd, JSON.stringify(record) + "\n");
+      const encoded = JSON.stringify(body);
+      const record = { ...body, hash: digest(encoded) };
+      fs.writeFileSync(this.fd, `${encoded.slice(0, -1)},"hash":"${record.hash}"}\n`);
       fs.fsyncSync(this.fd);
       this.accept(record);
-      this.layout?.append(this, record);
+      if ((type === "model.finished" || type === "model.failed") && scope.requestId) this.closeResponse(scope.requestId);
+      this.layout?.append(this, record, false, type === "context.checkpoint" ? undefined : body.payload);
       return record.seq;
     } catch (err) { return this.fail(err); }
   }
@@ -499,20 +502,32 @@ export class ConversationArchive {
     this.check();
     try {
       if (!scope.requestId) throw new Error("response capture requires a request id");
-      const folder = path.join(this.systemDirectory, "responses");
-      fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
-      const name = /^[a-zA-Z0-9_-]{1,120}$/.test(scope.requestId) ? scope.requestId : digest(scope.requestId);
-      const file = path.relative(this.directory, path.join(folder, `${name}.bin`)).split(path.sep).join("/");
-      const fd = fs.openSync(path.join(this.directory, file), "a+", 0o600);
-      let offset: number;
-      try {
-        offset = fs.fstatSync(fd).size;
-        fs.writeFileSync(fd, bytes);
-        fs.fsyncSync(fd);
-      } finally { fs.closeSync(fd); }
-      if (offset === 0) { syncDirectory(folder); syncDirectory(this.systemDirectory); syncDirectory(this.directory); }
+      let response = this.responseFiles.get(scope.requestId);
+      if (!response) {
+        // Bound descriptors even when callers capture requests without a terminal event.
+        if (this.responseFiles.size >= 32) this.closeResponse(this.responseFiles.keys().next().value!);
+        const folder = path.join(this.systemDirectory, "responses");
+        fs.mkdirSync(folder, { recursive: true, mode: 0o700 });
+        const name = /^[a-zA-Z0-9_-]{1,120}$/.test(scope.requestId) ? scope.requestId : digest(scope.requestId);
+        const file = path.relative(this.directory, path.join(folder, `${name}.bin`)).split(path.sep).join("/");
+        const fd = fs.openSync(path.join(this.directory, file), "a+", 0o600);
+        response = { fd, offset: fs.fstatSync(fd).size, file };
+        this.responseFiles.set(scope.requestId, response);
+        if (response.offset === 0) { syncDirectory(folder); syncDirectory(this.systemDirectory); syncDirectory(this.directory); }
+      }
+      const { fd, offset, file } = response;
+      fs.writeFileSync(fd, bytes);
+      fs.fsyncSync(fd);
+      response.offset += bytes.byteLength;
       this.record("model.bytes", scope, { file, offset, size: bytes.byteLength, sha256: digest(bytes) }, time);
     } catch (err) { this.fail(err); }
+  }
+
+  private closeResponse(id: string): void {
+    const response = this.responseFiles.get(id);
+    if (!response) return;
+    fs.closeSync(response.fd);
+    this.responseFiles.delete(id);
   }
 
   /** Verify a response range; legacy blob-based captures remain readable. */
@@ -551,6 +566,7 @@ export class ConversationArchive {
       try { this.layout?.finish(this); } catch (err) { layoutError = err; }
     }
     if (this.fd >= 0 && this.fastRecovery && this.recovered && !this.failure && ownsDirectory) this.saveIndex();
+    for (const id of this.responseFiles.keys()) this.closeResponse(id);
     if (this.fd >= 0) fs.closeSync(this.fd);
     this.fd = -1;
     this.checkpoints.clear();

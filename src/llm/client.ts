@@ -126,6 +126,8 @@ export interface StreamCallbacks {
   onResponse?: (status: number) => void;
   /** Durable observer: exact received body bytes, including unfinished SSE data. */
   onResponseBytes?: (bytes: Uint8Array) => void;
+  /** Parsed tool-call fragments, keyed by the endpoint's stream index. */
+  onToolCallDelta?: (index: number, delta: Partial<ToolCall>) => void;
   /** Called with each streamed content delta, as it arrives. */
   onDelta?: (delta: string) => void;
   /**
@@ -568,6 +570,11 @@ export class LlmClient {
             }
             phase.generating = true; // generation state is used only for timeout diagnostics
             calls.set(idx, acc);
+            callbacks.onToolCallDelta?.(idx, {
+              ...(typeof tc.id === "string" && tc.id ? { id: tc.id } : {}),
+              ...(typeof fn?.name === "string" ? { name: fn.name } : {}),
+              ...(fn?.arguments != null ? { arguments: typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments) } : {}),
+            });
           }
         }
       }

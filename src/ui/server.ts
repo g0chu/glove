@@ -38,7 +38,7 @@ export async function startInspector(directory: string, port: number): Promise<S
         if (!Number.isSafeInteger(before) || before < 1) { res.writeHead(400).end("invalid cursor"); return; }
         data = reader.list((url.searchParams.get("q") ?? "").slice(0, 200), before);
       } else if (/^\/api\/requests\/[^/]+$/.test(url.pathname)) {
-        data = await reader.detail(decodeURIComponent(url.pathname.split("/").at(-1)!));
+        data = await reader.detail(decodeURIComponent(url.pathname.split("/").at(-1)!), url.searchParams.get("view") === "readable");
         if (!data) { res.writeHead(404).end("request not found"); return; }
       } else { res.writeHead(404).end(); return; }
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" }).end(JSON.stringify(data));
