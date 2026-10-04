@@ -63,18 +63,23 @@ function readableValue(value) {
     } else root.append(prose(value));
     return root;
 }
-function group(kind, title, body, key) {
-    const root = node(key ? 'details' : 'section', undefined, 'group ' + kind);
+function group(kind, title, body, key, complete = true) {
+    const collapsible = kind !== 'response';
+    const root = node(collapsible ? 'details' : 'section', undefined, 'group ' + kind);
     root.dataset.kind = kind;
-    if (key) { root.dataset.key = key; root.open = true; }
-    const label = node(key ? 'summary' : 'h3', title, 'group-title');
+    if (collapsible) {
+        root.dataset.key = key || kind;
+        root.dataset.complete = String(complete);
+        root.open = !complete;
+    }
+    const label = node(collapsible ? 'summary' : 'h3', title, 'group-title');
     const content = node('div', undefined, 'group-body');
     content.append(body);
     root.append(label, content);
     return root;
 }
-function reasoningGroup(text, key) { return group('reasoning', 'Reasoning', prose(text), key); }
-function toolsGroup(calls) { return group('tools', 'Tool calls · ' + calls.length, toolCalls(calls)); }
+function reasoningGroup(text, key, complete = true) { return group('reasoning', 'Reasoning', prose(text), key, complete); }
+function toolsGroup(calls, key = 'tools', complete = true) { return group('tools', 'Tool calls · ' + calls.length, toolCalls(calls), key, complete); }
 function toolCalls(calls) {
     const root = node('div');
     for (const call of calls) {
@@ -179,19 +184,20 @@ function drawEntry(detail, previous) {
         if (m.role === 'assistant') {
             if (m.reasoning_content) root.append(reasoningGroup(m.reasoning_content, 'prompt-reasoning-' + i));
             if (m.content) root.append(group('response', 'Assistant response' + (m.name ? ' · ' + m.name : ''), messageContent(m.content)));
-            if (m.tool_calls?.length) root.append(toolsGroup(m.tool_calls));
+            if (m.tool_calls?.length) root.append(toolsGroup(m.tool_calls, 'prompt-tools-' + i));
         } else {
             const toolName = m.name || toolNames.get(m.tool_call_id);
             const kind = m.role === 'tool' ? 'tool-result' : m.role === 'user' ? 'user' : 'instructions';
             const label = m.role === 'tool' ? 'Tool result' + (toolName ? ' · ' + toolName : '') :
                 m.role === 'user' ? 'User message' + (m.name ? ' · ' + m.name : '') : 'Instructions';
-            root.append(group(kind, label, messageContent(m.content)));
+            root.append(group(kind, label, messageContent(m.content), 'prompt-' + kind + '-' + i));
         }
     }
     const parsed = output(detail), failed = event(detail, 'model.failed');
-    if (parsed.reasoning) root.append(reasoningGroup(parsed.reasoning, 'reasoning'));
+    const finished = detail.state !== 'pending' || !!event(detail, 'model.finished') || !!failed;
+    if (parsed.reasoning) root.append(reasoningGroup(parsed.reasoning, 'reasoning', finished || !!parsed.content || parsed.calls.length > 0));
     if (parsed.content) root.append(group('response', 'Assistant response', prose(parsed.content)));
-    if (parsed.calls.length) root.append(toolsGroup(parsed.calls));
+    if (parsed.calls.length) root.append(toolsGroup(parsed.calls, 'tools', finished));
     if (failed) root.append(group('failure', 'Request failed', prose(failed.error)));
     if (!parsed.content && !parsed.reasoning && !parsed.calls.length && !failed)
         root.append(node('div', detail.state === 'pending' ? 'Waiting for the model…' : 'No assistant text returned.', 'muted'));
@@ -226,8 +232,13 @@ function renderFeed(older = false, incoming = 0) {
         if (!entry || entry.key !== key) {
             const root = drawEntry(detail, previous);
             if (entry) {
-                const expanded = new Map(Array.from(entry.root.querySelectorAll('details')).map(d => [d.dataset.key, d.open]));
-                for (const d of root.querySelectorAll('details')) if (expanded.has(d.dataset.key)) d.open = expanded.get(d.dataset.key);
+                const expanded = new Map(Array.from(entry.root.querySelectorAll('details')).map(d =>
+                    [d.dataset.key, { open: d.open, complete: d.dataset.complete }]));
+                for (const d of root.querySelectorAll('details')) {
+                    const previous = expanded.get(d.dataset.key);
+                    // Collapse once at completion, then preserve manual reopening.
+                    if (previous && !(d.dataset.complete === 'true' && previous.complete !== 'true')) d.open = previous.open;
+                }
             }
             entry = { key, root };
             rendered.set(item.id, entry);

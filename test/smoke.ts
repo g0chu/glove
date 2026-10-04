@@ -6878,6 +6878,58 @@ const ok = (name: string): void => {
     assert.ok(visibleText(response).includes("Assistant response") && visibleText(response).includes("Done"));
     assert.ok(!visibleText(response).includes("Thinking"), "reasoning is outside the response group");
     assert.ok(!visibleText(toolResult).includes("A plan"), "tool results do not mix with reasoning");
+    assert.ok(groups.filter(n => n.tag === "details").every(n => !n.open), "completed inputs, reasoning and tool results start collapsed");
+    assert.equal(response.tag, "section", "assistant responses always stay visible");
+    new Script(`
+      const phase = fixture('phase', [
+        { type: 'model.request', data: { messages: [{ role: 'user', content: 'A question' }] } },
+        { type: 'model.progress', data: { content: '', reasoning: 'Working on it', toolCalls: [] } }
+      ], 'pending', 1);
+      function phaseGroup(kind) { return $('entries').querySelectorAll('details').find(d => d.dataset.kind === kind); }
+      items = [phase]; details.set(phase.id, phase); rendered.clear(); renderFeed();
+    `).runInNewContext(browser);
+    const phaseGroup = (kind: string): UiNode => element("entries").querySelectorAll("details").find(n => n.dataset.kind === kind)!;
+    assert.equal(phaseGroup("reasoning").open, true, "reasoning stays open while it is the active stream");
+    assert.equal(phaseGroup("user").open, false, "already complete input is collapsed even while the model runs");
+    phaseGroup("user").open = true;
+    new Script(`
+      phase.events.push({ type: 'model.progress', data: { content: 'Beginning answer', reasoning: '', toolCalls: [] } });
+      phase.updated++; renderFeed();
+    `).runInNewContext(browser);
+    assert.equal(phaseGroup("reasoning").open, false, "reasoning collapses when response text begins, before request completion");
+    assert.equal(phaseGroup("user").open, true, "manual reopening of finished input survives updates");
+    phaseGroup("reasoning").open = true;
+    new Script(`
+      phase.events.push({ type: 'model.progress', data: { content: '', reasoning: '', toolCalls: [{ index: 0, id: 'call', name: 'web_search', arguments: '{"q":' }] } });
+      phase.updated++; renderFeed();
+    `).runInNewContext(browser);
+    assert.equal(phaseGroup("tools").open, true, "tool arguments stay visible while streaming");
+    assert.equal(phaseGroup("reasoning").open, true, "manually reopened completed reasoning remains open");
+    new Script(`
+      phase.events.push({ type: 'model.finished', data: { content: 'Final answer', reasoning: 'Working on it', toolCalls: [{ id: 'call', name: 'web_search', arguments: '{"q":"cats"}' }] } });
+      phase.state = 'finished'; phase.updated++; renderFeed();
+    `).runInNewContext(browser);
+    assert.equal(phaseGroup("tools").open, false, "tool calls collapse on generation completion despite being open during streaming");
+    assert.equal(phaseGroup("reasoning").open, true, "later phases do not recollapse a manually reopened completed block");
+    assert.ok(element("entries").querySelectorAll("section").some(n => n.dataset.kind === "response" && visibleText(n).includes("Final answer")));
+    phaseGroup("tools").open = true;
+    new Script(`phase.updated++; renderFeed();`).runInNewContext(browser);
+    assert.equal(phaseGroup("tools").open, true, "completed tool messages can be reopened and stay open");
+    new Script(`
+      const toolsOnly = fixture('tools-only', [
+        { type: 'model.progress', data: { content: '', reasoning: 'Choosing a tool', toolCalls: [{ index: 0, id: 'call', name: 'web_search', arguments: '{}' }] } }
+      ], 'pending', 1);
+      items = [toolsOnly]; details.set(toolsOnly.id, toolsOnly); rendered.clear(); renderFeed();
+    `).runInNewContext(browser);
+    assert.equal(phaseGroup("reasoning").open, false, "tool-call generation also completes the reasoning phase");
+    assert.equal(phaseGroup("tools").open, true);
+    new Script(`
+      toolsOnly.events.push({ type: 'model.failed', data: { error: 'Interrupted' } });
+      toolsOnly.state = 'failed'; toolsOnly.updated++; renderFeed();
+    `).runInNewContext(browser);
+    assert.equal(phaseGroup("tools").open, false, "interrupted tool output also settles and collapses");
+    assert.equal(phaseGroup("failure").open, false, "finished error output is collapsible too");
+    new Script(`items = [first]; rendered.clear(); renderFeed();`).runInNewContext(browser);
 
     const initialWindow = new Script(`promptMessages(fixture('window', [{ type: 'model.request', data: { messages: [
       { role: 'user', content: 'Already in earlier history' }, { role: 'assistant', content: 'Earlier answer' }, { role: 'user', content: 'Latest input' }
