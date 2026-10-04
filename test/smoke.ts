@@ -4323,6 +4323,25 @@ const ok = (name: string): void => {
     await assert.rejects(fileOps.writeFile(ws, "notes", "x", true, 10), /overwrite a directory/);
     ok("file write: create_dirs, cap, directory guard");
 
+    fs.writeFileSync(path.join(ws, "concurrent.txt"), "alpha beta");
+    fs.symlinkSync(path.join(ws, "concurrent.txt"), path.join(ws, "concurrent-alias.txt"));
+    await Promise.all([
+      fileOps.editFile(ws, "concurrent.txt", "alpha", "ALPHA", false, 1000, 1000),
+      fileOps.editFile(ws, "concurrent-alias.txt", "beta", "BETA", false, 1000, 1000),
+    ]);
+    assert.equal(fs.readFileSync(path.join(ws, "concurrent.txt"), "utf8"), "ALPHA BETA");
+    await Promise.all([
+      fileOps.writeFile(ws, "concurrent.txt", "fresh", false, 1000),
+      fileOps.editFile(ws, "concurrent.txt", "fresh", "FRESH", false, 1000, 1000),
+    ]);
+    assert.equal(fs.readFileSync(path.join(ws, "concurrent.txt"), "utf8"), "FRESH");
+    const failedMutation = fileOps.editFile(ws, "concurrent.txt", "missing", "x", false, 1000, 1000);
+    const nextMutation = fileOps.editFile(ws, "concurrent.txt", "FRESH", "recovered", false, 1000, 1000);
+    await assert.rejects(failedMutation, /not found/);
+    await nextMutation;
+    assert.equal(fs.readFileSync(path.join(ws, "concurrent.txt"), "utf8"), "recovered");
+    ok("file mutations: concurrent edits, aliases, writes and failed operations serialize without lost updates");
+
     // -- read
     fs.writeFileSync(path.join(ws, "big.txt"), "abcdef");
     const r1 = await fileOps.readFile(ws, "big.txt", 0, 2, ops.readMaxBytes);
@@ -4443,6 +4462,51 @@ const ok = (name: string): void => {
     assert.equal(combined.timedOut, false);
     assert.ok(Buffer.byteLength(combined.stdout) + Buffer.byteLength(combined.stderr) <= 1000);
     ok("shell: combined stdout/stderr cap kills a chatty command, partial output returned");
+
+    // A nested process records receipt of SIGTERM. Always clean up if a regression
+    // leaves it alive; readiness drives cancellation without arbitrary sleeps.
+    for (const mode of ["timeout", "cap", "abort"] as const) {
+      const marker = path.join(ws, `terminated-${mode}`);
+      let descendant: number | undefined;
+      const script = `process.on("SIGTERM", () => { require("fs").writeFileSync(${JSON.stringify(marker)}, "terminated"); process.exit(0); }); console.log(process.pid); ${mode === "cap" ? "setImmediate(() => console.log(\"x\".repeat(200)));" : ""} setInterval(() => {}, 1000);`;
+      const command = `${JSON.stringify(process.execPath)} -e '${script}'`;
+      try {
+        if (mode === "timeout") mock.timers.enable({ apis: ["setTimeout"] });
+        const run = await runShellCommand(command, ws, 5000, mode === "cap" ? 100 : 1000, (child, terminate) => {
+          child.stdout?.once("data", (chunk: Buffer) => {
+            descendant = Number(chunk.toString().split("\n")[0]);
+            if (mode === "abort") terminate();
+            if (mode === "timeout") mock.timers.tick(5000);
+          });
+        });
+        assert.equal(run.capped, mode === "cap");
+        assert.equal(run.timedOut, mode !== "cap");
+        assert.equal(fs.readFileSync(marker, "utf8"), "terminated");
+      } finally {
+        if (mode === "timeout") mock.timers.reset();
+        if (descendant) { try { process.kill(descendant, "SIGKILL"); } catch {} }
+      }
+    }
+    ok("shell: timeout, output cap and explicit cancellation terminate descendants");
+
+    let stubbornPid: number | undefined;
+    try {
+      mock.timers.enable({ apis: ["setTimeout"] });
+      const script = 'process.on("SIGTERM", () => {}); console.log(process.pid); setInterval(() => {}, 1000);';
+      const stubborn = await runShellCommand(`${JSON.stringify(process.execPath)} -e '${script}'`, ws, 5000, 1000, (child) => {
+        child.stdout?.once("data", (chunk: Buffer) => {
+          stubbornPid = Number(chunk.toString().trim());
+          mock.timers.tick(5000);
+          mock.timers.tick(100);
+        });
+      });
+      assert.equal(stubborn.timedOut, true);
+      assert.equal(stubborn.exitCode, null);
+      ok("shell: forced termination closes descendant pipes when SIGTERM is ignored");
+    } finally {
+      mock.timers.reset();
+      if (stubbornPid) { try { process.kill(stubbornPid, "SIGKILL"); } catch {} }
+    }
 
     const noWs = new ShellTools({ cwd: path.join(ws, "nope"), timeoutMs: 1000, maxOutputBytes: 1000, maxResultChars: 50_000 });
     await assert.rejects(noWs.exec("true", 5), /does not exist/);

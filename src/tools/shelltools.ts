@@ -9,7 +9,7 @@
  * system-prompt rules are the only guard, so the tool description steers it
  * toward read-only or workspace-local commands.
  */
-import { exec, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import type { ToolSpec } from "../llm/client.js";
 import { ToolRegistry, argInt, argString } from "./executor.js";
 import { ToolError } from "./web/ssrf.js";
@@ -38,78 +38,69 @@ export interface ShellRun {
   stderr: string;
 }
 
-/**
- * Run one command via /bin/sh with a deadline and output cap. The command
- * is never parsed or validated here — it is exactly what the caller sent.
- * Partial output survives a kill: the callback's stdout/stderr args carry
- * whatever was buffered (Node also mirrors them onto the error object on
- * some paths, so both sources are checked). Classification of the error:
- * `killed` = the deadline ended the command, a MAXBUFFER error code = the
- * output cap ended it, a numeric `code` = the process exit code, anything
- * else = the command could not start (rejected as a ToolError).
- */
+/** Run a command in its own process group, terminating descendants on every kill path. */
 export function runShellCommand(
   command: string,
   cwd: string,
   timeoutMs: number,
   maxOutputBytes: number,
-  onChild?: (child: ChildProcess) => void,
+  onChild?: (child: ChildProcess, terminate: () => void) => void,
 ): Promise<ShellRun> {
   return new Promise((resolve, reject) => {
+    const child = spawn("/bin/sh", ["-c", command], { cwd, detached: true, stdio: ["pipe", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
     let outputBytes = 0;
-    let combinedCapped = false;
-    const child = exec(
-      command,
-      { cwd, shell: "/bin/sh", timeout: timeoutMs, maxBuffer: maxOutputBytes, encoding: "utf8" },
-      (err, stdout, stderr) => {
-        const e = err as { stdout?: unknown; stderr?: unknown; code?: unknown; killed?: boolean } | null;
-        const rawOut = String(e?.stdout ?? stdout);
-        const rawErr = String(e?.stderr ?? stderr);
-        const out = new TextDecoder().decode(Buffer.from(rawOut).subarray(0, maxOutputBytes), { stream: true });
-        const remaining = Math.max(0, maxOutputBytes - Buffer.byteLength(out));
-        const errOut = new TextDecoder().decode(Buffer.from(rawErr).subarray(0, remaining), { stream: true });
-        if (combinedCapped) {
-          resolve({ exitCode: null, timedOut: false, capped: true, stdout: out, stderr: errOut });
-          return;
-        }
-        if (err === null) {
-          resolve({ exitCode: 0, timedOut: false, capped: false, stdout: out, stderr: errOut });
-          return;
-        }
-        const code = e?.code;
-        // Node may mark a maxBuffer kill as killed too; classify the cap first.
-        if (typeof code === "string" && code.includes("MAXBUFFER")) {
-          resolve({ exitCode: null, timedOut: false, capped: true, stdout: out, stderr: errOut });
-          return;
-        }
-        if (e?.killed === true) {
-          resolve({ exitCode: null, timedOut: true, capped: false, stdout: out, stderr: errOut });
-          return;
-        }
-        if (typeof code === "number") {
-          resolve({ exitCode: code, timedOut: false, capped: false, stdout: out, stderr: errOut });
-          return;
-        }
-        // Error with no exit code and no kill: the command could not even
-        // start (e.g. /bin/sh missing). Surface it, not a fake exit 0.
-        reject(new ToolError(`cannot start /bin/sh: ${err.message}`));
-      },
-    );
-    const countOutput = (chunk: string): void => {
-      outputBytes += Buffer.byteLength(chunk);
-      if (outputBytes > maxOutputBytes && !combinedCapped) {
-        combinedCapped = true;
-        child.kill();
+    let timedOut = false;
+    let capped = false;
+    let stopping = false;
+    const killGroup = (signal: NodeJS.Signals): void => {
+      if (child.pid === undefined) return;
+      try { process.kill(-child.pid, signal); } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
       }
     };
-    child.stdout?.on("data", countOutput);
-    child.stderr?.on("data", countOutput);
-    onChild?.(child);
+    const stop = (): void => {
+      if (stopping) return;
+      stopping = true;
+      killGroup("SIGTERM");
+      // Keep escalation even if the shell exits first: descendants may ignore SIGTERM.
+      setTimeout(() => { killGroup("SIGKILL"); }, 100).unref();
+    };
+    const timer = setTimeout(() => { timedOut = true; stop(); }, timeoutMs);
+    const collect = (chunks: Buffer[], chunk: Buffer): void => {
+      const remaining = Math.max(0, maxOutputBytes - outputBytes);
+      if (remaining > 0) chunks.push(chunk.subarray(0, remaining));
+      outputBytes += chunk.length;
+      if (outputBytes > maxOutputBytes && !capped) {
+        capped = true;
+        stop();
+      }
+    };
+    child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
+    child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      reject(new ToolError(`cannot start /bin/sh: ${err.message}`));
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      resolve({
+        exitCode: stopping ? null : code,
+        timedOut: !capped && timedOut,
+        capped,
+        stdout: new TextDecoder().decode(Buffer.concat(stdout), { stream: true }),
+        stderr: new TextDecoder().decode(Buffer.concat(stderr), { stream: true }),
+      });
+    });
+    // Route explicit shutdown kills through the same process-group termination.
+    child.stdin.end();
+    onChild?.(child, () => { timedOut = true; stop(); });
   });
 }
 
 export class ShellTools {
-  private readonly active = new Set<ChildProcess>();
+  private readonly active = new Set<() => void>();
 
   /** Max seconds the timeout_s argument may request (from the configured timeout). */
   readonly timeoutCapS: number;
@@ -128,9 +119,9 @@ export class ShellTools {
   /** Run one command in the workspace; returns the formatted result for the model. */
   async exec(command: string, timeoutS: number): Promise<string> {
     const cwd = workspaceRoot(this.opts.cwd);
-    const run = await runShellCommand(command, cwd, timeoutS * 1000, this.opts.maxOutputBytes, (child) => {
-      this.active.add(child);
-      child.once("close", () => this.active.delete(child));
+    const run = await runShellCommand(command, cwd, timeoutS * 1000, this.opts.maxOutputBytes, (child, terminate) => {
+      this.active.add(terminate);
+      child.once("close", () => this.active.delete(terminate));
     });
     const parts: string[] = [`$ ${command}`];
     if (run.timedOut) {
@@ -148,9 +139,9 @@ export class ShellTools {
 
   /** Kill all in-flight commands (graceful shutdown). */
   abort(): void {
-    for (const child of this.active) {
+    for (const terminate of this.active) {
       try {
-        child.kill();
+        terminate();
       } catch {
         /* already settled */
       }

@@ -12,6 +12,20 @@ import path from "node:path";
 import { ToolError } from "../web/ssrf.js";
 import { resolveInWorkspace } from "./paths.js";
 
+// Shared across FileTools instances and channels; aliases resolve to the same key.
+const mutations = new Map<string, Promise<unknown>>();
+
+async function mutate<T>(target: string, operation: () => Promise<T>): Promise<T> {
+  const previous = mutations.get(target) ?? Promise.resolve();
+  const pending = previous.catch(() => {}).then(operation);
+  mutations.set(target, pending);
+  try {
+    return await pending;
+  } finally {
+    if (mutations.get(target) === pending) mutations.delete(target);
+  }
+}
+
 /** Per-operation caps (from config; keep them close to the sidecar defaults). */
 export interface FileOpsOptions {
   readMaxBytes: number;
@@ -100,28 +114,30 @@ export async function writeFile(
     throw new ToolError(`content is larger than the write cap (${writeMaxBytes} bytes)`);
   }
   const target = resolveInWorkspace(workspace, rel);
-  let st;
-  try {
-    st = await fs.stat(target);
-  } catch {
-    st = null; // missing target: fine, we are creating it
-  }
-  if (st && st.isDirectory()) throw new ToolError(`cannot overwrite a directory: ${rel}`);
-  const parent = path.dirname(target);
-  try {
-    await fs.access(parent);
-  } catch {
-    if (!createDirs) {
-      throw new ToolError(`parent directory of ${rel} does not exist (use create_dirs=true to create it)`);
-    }
+  return mutate(target, async () => {
+    let st;
     try {
-      await fs.mkdir(parent, { recursive: true });
-    } catch (err) {
-      throw new ToolError(`cannot create parent directory of ${rel}: ${errMsg(err)}`);
+      st = await fs.stat(target);
+    } catch {
+      st = null; // missing target: fine, we are creating it
     }
-  }
-  await fs.writeFile(target, encoded);
-  return { path: rel, bytesWritten: encoded.length };
+    if (st && st.isDirectory()) throw new ToolError(`cannot overwrite a directory: ${rel}`);
+    const parent = path.dirname(target);
+    try {
+      await fs.access(parent);
+    } catch {
+      if (!createDirs) {
+        throw new ToolError(`parent directory of ${rel} does not exist (use create_dirs=true to create it)`);
+      }
+      try {
+        await fs.mkdir(parent, { recursive: true });
+      } catch (err) {
+        throw new ToolError(`cannot create parent directory of ${rel}: ${errMsg(err)}`);
+      }
+    }
+    await fs.writeFile(target, encoded);
+    return { path: rel, bytesWritten: encoded.length };
+  });
 }
 
 /**
@@ -140,37 +156,39 @@ export async function editFile(
   writeMaxBytes: number,
 ): Promise<{ path: string; replacements: number }> {
   const target = resolveInWorkspace(workspace, rel);
-  let st;
-  try {
-    st = await fs.stat(target);
-  } catch {
-    throw new ToolError(`not a file: ${rel}`);
-  }
-  if (st.size > readMaxBytes) {
-    throw new ToolError(`file ${rel} is too large to edit (${st.size} bytes, cap ${readMaxBytes})`);
-  }
-  let buf: Buffer;
-  try {
-    buf = await fs.readFile(target);
-  } catch {
-    throw new ToolError(`not a file: ${rel}`);
-  }
-  let text: string;
-  try {
-    text = utf8Fatal(buf);
-  } catch {
-    throw new ToolError(`file ${rel} is not valid UTF-8 text; refusing to edit it`);
-  }
-  if (oldText === "") throw new ToolError("old_text must not be empty");
-  const occurrences = countOccurrences(text, oldText);
-  if (occurrences === 0) {
-    throw new ToolError("old_text not found in the file (it must match exactly, whitespace included)");
-  }
-  const updated = replaceAll ? text.split(oldText).join(newText) : replaceFirst(text, oldText, newText);
-  const encoded = Buffer.from(updated, "utf8");
-  if (encoded.length > writeMaxBytes) {
-    throw new ToolError(`the edited content is larger than the write cap (${writeMaxBytes} bytes)`);
-  }
-  await fs.writeFile(target, encoded);
-  return { path: rel, replacements: replaceAll ? occurrences : 1 };
+  return mutate(target, async () => {
+    let st;
+    try {
+      st = await fs.stat(target);
+    } catch {
+      throw new ToolError(`not a file: ${rel}`);
+    }
+    if (st.size > readMaxBytes) {
+      throw new ToolError(`file ${rel} is too large to edit (${st.size} bytes, cap ${readMaxBytes})`);
+    }
+    let buf: Buffer;
+    try {
+      buf = await fs.readFile(target);
+    } catch {
+      throw new ToolError(`not a file: ${rel}`);
+    }
+    let text: string;
+    try {
+      text = utf8Fatal(buf);
+    } catch {
+      throw new ToolError(`file ${rel} is not valid UTF-8 text; refusing to edit it`);
+    }
+    if (oldText === "") throw new ToolError("old_text must not be empty");
+    const occurrences = countOccurrences(text, oldText);
+    if (occurrences === 0) {
+      throw new ToolError("old_text not found in the file (it must match exactly, whitespace included)");
+    }
+    const updated = replaceAll ? text.split(oldText).join(newText) : replaceFirst(text, oldText, newText);
+    const encoded = Buffer.from(updated, "utf8");
+    if (encoded.length > writeMaxBytes) {
+      throw new ToolError(`the edited content is larger than the write cap (${writeMaxBytes} bytes)`);
+    }
+    await fs.writeFile(target, encoded);
+    return { path: rel, replacements: replaceAll ? occurrences : 1 };
+  });
 }
