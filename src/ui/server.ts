@@ -36,7 +36,9 @@ export async function startInspector(directory: string, port: number): Promise<S
       if (url.pathname === "/api/requests") {
         const before = Number(url.searchParams.get("before") ?? Number.MAX_SAFE_INTEGER);
         if (!Number.isSafeInteger(before) || before < 1) { res.writeHead(400).end("invalid cursor"); return; }
-        data = reader.list((url.searchParams.get("q") ?? "").slice(0, 200), before);
+        const limit = Number(url.searchParams.get("limit") ?? 100);
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) { res.writeHead(400).end("invalid page size"); return; }
+        data = reader.list((url.searchParams.get("q") ?? "").slice(0, 200), before, limit);
       } else if (/^\/api\/requests\/[^/]+$/.test(url.pathname)) {
         data = await reader.detail(decodeURIComponent(url.pathname.split("/").at(-1)!), url.searchParams.get("view") === "readable");
         if (!data) { res.writeHead(404).end("request not found"); return; }

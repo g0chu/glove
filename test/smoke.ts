@@ -53,7 +53,7 @@ import { MessageGate, type GateMessage } from "../src/bot/gate.js";
 import { MessageObservations } from "../src/bot/observations.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
 import { chimeReplyChat } from "../src/bot/chime-reply.js";
-import { executeReplyChime, chimeTools, CHIME_MAX_TOKENS, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
+import { executeReplyChime, chimeTools, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
 import { InterruptedError, isInterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
@@ -1032,8 +1032,8 @@ const ok = (name: string): void => {
     assert.equal(requests[0].choice, "auto");
     assert.deepEqual(requests[1].tools, requests[0].tools);
     assert.equal(requests[1].choice, "auto");
-    assert.equal(requests[0].maxTokens, CHIME_MAX_TOKENS);
-    assert.equal(requests[1].maxTokens, CHIME_MAX_TOKENS, "repair also bounds generation");
+    assert.equal(requests[0].maxTokens, undefined, "decision uses the endpoint output limit");
+    assert.equal(requests[1].maxTokens, undefined, "repair also uses the endpoint output limit");
     assert.deepEqual(requests[1].messages.slice(0, -1), requests[0].messages, "repair preserves the message prefix");
   }
   let attempts = 0;
@@ -2642,7 +2642,7 @@ const ok = (name: string): void => {
       "the serialized reply extends the complete decision request prefix");
     assert.deepEqual(wireRequests[0].tools, wireRequests[1].tools);
     assert.equal(wireRequests[0].tool_choice, wireRequests[1].tool_choice);
-    assert.equal(wireRequests[0].max_tokens, CHIME_MAX_TOKENS);
+    assert.equal(wireRequests[0].max_tokens, undefined, "chime omits the output token cap on the wire");
     assert.equal(wireRequests[1].max_tokens, undefined);
     assert.deepEqual(sharedContext.slice(0, originalContext.length), originalContext, "retaining the decision never rewrites earlier context");
     const apiBase = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -5646,7 +5646,7 @@ const ok = (name: string): void => {
   const recoveryRequests = seenRequests.slice(requestStart).map(r => r.body as Record<string, unknown>);
   assert.equal(recoveryRequests.length, 1);
   assert.equal(recoveryRequests[0].tool_choice, "auto");
-  assert.equal(recoveryRequests[0].max_tokens, CHIME_MAX_TOKENS);
+  assert.equal(recoveryRequests[0].max_tokens, undefined, "overflow retry preserves the endpoint output limit");
   ok("chime: real HTTP tool rejection stays silent without a text fallback");
 
 
@@ -6801,21 +6801,31 @@ const ok = (name: string): void => {
     assert.ok(!html.includes(request.messages[0].content), "archived model text is never interpolated into HTML");
     const script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)![1];
     new Script(script); // Check the actual browser script's syntax, including template escapes.
-    // Exercise the shipped browser renderer without a browser dependency.
+    // Exercise the shipped feed renderer and live-update logic without a browser dependency.
     class UiNode {
       textContent = "";
       children: UiNode[] = [];
+      dataset: Record<string, string> = {};
       open = false;
       checked = true;
       hidden = false;
+      disabled = false;
       value = "";
       scrollTop = 0;
       scrollHeight = 100;
       clientHeight = 100;
+      offsetTop = 0;
+      offsetHeight = 100;
       className = "";
       constructor(readonly tag = "div") {}
       append(...nodes: UiNode[]): void { this.children.push(...nodes); }
-      replaceChildren(...nodes: UiNode[]): void { this.children = nodes; }
+      replaceChildren(...nodes: UiNode[]): void {
+        this.children = nodes;
+        if (this === elements.get("entries")) {
+          nodes.forEach((n, i) => { n.offsetTop = i * 100; });
+          element("feed").scrollHeight = Math.max(100, nodes.length * 100);
+        }
+      }
       querySelectorAll(selector: string): UiNode[] {
         return this.children.flatMap(n => [...(n.tag === selector ? [n] : []), ...n.querySelectorAll(selector)]);
       }
@@ -6825,56 +6835,125 @@ const ok = (name: string): void => {
       if (!elements.has(id)) elements.set(id, new UiNode());
       return elements.get(id)!;
     };
+    element("prompts").checked = false;
     const browser = {
-      document: { getElementById: element, createElement: (tag: string) => new UiNode(tag),
-        createTextNode: (text: string) => { const n = new UiNode(); n.textContent = text; return n; } },
-      fetch: () => new Promise(() => {}), setInterval: () => {}, setTimeout: () => {}, clearTimeout: () => {},
+      document: { getElementById: element, createElement: (tag: string) => new UiNode(tag), hidden: false },
+      fetch: (_url: string): Promise<unknown> => new Promise(() => {}),
+      setInterval: () => {}, setTimeout: () => {}, clearTimeout: () => {},
     };
     const partial = 'data: {"choices":[{"delta":{"reasoning_content":"Thinking", "tool_calls":[{"index":0,"id":"call-1","function":{"name":"web_search","arguments":"{\\\"q\\\": "}}]}}]}\n\n'
       + 'data: {"choices":[{"delta":{"content":"Hello", "tool_calls":[{"index":0,"function":{"arguments":"\\\"cats\\\"}"}}]}}]}\n\n'
       + 'data: {"choices":';
     new Script(script + `
-      detail = { rawResponse: ${JSON.stringify(partial)}, events: [] };
-      renderOutput();
+      function fixture(id, events, state = 'finished', updated = 1, channelId = 'c') {
+        return { id, scope: { channelId, purpose: 'reply' }, time: '2026-10-03T00:00:00Z', events, state, updated, rawResponse: '' };
+      }
+      const legacy = fixture('legacy', [], 'pending');
+      legacy.rawResponse = ${JSON.stringify(partial)};
+      $('entries').replaceChildren(drawEntry(legacy));
     `).runInNewContext(browser);
     const visibleText = (n: UiNode): string => n.textContent + n.children.map(visibleText).join(" ");
-    assert.ok(visibleText(element("output")).includes("Thinking"));
-    assert.ok(visibleText(element("output")).includes("Hello"));
-    assert.ok(visibleText(element("output")).includes("web_search"));
-    assert.ok(visibleText(element("output")).includes("cats"));
-    element("output").querySelectorAll("details")[0].open = false;
-    element("output").scrollTop = 15;
-    element("output").scrollHeight = 500;
-    new Script("renderOutput()").runInNewContext(browser);
-    assert.equal(element("output").querySelectorAll("details")[0].open, false);
-    assert.equal(element("output").scrollTop, 15, "stream refresh preserves the reader's position");
-    assert.ok(html.includes('id="live"') && html.includes('id="follow"'));
-    assert.ok(!html.includes('data-view=') && !html.includes('Raw bytes / SSE'));
+    for (const text of ["Thinking", "Hello", "web_search", "cats"]) assert.ok(visibleText(element("entries")).includes(text));
+    assert.ok(html.includes('id="feed"') && html.includes('id="bottom"') && html.includes('id="follow"'));
+    assert.ok(!html.includes('id="list"') && !html.includes('data-view=') && !html.includes('class="panel"'));
     new Script(`
-      detail = { events: [{ type: 'model.request', data: { messages: [
+      const requestEvent = { type: 'model.request', data: { messages: [
+        { role: 'system', content: 'Master instructions' },
         { role: 'user', content: [{ type: 'text', text: 'Read this' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,PRIVATE_IMAGE_BYTES' } }] },
-        { role: 'assistant', content: '', reasoning_content: 'A plan', tool_calls: [{ function: { name: 'web_search', arguments: '{"q":"cats"}' } }] },
-        { role: 'tool', content: 'Search found cats' }
-      ] } }] };
-      renderInput();
+        { role: 'assistant', content: '', reasoning_content: 'A plan', tool_calls: [{ id: 'search-call', function: { name: 'web_search', arguments: '{"q":"cats"}' } }] },
+        { role: 'tool', tool_call_id: 'search-call', content: 'Search found cats' }
+      ] } };
+      const first = fixture('first', [requestEvent, { type: 'model.finished', data: { content: 'Done', reasoning: 'Thinking', toolCalls: [] } }]);
+      details.set(first.id, first); items = [first]; rendered.clear(); renderFeed();
     `).runInNewContext(browser);
-    const input = visibleText(element("input"));
-    for (const text of ["Read this", "Image attached", "A plan", "web_search", "cats", "Tool result", "Search found cats"]) assert.ok(input.includes(text));
-    assert.ok(!input.includes("PRIVATE_IMAGE_BYTES"));
+    const input = visibleText(element("entries"));
+    for (const text of ["Read this", "Image attached", "A plan", "web_search", "cats", "Tool result", "Search found cats", "Done"]) assert.ok(input.includes(text));
+    assert.ok(!input.includes("PRIVATE_IMAGE_BYTES") && !input.includes("Master instructions"));
+    const groups = element("entries").querySelectorAll("section").concat(element("entries").querySelectorAll("details"));
+    for (const kind of ["user", "reasoning", "tools", "tool-result", "response"]) assert.ok(groups.some(n => n.dataset.kind === kind), "explicit feed group: " + kind);
+    const toolResult = groups.find(n => n.dataset.kind === "tool-result")!;
+    assert.ok(visibleText(toolResult).includes("Tool result · web_search"), "tool results identify their originating call");
+    assert.ok(visibleText(toolResult).includes("Search found cats"));
+    const response = groups.find(n => n.dataset.kind === "response")!;
+    assert.ok(visibleText(response).includes("Assistant response") && visibleText(response).includes("Done"));
+    assert.ok(!visibleText(response).includes("Thinking"), "reasoning is outside the response group");
+    assert.ok(!visibleText(toolResult).includes("A plan"), "tool results do not mix with reasoning");
+
+    const initialWindow = new Script(`promptMessages(fixture('window', [{ type: 'model.request', data: { messages: [
+      { role: 'user', content: 'Already in earlier history' }, { role: 'assistant', content: 'Earlier answer' }, { role: 'user', content: 'Latest input' }
+    ] } }])).map(m => m.content).join(' ')`).runInNewContext(browser) as string;
+    assert.equal(initialWindow, "Latest input", "initial page does not replay history embedded in the first request");
+
+    assert.equal(element("feed").scrollTop, element("feed").scrollHeight, "initial load follows the bottom");
     new Script(`
-      detail = { state: 'failed', rawResponse: '', events: [
+      const nextRequest = { type: 'model.request', data: { messages: requestEvent.data.messages.concat([
+        { role: 'assistant', content: 'Done', reasoning_content: 'Thinking', tool_calls: [] }, { role: 'user', content: 'Another question' }
+      ]) } };
+      const second = fixture('second', [nextRequest,
         { type: 'model.progress', data: { content: 'Hello ', reasoning: 'Thinking', toolCalls: [{ index: 0, id: 'a', name: 'web_', arguments: '{"q":' }] } },
         { type: 'model.progress', data: { content: 'world', reasoning: ' more', toolCalls: [{ index: 0, id: '', name: 'search', arguments: '"cats"}' }] } },
         { type: 'model.failed', data: { error: 'connection lost' } }
-      ] };
-      renderOutput();
+      ], 'failed', 2);
+      details.set(second.id, second); items = [second, first]; renderFeed(false, 1);
     `).runInNewContext(browser);
-    const progressText = visibleText(element("output"));
-    for (const text of ["Hello world", "Thinking more", "web_search", "cats", "connection lost"]) assert.ok(progressText.includes(text));
-    new Script(`detail = { events: [{ type: 'model.finished', data: { content: 'Done', toolCalls: [{ id: 'a', name: 'web_search', arguments: '{"q":"cats"}' }] } }] }; renderOutput();`).runInNewContext(browser);
-    assert.ok(visibleText(element("output")).includes("web_search"));
+    const text = visibleText(element("entries"));
+    for (const phrase of ["Another question", "Hello world", "Thinking more", "web_search", "cats", "connection lost"]) assert.ok(text.includes(phrase));
+    assert.equal((text.match(/Read this/g) ?? []).length, 1, "shared prompt history appears only once");
+    assert.equal(element("entries").children[0].dataset.id, "first", "feed runs oldest to newest");
+    assert.equal(element("feed").scrollTop, element("feed").scrollHeight, "new output follows while at the bottom");
+    element("feed").scrollTop = 15;
+    const firstNode = element("entries").children[0];
+    firstNode.querySelectorAll("details")[0].open = false;
+    new Script(`
+      const third = fixture('third', [{ type: 'model.finished', data: { content: 'Newest answer', toolCalls: [{ id: 'a', name: 'web_search', arguments: '{"q":"cats"}' }] } }], 'finished', 3);
+      details.set(third.id, third); items = [third, second, first]; renderFeed(false, 1);
+    `).runInNewContext(browser);
+    assert.equal(element("feed").scrollTop, 15, "new output does not pull a reader away from history");
+    assert.ok(element("bottom").textContent.includes("1 new interaction"));
+    assert.equal(element("entries").children[0], firstNode, "unchanged output nodes are reused");
+    assert.equal(firstNode.querySelectorAll("details")[0].open, false);
+    new Script(`
+      const earliest = fixture('earliest', [{ type: 'model.finished', data: { content: 'Earlier answer', toolCalls: [] } }], 'finished', 0, 'other');
+      details.set(earliest.id, earliest); items.push(earliest); next = 1; renderFeed(true);
+    `).runInNewContext(browser);
+    assert.equal(element("feed").scrollTop, 115, "prepending history preserves the visible message and its offset");
+    new Script("jumpToBottom()").runInNewContext(browser);
+    assert.equal(element("feed").scrollTop, element("feed").scrollHeight);
+    assert.ok(!element("bottom").textContent.includes("new interaction"));
+    element("prompts").checked = true;
+    new Script("renderFeed()").runInNewContext(browser);
+    assert.ok(visibleText(element("entries")).includes("Master instructions"));
+    element("prompts").checked = false;
+    new Script(`
+      details.clear(); rendered.clear(); items = []; next = null; busy = false;
+    `).runInNewContext(browser);
+    const fetches: string[] = [];
+    let feedPage = { items: [{ id: "one", updated: 1 }], next: null as number | null };
+    let tailPage: typeof feedPage | undefined;
+    browser.fetch = async (url: string) => {
+      fetches.push(url);
+      if (url.startsWith("/api/requests?")) return { ok: true, json: async () => url.includes("&before=") ? tailPage ?? feedPage : feedPage };
+      const id = url.split("/").at(-1)!.split("?")[0];
+      return { ok: true, json: async () => ({ id, updated: 1, time: "2026-10-03T00:00:00Z", state: "finished", scope: { channelId: "c" }, events: [{ type: "model.finished", data: { content: id, toolCalls: [] } }] }) };
+    };
+    await new Script("refresh()").runInNewContext(browser);
+    assert.equal(fetches.filter(url => url.includes("view=readable")).length, 1);
+    await new Script("refresh(false, true)").runInNewContext(browser);
+    assert.equal(fetches.filter(url => url.includes("view=readable")).length, 1, "live polling does not reread unchanged responses");
+    assert.ok(fetches[0].includes("limit=20"));
+    feedPage = { items: Array.from({ length: 20 }, (_, i) => ({ id: "new-" + (30 - i), updated: 1 })), next: 40 };
+    tailPage = { items: Array.from({ length: 10 }, (_, i) => ({ id: "new-" + (10 - i), updated: 1 })).concat([{ id: "one", updated: 1 }]), next: null };
+    await new Script("refresh(false, true)").runInNewContext(browser);
+    assert.equal(element("entries").children.length, 31, "resuming catches every request across multiple pages");
+    assert.equal(element("entries").children[0].dataset.id, "one");
+    assert.equal(element("entries").children.at(-1)!.dataset.id, "new-30");
+    assert.ok(fetches.some(url => url.includes("&before=40")));
 
-
+    element("live").checked = false;
+    const fetchCount = fetches.length;
+    await new Script("refresh(false, true)").runInNewContext(browser);
+    assert.equal(fetches.length, fetchCount, "automatic polling does not fetch while paused");
+    element("live").checked = true;
 
     assert.equal((await fetch(base + "/api/requests", { headers: { Origin: "https://untrusted.example" } })).status, 403);
     const forbiddenHost = await new Promise<number | undefined>((resolve, reject) => {
@@ -6921,6 +7000,19 @@ const ok = (name: string): void => {
     assert.equal(older.items.at(-1)!.state, "finished");
     const filtered = await (await fetch(base + "/api/requests?q=channel-1")).json() as typeof list;
     assert.deepEqual(filtered.items.map(i => i.id), ["request-1"]);
+    const pagesReader = new InteractionReader(dir);
+    await pagesReader.refresh();
+    let cursor = Number.MAX_SAFE_INTEGER;
+    const pagedIds: string[] = [];
+    for (;;) {
+      const page = pagesReader.list("", cursor, 20);
+      assert.ok(page.items.length <= 20);
+      pagedIds.push(...page.items.map(item => item.id));
+      if (page.next === null) break;
+      cursor = page.next;
+    }
+    assert.equal(pagedIds.length, 102);
+    assert.equal(new Set(pagedIds).size, 102, "small feed pages cover history without gaps or duplicates");
     const journal = archiveJournalPath(dir);
     fs.appendFileSync(journal, '{"unfinished":');
     assert.equal((await fetch(base + "/api/requests")).status, 200, "a live partial journal line is left for the next refresh");

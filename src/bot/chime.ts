@@ -16,9 +16,6 @@ export function chimeTools(tools: ToolSpec[]): ToolSpec[] {
   return [...tools.filter((tool) => tool.name !== CHIME_TOOL_NAME), CHIME_TOOL_SPEC];
 }
 
-/** Bound decision generation, including reasoning, so it cannot run like a full reply. */
-export const CHIME_MAX_TOKENS = 1024;
-
 /** The name of the tool the chime decision is reported through. */
 export const CHIME_TOOL_NAME = "chime";
 
@@ -105,7 +102,7 @@ export async function decideChime(
           requestMessages,
           tools,
           signal,
-          { toolChoice: "auto", maxTokens: CHIME_MAX_TOKENS },
+          { toolChoice: "auto" },
         );
       } catch (err) {
         if (isInterruptedError(err) || isContextOverflowError(err)) throw err;

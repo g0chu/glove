@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Client, ChannelType, Collection, type Message, type GuildTextBasedChannel } from "discord.js";
 import { InterruptedError, LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
-import { CHIME_MAX_TOKENS } from "../src/bot/chime.js";
+import { CHIME_SYSTEM_PROMPT } from "../src/bot/chime.js";
 
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 async function ticks(): Promise<void> { for (let i = 0; i < 30; i++) await tick(); }
@@ -48,7 +48,8 @@ LlmClient.prototype.chat = async function (messages, _callbacks, _tools, signal,
   const hook = duringChat;
   duringChat = undefined;
   if (hook) return hook(signal);
-  if (options?.maxTokens === CHIME_MAX_TOKENS) {
+  if (messages.at(-1)?.role === "system" && messages.at(-1)?.content === CHIME_SYSTEM_PROMPT) {
+    assert.equal(options?.maxTokens, undefined, "chime decisions use the endpoint output limit");
     return { content: "", toolCalls: [{ id: `decision-${requests.length}`, name: "chime",
       arguments: JSON.stringify({ respond: chimeRespond, reason: "conversation settled" }) }] };
   }

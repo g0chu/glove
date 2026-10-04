@@ -92,7 +92,7 @@ export class InteractionReader {
   }
 
   /** Page newest requests first, with optional metadata search. */
-  list(query: string, before: number): { items: Omit<Interaction, "records">[]; next: number | null } {
+  list(query: string, before: number, limit = 100): { items: Omit<Interaction, "records">[]; next: number | null } {
     const page: Interaction[] = [];
     const search = query.toLowerCase();
     for (let i = this.ordered.length - 1; i >= 0; i--) {
@@ -100,9 +100,9 @@ export class InteractionReader {
       if (item.records[0].seq >= before ||
         !`${item.id} ${item.scope.channelId ?? ""} ${item.scope.purpose ?? "reply"} ${item.state}`.toLowerCase().includes(search)) continue;
       page.push(item);
-      if (page.length === 101) break;
+      if (page.length === limit + 1) break;
     }
-    const more = page.length > 100;
+    const more = page.length > limit;
     if (more) page.pop();
     return { items: page.map(({ records: _records, ...item }) => item),
       next: more ? page.at(-1)!.records[0].seq : null };
