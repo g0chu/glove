@@ -62,7 +62,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, contextToMessages, mergeDiscordHistory, prefixEndIndex, syncMessageUpdate, type ContextOptions, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, refreshChannelIdentity, contextToMessages, mergeDiscordHistory, prefixEndIndex, syncMessageUpdate, type ContextOptions, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn, type ToolRound } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -3494,7 +3494,7 @@ const ok = (name: string): void => {
   await ticks(3);
   assert.equal(dmMsgs.length, 3, "the activity message + the demoted slices");
   assert.match(dmMsgs[0].content, /^🤔 \*Thinking hard\. \(\d+s\)\*$/, "the activity message goes back to its settled lines (the text demoted out)");
-  assert.equal(dmMsgs[0].content.length + 1 + dmMsgs[1].content.length, 2000, "the first slice is budgeted exactly to the room the line left (stable across the demotion)");
+  assert.equal(dmMsgs[1].content.length, 2000, "standalone text uses the full message budget after demotion");
   assert.ok(dmMsgs[1].content.length + dmMsgs[2].content.length === 2500, "the demoted slices hold the whole round text");
   const pD = await wD.discard();
   await ticks(3);
@@ -3516,6 +3516,31 @@ const ok = (name: string): void => {
   const pDF = await wD.finish("Final.");
   assert.deepEqual(pDF!.messageIds, [], "the in-message reply is recorded without a backing message");
   ok("writer: a round text that outgrows the room demotes below it; the next round's lines open fresh");
+
+  // A nearly full activity message must not dictate standalone reply sizes.
+  const prose = "An upgrade doesn't move the standard — Scripture still judges my exegesis, not the reverse. So: corrections first.\n\n**1. I misquoted the Hebrew of Ps 139:12.** The MT reads:";
+  for (const streamed of [true, false]) {
+    const start = dmMsgs.length;
+    const writer = new ResponseWriter({ channel: dmChan as unknown as GuildTextBasedChannel, typingIntervalMs: 3_600_000, throttleMs: 0 });
+    writer.start();
+    await writer.appendActivityLines([`🔧 *${"x".repeat(1930)}*`]);
+    if (streamed) {
+      writer.chunk(prose.slice(0, 20));
+      await ticks(2);
+      writer.chunk(prose.slice(20));
+      await ticks(3);
+    }
+    const posted = await writer.finish(prose);
+    assert.equal(dmMsgs.length - start, 2, "one activity message and one complete prose message");
+    assert.equal(dmMsgs[start + 1].content, prose, "paragraph, whole words and bold heading survive demotion");
+    assert(!dmMsgs[start].content.includes("An upgrade"), "the partial inline preview is removed");
+    assert.deepEqual(posted!.messageIds, [dmMsgs[start + 1].id]);
+    assert.equal(posted!.chunks, undefined, "one standalone message needs no chunk array");
+    assert.equal(posted!.text, prose);
+    await writer.appendActivityLines(["🔧 *finished*"]);
+    assert.equal(dmMsgs.length - start, 2, "finished writers post nothing further");
+  }
+  ok("writer: small remaining activity room cannot fragment streamed or non-streamed prose");
 
   // The whole turn's UI lines share ONE activity message, in the order they
   // happened: each round's thinking terminal line, then that round's
@@ -6693,6 +6718,69 @@ const ok = (name: string): void => {
     assert.equal(recoverTurns(archive, store), 0, "recovery still happens once");
     ok("prompt prefix: crash recovery retains raw round/final text separately from formatted Discord delivery");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// Channel identity labels make a multi-channel chats.json unambiguous to tool readers.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-channel-identity-"));
+  const opts = { systemPrompt: "master", maxMessages: 10, enableImages: false, imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024 };
+  try {
+    const persistence = new ChatPersistence(path.join(dir, "chats.json"));
+    const archive = new ConversationArchive(path.join(dir, "archive"));
+    try {
+      const store = new ChannelContextStore((id, context) => {
+        persistence.save(id, context);
+        archive.record("context.checkpoint", { channelId: id }, context.serialize());
+      });
+      for (const [id, guildId, guildName, text] of [["101", "201", "Server A", "alpha history"], ["102", "202", "Server B", "beta history"]]) {
+        const context = store.get(id);
+        context.seeded = true;
+        context.pushUser("Alice", text, `message-${id}`, 1, []);
+        refreshChannelIdentity(context, { id, name: "general", guildId, guild: { name: guildName } } as GuildTextBasedChannel);
+        const request = await contextToMessages(context, opts);
+        assert.equal(request[0].content, "master", "the master prompt stays unchanged");
+        assert.equal(request[1].role, "system");
+        assert(String(request[1].content).includes(`channels["${id}"]`));
+        assert(String(request[1].content).includes(guildName));
+        assert.equal(request[2].content, `Alice: ${text}`);
+        assert.equal(prefixEndIndex(context, opts, `message-${id}`), 3, "identity is counted in trigger indices");
+        const restored = ChannelContext.restore(context.serialize());
+        assert.deepEqual(await contextToMessages(restored, opts), request);
+      }
+      await persistence.flush();
+      const saved = persistence.load();
+      assert.deepEqual(saved.get("101")!.channel, { id: "101", name: "general", guildId: "201", guildName: "Server A" });
+      assert.equal(saved.get("102")!.channel!.guildName, "Server B");
+      assert(!JSON.stringify(saved.get("101")).includes("beta history"));
+      assert(!JSON.stringify(saved.get("102")).includes("alpha history"));
+      const durable = archive.restoreContexts().get("101")!;
+      assert.deepEqual(durable.channel, saved.get("101")!.channel, "archive checkpoints carry the same identity");
+      const first = store.get("101");
+      first.setMeasuredTokens(500);
+      const epoch = first.getMeasurementEpoch();
+      refreshChannelIdentity(first, { id: "101", name: "renamed", guildId: "201", guild: { name: "Server A renamed" } } as GuildTextBasedChannel);
+      assert.equal(first.getMeasuredTokens(), null);
+      assert(first.getMeasurementEpoch() > epoch);
+      const revision = first.getRevision();
+      refreshChannelIdentity(first, { id: "101", name: "renamed", guildId: "201", guild: { name: "Server A renamed" } } as GuildTextBasedChannel);
+      assert.equal(first.getRevision(), revision, "unchanged labels do not mutate the prompt");
+      first.pushUser("Bob", "recent", "recent", 2, []);
+      await first.compact(1, async () => "older alpha summary", "recent");
+      assert.equal((await contextToMessages(first, opts))[1].role, "system", "identity survives compaction");
+      first.emergencyShrink("recent", 1, "", 10);
+      assert.equal(first.getChannelIdentity()!.name, "renamed");
+      first.reset();
+      assert.equal(first.length, 0);
+      assert.equal(first.getChannelIdentity()!.name, "renamed", "clear resets history, not channel ownership");
+      const mismatch = new ChannelContextStore();
+      mismatch.restore("102", saved.get("101")!);
+      assert.equal(mismatch.get("102").getChannelIdentity(), undefined, "a mismatched stored identity cannot override its enclosing key");
+      const legacy = { ...saved.get("101")!, channel: undefined };
+      assert.equal(ChannelContext.restore(legacy).getChannelIdentity(), undefined, "legacy stores remain readable");
+      assert.equal(ChannelContext.restore(legacy).length, 1);
+      ok("channel identity: duplicate names, file/archive persistence, prompt indices, renames, compaction, clear and legacy restore");
+    } finally { archive.close(); }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
 // Unified chime history retains the exact decision request prefix and complete groups.

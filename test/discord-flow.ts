@@ -62,7 +62,7 @@ let postedId = 0;
 let pageHook: (() => Promise<void>) | undefined;
 let oneHook: (() => Promise<void>) | undefined;
 const channel = {
-  id: "channel", guildId: "guild", guild: { id: "guild" }, type: ChannelType.GuildText,
+  id: "channel", name: "general", guildId: "guild", guild: { id: "guild", name: "Test Server" }, type: ChannelType.GuildText,
   isTextBased: () => true,
   sendTyping: async () => {},
   messages: {
@@ -181,6 +181,12 @@ async function run(): Promise<void> {
     await advance(1);
     assert.equal(requests.length, 1, "only the newest ambient trigger decides after stillness");
     assert(prompt().includes("first ambient message"));
+    assert.equal(requests[0][0].role, "system");
+    assert(String(requests[0][1].content).includes('channels["channel"]'));
+    assert(String(requests[0][1].content).includes('"name":"general"'));
+    assert(String(requests[0][1].content).includes('"guildName":"Test Server"'));
+    const savedChannel = JSON.parse(fs.readFileSync(path.join(process.cwd(), "chats.json"), "utf8")).channels.channel.channel;
+    assert.deepEqual(savedChannel, { id: "channel", name: "general", guildId: "guild", guildName: "Test Server" });
     assert(prompt().includes("other-bot (bot): newest ambient message"));
     assert(entries().some((e) => e.content.includes("conversation settled")), "completed NO exchange is retained");
     assert(!entries().some((e) => e.content.startsWith("🔕")), "NO delivery is UI only");

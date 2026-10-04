@@ -121,6 +121,10 @@ without the affected tensor/MTP combination.
   across the boundary).
 - **Formatting:** any math the model emits as `$...$` LaTeX is rewritten
   to plain Unicode before posting (Discord renders markdown but not LaTeX).
+- **Reply overflow:** text that outgrows the activity message moves below it
+  and uses the full 2000-character budget per standalone message. A nearly full
+  activity message cannot force a short paragraph into tiny posts. The inline
+  preview is removed when the text moves, preserving the message order.
 - **Queue:** one turn per channel at a time. Mentions that arrive while a
   reply is generating are queued and answered in order. Non-mentions on
   their own never trigger a reply, but they are part of the context.
@@ -250,6 +254,16 @@ See [.env.example](.env.example) for the documented list.
 | `npm test` | smoke tests (config, history, chunking, queue, writer, tool loop, in-process web/file/shell/zim tools, LLM client incl. tool calls vs. a mock endpoint) |
 
 ### Shared prompts and caching
+
+Channel histories in `chats.json` remain keyed by Discord channel ID. Each
+history also records a `channel` object with its `id`, `name`, `guildId`, and
+`guildName`. IDs determine ownership; names are labels and may repeat across
+servers. Replies, chime decisions and compaction receive this current identity
+as a separate system message, including the exact `channels["ID"]` key to use
+when reading the store through tools. Other stored histories remain separate
+conversations. Renames refresh labels, while clear/compaction preserve identity.
+Older stores are supported; metadata is populated when Discord channels are
+observed again after startup.
 
 Replies, chime decisions and compaction share `MODEL_SYSTEM_PROMPT` unchanged.
 No tool guidance or phase instructions are added to that master prompt.

@@ -452,6 +452,8 @@ export class ResponseWriter {
   private pendingDropped = 0;
   /** The current activity message (null until its first line/preview lands). */
   private activityMessage: Message | null = null;
+  /** Last successful activity delivery, independent of Discord's cached object. */
+  private activityContent = "";
   /**
    * True once a message was posted below the activity message (a round
    * text that outgrew it, demoted to its own message): later lines open a
@@ -468,9 +470,8 @@ export class ResponseWriter {
   private textMode: "none" | "activity" | "own" = "none";
   /**
    * The cap of the text block's first slice: the room the settled blocks
-   * left at stream start (the same cap is used at settle, so the slice
-   * boundaries stay stable across the demotion), or 2000 when the block is
-   * its own message from the start.
+   * left at stream start, or 2000 once the block moves to its own messages.
+   * Demotion resets the cap before any standalone slices are posted.
    */
   private textFirstCap = DISCORD_MAX_MESSAGE_CHARS;
   /**
@@ -818,6 +819,7 @@ export class ResponseWriter {
   private async openActivity(content: string, blocks: string[], dropped: number): Promise<void> {
     try {
       this.activityMessage = await this.opts.channel.send({ content, allowedMentions: SAFE_MENTIONS });
+      this.activityContent = content;
       this.activityStale = false;
       this.blocks = blocks;
       this.droppedLines = dropped;
@@ -837,8 +839,9 @@ export class ResponseWriter {
     const m = this.activityMessage;
     if (!m) return;
     try {
-      if (m.content !== content) {
+      if (this.activityContent !== content) {
         await m.edit({ content, allowedMentions: SAFE_MENTIONS });
+        this.activityContent = content;
       }
     } catch (err) {
       log.warn(`failed to update the activity message: ${errMsg(err)}`);
@@ -990,18 +993,15 @@ export class ResponseWriter {
       if (this.textMode === "own" && this.activityMessage !== null) {
         await this.syncActivity(this.renderBlocks());
       }
-      const chunks = splitForDiscord(text, DISCORD_MAX_MESSAGE_CHARS, this.textFirstCap);
+      let chunks = splitForDiscord(text, DISCORD_MAX_MESSAGE_CHARS, this.textFirstCap);
       if (this.textMode === "activity" && chunks.length > 1) {
-        // The text outgrew the activity message's room: demote — the first
-        // slice is final, so it moves out into its own message (the channel
-        // order: the activity message, then the text's slices), and the
-        // block continues in its own live message(s) (the record keeps the
-        // message ids: the seed and the edit/delete sync stay correct).
+        // Once outside the activity message, use the full Discord budget.
+        // Its leftover room must not fragment a short paragraph into tiny posts.
         if (this.activityMessage !== null) await this.syncActivity(this.renderBlocks());
-        const first = await this.opts.channel.send({ content: chunks[0], allowedMentions: SAFE_MENTIONS });
-        this.textSlices = [first, ...this.textSlices];
+        this.textFirstCap = DISCORD_MAX_MESSAGE_CHARS;
+        chunks = splitForDiscord(text);
         this.textMode = "own";
-        this.activityStale = true; // a message now sits below the activity message
+        this.activityStale = true;
       }
       if (this.textMode === "activity") {
         // No overflow: the first slice grows inside the activity message.
@@ -1041,7 +1041,7 @@ export class ResponseWriter {
    * own-message settle posted nothing).
    */
   private async settleText(text: string): Promise<PostedReply | null> {
-    const chunks = splitForDiscord(text, DISCORD_MAX_MESSAGE_CHARS, this.textFirstCap);
+    let chunks = splitForDiscord(text, DISCORD_MAX_MESSAGE_CHARS, this.textFirstCap);
     if (this.textMode === "activity") {
       if (chunks.length === 1) {
         this.blocks.push(chunks[0]);
@@ -1054,6 +1054,8 @@ export class ResponseWriter {
       // final settle, not during the stream): strip the tail out and settle
       // the text in its own message(s).
       if (this.activityMessage !== null) await this.syncActivity(this.renderBlocks());
+      this.textFirstCap = DISCORD_MAX_MESSAGE_CHARS;
+      chunks = splitForDiscord(text);
     }
     const landed = await this.settleSlices(chunks);
     if (this.activityMessage !== null) this.activityStale = true;

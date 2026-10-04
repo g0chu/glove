@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, prefixEndIndex, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
+import { buildChannelContext, refreshChannelIdentity, prefixEndIndex, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
 import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
 import { chimeReplyChat, replyPhaseInstruction } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
@@ -157,6 +157,7 @@ async function main(): Promise<void> {
     ensureCatchupBoundary(channel.id);
     const task = (async (): Promise<void> => {
       const context = contexts.get(channel.id);
+      refreshChannelIdentity(context, channel);
       const retainedIds = context.snapshot().flatMap((e) => e.ids);
       const after = catchupBoundaries.get(channel.id) ?? null;
       const observations = new Map<string, Message>();
@@ -824,6 +825,7 @@ async function main(): Promise<void> {
     const channelId = message.channel?.id;
     if (!channelId) return; // the channel vanished while the message was pending
     if (!message.author) return;
+    refreshChannelIdentity(contexts.get(channelId), message.channel as GuildTextBasedChannel);
     archiveMessage(message, "stable");
     if (!message.author.bot && isClearCommand(message.content, botId)) {
       archive.record("context.cleared", { channelId, messageId: message.id }, { authorId: message.author.id });
@@ -1144,6 +1146,21 @@ async function main(): Promise<void> {
       }
       gate.drop(m.id);
       conv?.removeById(m.id);
+    }
+  });
+
+  // Renames change identity labels, not history ownership or message order.
+  client.on("channelUpdate", (_oldChannel, channel) => {
+    if (stopping || channel.type !== ChannelType.GuildText || !contexts.has(channel.id)) return;
+    refreshChannelIdentity(contexts.get(channel.id), channel);
+    channelActivity.note(channel.id);
+  });
+  client.on("guildUpdate", (_oldGuild, guild) => {
+    if (stopping) return;
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.type !== ChannelType.GuildText || !contexts.has(channel.id)) continue;
+      refreshChannelIdentity(contexts.get(channel.id), channel);
+      channelActivity.note(channel.id);
     }
   });
 

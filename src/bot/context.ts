@@ -4,6 +4,7 @@ import type { ChatMessage, ContentPart } from "../llm/client.js";
 import { attachmentIdentity, InterruptedError } from "../llm/client.js";
 import {
   compareDiscordIds,
+  channelIdentityPrompt,
   COMPACTION_SYSTEM_PROMPT,
   speakerLabel,
   type ChannelContext,
@@ -118,6 +119,17 @@ export interface ContextOptions {
  */
 const BOT_UI_RE = /^(?:🤔|🔎|📁|🐚|🔧|📚|🗃|🧹|🔕) \*/;
 
+/** Record current Discord labels so prompts and chats.json can identify this history. */
+export function refreshChannelIdentity(context: ChannelContext, channel: GuildTextBasedChannel): void {
+  if (typeof channel.id !== "string" || typeof channel.guildId !== "string") return;
+  context.setChannelIdentity({
+    id: channel.id,
+    name: "name" in channel && typeof channel.name === "string" ? channel.name : null,
+    guildId: channel.guildId,
+    guildName: typeof channel.guild?.name === "string" ? channel.guild.name : null,
+  });
+}
+
 /**
  * Build the `messages` array for a turn from the channel's persistent
  * context. A context without the seed yet gets one live fetch of the
@@ -140,6 +152,7 @@ export async function buildChannelContext(
   opts: ContextOptions,
 ): Promise<ChatMessage[] | null> {
   if (!context.has(mentionId)) return null; // deleted before its turn ran
+  refreshChannelIdentity(context, channel);
   if (!context.seeded) {
     const revision = context.getRevision();
     const seed = await seedMessages(channel, opts.maxMessages);
@@ -274,6 +287,7 @@ export function prefixEndIndex(
   const idx = typeof entryId === "number" ? entryId - 1 : entries.findIndex((e) => e.ids.includes(entryId));
   if (idx === -1) return null;
   let n = opts.systemPrompt.trim().length > 0 ? 1 : 0;
+  if (context.getChannelIdentity()) n++;
   const summary = context.getSummary();
   if (summary && summary.trim().length > 0) n += 1;
   for (let i = 0; i <= idx; i++) {
@@ -370,6 +384,8 @@ export async function contextToMessages(
 ): Promise<ChatMessage[]> {
   const out: ChatMessage[] = [];
   if (opts.systemPrompt.trim().length > 0) out.push({ role: "system", content: opts.systemPrompt });
+  const channel = context.getChannelIdentity();
+  if (channel) out.push({ role: "system", content: channelIdentityPrompt(channel) });
   const summary = context.getSummary();
   if (summary && summary.trim().length > 0) {
     out.push({
