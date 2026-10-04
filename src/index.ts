@@ -3,9 +3,9 @@ import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
+import { buildChannelContext, prefixEndIndex, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
 import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
-import { chimeReplyChat } from "./bot/chime-reply.js";
+import { chimeReplyChat, replyPhaseInstruction } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { MessageObservations } from "./bot/observations.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
@@ -632,8 +632,16 @@ async function main(): Promise<void> {
           }
           if (!context.has(turn.id)) return;
           writer.start();
-          const runModel = (msgs: Parameters<typeof runToolTurn>[0]): Promise<ToolTurnOutcome> =>
-            runToolTurn(msgs, {
+          const runModel = (msgs: Parameters<typeof runToolTurn>[0]): Promise<ToolTurnOutcome> => {
+            // Scope every reply attempt explicitly, including overflow rebuilds.
+            // Keep this instruction transient: completed decision exchanges stay
+            // intact in history, while the current phase never becomes stale history.
+            const triggerEnd = prefixEndIndex(context, ctxOpts, turn.id);
+            if (triggerEnd === null) throw new InterruptedError();
+            const replyMessages: ChatMessage[] = cfg.discord.chimeEnabled
+              ? [...msgs, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) }]
+              : msgs;
+            return runToolTurn(replyMessages, {
               chat: replyChat,
               registry: tools.registry,
               maxRounds: Math.max(0, cfg.tools.maxRounds - retainedToolRounds),
@@ -661,6 +669,7 @@ async function main(): Promise<void> {
                 rounds.push(round);
               },
             });
+          };
           let outcome: ToolTurnOutcome;
           try {
             outcome = await runModel(messages);

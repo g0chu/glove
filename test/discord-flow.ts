@@ -184,6 +184,18 @@ async function run(): Promise<void> {
     assert(prompt().includes("other-bot (bot): newest ambient message"));
     assert(entries().some((e) => e.content.includes("conversation settled")), "completed NO exchange is retained");
     assert(!entries().some((e) => e.content.startsWith("🔕")), "NO delivery is UI only");
+    create("250", "<@bot> answer after NO");
+    await advance(200);
+    assert.equal(requests.length, 2, "a mention after NO bypasses the decision gate");
+    const noMention = requests.at(-1)!;
+    assert(noMention.some((m) => typeof m.content === "string" && m.content.includes("Stay silent for this message")));
+    assert.equal(noMention.at(-1)?.role, "system");
+    assert(String(noMention.at(-1)?.content).includes("reply phase for Discord message 250"));
+    assert(String(noMention.at(-1)?.content).includes("directly mentions the bot and requires a reply"));
+    assert(String(noMention.at(-1)?.content).includes("apply only to their earlier decision phases and messages"));
+    const triggerIndex = Number(String(noMention.at(-1)?.content).match(/message index (\d+)/)![1]);
+    assert(String(noMention[triggerIndex].content).includes("@Glove answer after NO"));
+    assert(!entries().some((e) => e.content.startsWith("This request is in the reply phase")), "reply instruction is transient");
     duringChat = async (signal) => {
       const ambient = history.get("200")!;
       edit(ambient, "edited during chime decision");
@@ -193,15 +205,55 @@ async function run(): Promise<void> {
     chimeRespond = true;
     create("300", "another ambient trigger");
     await advance(200);
-    assert.equal(requests.length, 2, "the interrupted decision produces no reply");
+    assert.equal(requests.length, 3, "the interrupted decision produces no reply");
     await advance(200);
-    assert.equal(requests.length, 4, "a fresh YES decision runs one reply");
+    assert.equal(requests.length, 5, "a fresh YES decision runs one reply");
     assert(prompt().includes("edited during chime decision"));
     assert(!prompt().includes("🔕"));
     create("400", "<@bot> mention always answers");
     await advance(200);
-    assert.equal(requests.length, 5, "mentions bypass the chime decision");
+    assert.equal(requests.length, 6, "mentions bypass the chime decision");
     assert(!prompt().includes("🔕"));
+    duringChat = async () => {
+      // Accept YES, then interrupt its reply with a newer direct mention.
+      duringChat = async (signal) => {
+        create("600", "<@bot> answer after interrupted YES");
+        assert(signal?.aborted);
+        throw new InterruptedError();
+      };
+      return { content: "", toolCalls: [{ id: "interrupted-yes", name: "chime", arguments: '{"respond":true,"reason":"reply warranted"}' }] };
+    };
+    create("500", "ambient before interrupted YES");
+    await advance(200);
+    assert.equal(requests.length, 8, "YES enters reply before being interrupted");
+    assert(String(requests.at(-1)?.at(-1)?.content).includes("reply phase for Discord message 500"));
+    await advance(200);
+    assert.equal(requests.length, 9, "newer mention supersedes interrupted chime without a decision call");
+    const afterYes = requests.at(-1)!;
+    assert(afterYes.some((m) => m.toolCalls?.some((call) => call.id === "interrupted-yes")), "completed YES stays in history");
+    assert(String(afterYes.at(-1)?.content).includes("reply phase for Discord message 600"));
+    assert(String(afterYes.at(-1)?.content).includes("directly mentions the bot and requires a reply"));
+    assert(!entries().some((e) => e.content.startsWith("This request is in the reply phase")));
+    duringChat = async () => {
+      duringChat = async (signal) => {
+        client.emit("typingStart", { channel, user: { id: "human" } } as never);
+        assert(signal?.aborted);
+        throw new InterruptedError();
+      };
+      return { content: "", toolCalls: [{ id: "retry-yes", name: "chime", arguments: '{"respond":true,"reason":"continue"}' }] };
+    };
+    create("700", "ambient reply interrupted by typing");
+    await advance(200);
+    assert.equal(requests.length, 11);
+    await advance(200);
+    assert.equal(requests.length, 13, "typing interruption retries the YES turn over retained history");
+    const retriedYes = requests.at(-1)!;
+    assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")));
+    assert(String(retriedYes.at(-1)?.content).includes("reply phase for Discord message 700"));
+    assert(String(retriedYes.at(-1)?.content).includes("chime decision for this message is complete and allows a reply"));
+    assert.equal(retriedYes.filter((m) => String(m.content).startsWith("This request is in the reply phase")).length, 1,
+      "retry gets one fresh instruction, without accumulating earlier attempt instructions");
+    assert(!entries().some((e) => e.content.startsWith("This request is in the reply phase")));
     process.emit("SIGTERM");
     return;
   }

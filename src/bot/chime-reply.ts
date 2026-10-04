@@ -5,6 +5,17 @@ import { isContextOverflowError } from "../llm/context.js";
 import { log } from "../log.js";
 import { CHIME_TOOL_NAME, chimeTools } from "./chime.js";
 
+/** Transient instruction for the current reply, appended after the shared history. */
+export function replyPhaseInstruction(triggerId: string, messageIndex: number, directMention: boolean): string {
+  return `This request is in the reply phase for Discord message ${triggerId}, at message index ${messageIndex} (zero-based) in this request. ` +
+    (directMention
+      ? "This message directly mentions the bot and requires a reply; do not make another respond-or-stay-silent decision. "
+      : "The chime decision for this message is complete and allows a reply; continue answering. ") +
+    "Previous chime decision instructions and decisions apply only to their earlier decision phases and messages. " +
+    "They do not forbid answering this request. Answer the triggering message using the updated conversation above, including later activity and completed tool results. " +
+    "Use tools if needed. A chime call during this reply only acknowledges the call and does not stop the reply.";
+}
+
 /**
  * Advertise the shared schemas; chime calls use the registered reply handler
  * and remain in the executable loop and its history. Wrap an archived/token-counted

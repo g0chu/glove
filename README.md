@@ -272,6 +272,15 @@ whole, preserving call/result pairing. Interrupted or unusable decisions are
 not retained. Unusable decisions still get one repair with unchanged schemas
 and `tool_choice: "auto"`.
 
+Each reply with chime enabled appends a fresh system instruction identifying
+its triggering Discord message and the message's index in that request. A direct
+mention requires a reply immediately; a YES turn continues its accepted decision.
+The instruction scopes historical chime instructions and decisions to their
+earlier phases, so a previous NO does not silence a later mention. It is transient:
+it stays with the current tool loop, is rebuilt for interruption/overflow retries,
+and never becomes a persistent conversation entry. Decision history and the shared
+request prefix remain intact.
+
 During replies, chime is a registered local tool. Its call and result are
 retained with any other calls in the round, including mixed responses. The
 result tells the model to continue the reply already underway; mentions always
