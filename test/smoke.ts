@@ -6929,6 +6929,37 @@ const ok = (name: string): void => {
     `).runInNewContext(browser);
     assert.equal(phaseGroup("tools").open, false, "interrupted tool output also settles and collapses");
     assert.equal(phaseGroup("failure").open, false, "finished error output is collapsible too");
+    assert.ok(html.includes('id="collapse" type="checkbox" checked'), "auto-collapse is enabled by default");
+    element("collapse").checked = false;
+    new Script("$('collapse').onchange()").runInNewContext(browser);
+    assert.ok(element("entries").querySelectorAll("details").every(n => n.open), "disabling auto-collapse expands automatically collapsed blocks immediately");
+    new Script(`
+      phaseGroup('tools').children[0].onclick(); phaseGroup('tools').open = false;
+      phaseGroup('reasoning').children[0].onclick(); phaseGroup('reasoning').open = true;
+    `).runInNewContext(browser);
+    element("collapse").checked = true;
+    new Script("$('collapse').onchange()").runInNewContext(browser);
+    assert.equal(phaseGroup("tools").open, false, "manually closed blocks stay closed when toggling");
+    assert.equal(phaseGroup("reasoning").open, true, "manually opened blocks stay open when toggling");
+    assert.equal(phaseGroup("failure").open, false, "reenabling auto-collapse folds completed blocks without manual choices");
+    element("collapse").checked = false;
+    new Script(`
+      const toggleStream = fixture('toggle-stream', [{ type: 'model.progress', data: { content: '', reasoning: 'Thinking', toolCalls: [] } }], 'pending', 1);
+      items = [toggleStream]; details.set(toggleStream.id, toggleStream); rendered.clear(); renderFeed();
+      toggleStream.events.push({ type: 'model.progress', data: { content: 'Answering', reasoning: '', toolCalls: [{ index: 0, id: 'a', name: 'web_search', arguments: '{}' }] } });
+      toggleStream.updated++; renderFeed();
+    `).runInNewContext(browser);
+    assert.equal(phaseGroup("reasoning").open, true, "disabled auto-collapse keeps reasoning open when response generation begins");
+    new Script(`
+      toggleStream.events.push({ type: 'model.finished', data: { content: 'Finished answer', reasoning: 'Thinking', toolCalls: [{ id: 'a', name: 'web_search', arguments: '{}' }] } });
+      toggleStream.state = 'finished'; toggleStream.updated++; renderFeed();
+    `).runInNewContext(browser);
+    assert.equal(phaseGroup("tools").open, true, "disabled auto-collapse keeps tool blocks open on completion");
+    assert.ok(element("entries").querySelectorAll("section").some(n => n.dataset.kind === "response" && visibleText(n).includes("Finished answer")));
+    element("collapse").checked = true;
+    new Script("$('collapse').onchange()").runInNewContext(browser);
+    assert.equal(phaseGroup("reasoning").open, false);
+    assert.equal(phaseGroup("tools").open, false, "reenabling auto-collapse immediately applies to completed blocks");
     new Script(`items = [first]; rendered.clear(); renderFeed();`).runInNewContext(browser);
 
     const initialWindow = new Script(`promptMessages(fixture('window', [{ type: 'model.request', data: { messages: [

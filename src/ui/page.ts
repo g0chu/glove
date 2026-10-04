@@ -40,7 +40,7 @@ details{margin:10px 0}summary{cursor:pointer;color:var(--muted);font-size:12px}
 @media(max-width:600px){header,.controls,footer{padding:12px 16px}#feed{padding:14px 16px}#search{max-width:none;min-width:0;flex-basis:100%}.controls{gap:10px}header .muted{display:none}}
 </style></head><body>
 <header><h1>Glove <span>/ API Inspector</span></h1><span class="muted">One continuous conversation feed</span><span id="connection" role="status">Connecting…</span></header>
-<div class="controls"><input id="search" type="search" aria-label="Filter feed" placeholder="Filter channel, purpose, status…"><label><input id="live" type="checkbox" checked>Live updates</label><label><input id="follow" type="checkbox" checked>Auto-scroll</label><label><input id="prompts" type="checkbox">Full prompts</label><button id="refresh" type="button">Refresh</button><button id="copy" type="button">Copy feed</button><button id="save" type="button">Save text</button></div>
+<div class="controls"><input id="search" type="search" aria-label="Filter feed" placeholder="Filter channel, purpose, status…"><label><input id="live" type="checkbox" checked>Live updates</label><label><input id="follow" type="checkbox" checked>Auto-scroll</label><label><input id="collapse" type="checkbox" checked>Auto-collapse</label><label><input id="prompts" type="checkbox">Full prompts</label><button id="refresh" type="button">Refresh</button><button id="copy" type="button">Copy feed</button><button id="save" type="button">Save text</button></div>
 <div id="error" class="error" role="alert" hidden></div>
 <main id="feed" tabindex="0" aria-label="Conversation feed"><div id="more-wrap" hidden><button id="more" type="button">Load earlier history</button></div><div id="entries"></div><div id="empty" class="empty">Loading conversation history…</div></main>
 <footer><span id="count">No interactions loaded</span><span id="position" role="status">Following latest</span><button id="bottom" type="button">↓ Jump to bottom</button></footer>
@@ -70,9 +70,11 @@ function group(kind, title, body, key, complete = true) {
     if (collapsible) {
         root.dataset.key = key || kind;
         root.dataset.complete = String(complete);
-        root.open = !complete;
+        root.open = !$('collapse').checked || !complete;
+        root.dataset.autoOpen = String(root.open);
     }
     const label = node(collapsible ? 'summary' : 'h3', title, 'group-title');
+    if (collapsible) label.onclick = () => { root.dataset.manual = 'true'; };
     const content = node('div', undefined, 'group-body');
     content.append(body);
     root.append(label, content);
@@ -227,17 +229,22 @@ function renderFeed(older = false, incoming = 0) {
         const detail = details.get(item.id);
         if (!detail) continue;
         const channel = detail.scope.channelId || '', previous = previousByChannel.get(channel);
-        const key = detail.updated + ':' + (previous?.id || '') + ':' + (previous?.updated || '') + ':' + $('prompts').checked;
+        const key = detail.updated + ':' + (previous?.id || '') + ':' + (previous?.updated || '') + ':' + $('prompts').checked + ':' + $('collapse').checked;
         let entry = rendered.get(item.id);
         if (!entry || entry.key !== key) {
             const root = drawEntry(detail, previous);
             if (entry) {
                 const expanded = new Map(Array.from(entry.root.querySelectorAll('details')).map(d =>
-                    [d.dataset.key, { open: d.open, complete: d.dataset.complete }]));
+                    [d.dataset.key, { open: d.open, complete: d.dataset.complete,
+                        manual: d.dataset.manual === 'true' || d.open !== (d.dataset.autoOpen === 'true') }]));
                 for (const d of root.querySelectorAll('details')) {
                     const previous = expanded.get(d.dataset.key);
-                    // Collapse once at completion, then preserve manual reopening.
-                    if (previous && !(d.dataset.complete === 'true' && previous.complete !== 'true')) d.open = previous.open;
+                    const completedNow = previous && d.dataset.complete === 'true' && previous.complete !== 'true';
+                    // Apply automatic state on completion/toggle changes; retain manual choices otherwise.
+                    if (previous?.manual && !($('collapse').checked && completedNow)) {
+                        d.open = previous.open;
+                        d.dataset.manual = 'true';
+                    }
                 }
             }
             entry = { key, root };
@@ -323,6 +330,7 @@ $('feed').onscroll = position;
 $('bottom').onclick = jumpToBottom;
 $('follow').onchange = () => { if ($('follow').checked) jumpToBottom(); else position(); };
 $('prompts').onchange = () => renderFeed();
+$('collapse').onchange = () => renderFeed();
 $('more').onclick = () => refresh(true);
 $('refresh').onclick = () => refresh();
 $('search').oninput = () => {
