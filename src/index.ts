@@ -1115,7 +1115,7 @@ async function main(): Promise<void> {
     const channel = typing.channel;
     if (channel.type !== ChannelType.GuildText) return; // text channels only, DMs never
     if (cfg.discord.guildId !== "" && channel.guild?.id !== cfg.discord.guildId) return;
-    channelActivity.note(channel.id);
+    channelActivity.noteTyping(channel.id);
   });
 
   // Deletions: drop the still-pending message (it never committed, so there

@@ -176,7 +176,7 @@ async function run(): Promise<void> {
     create("200", "newest ambient message", "other-bot");
     await advance(100);
     client.emit("typingStart", { channel, user: { id: "human" } } as never);
-    await advance(199);
+    await advance(9999);
     assert.equal(requests.length, 0);
     await advance(1);
     assert.equal(requests.length, 1, "only the newest ambient trigger decides after stillness");
@@ -251,7 +251,9 @@ async function run(): Promise<void> {
     create("700", "ambient reply interrupted by typing");
     await advance(200);
     assert.equal(requests.length, 11);
-    await advance(200);
+    await advance(9999);
+    assert.equal(requests.length, 11, "no retry while the typing indicator is active");
+    await advance(1);
     assert.equal(requests.length, 13, "typing interruption retries the YES turn over retained history");
     const retriedYes = requests.at(-1)!;
     assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")));
@@ -388,7 +390,7 @@ async function run(): Promise<void> {
   create("1500", "<@bot> newest queued question");
   await advance(100);
   client.emit("typingStart", { channel, user: { id: "human" } } as never);
-  await advance(199);
+  await advance(9999);
   assert.equal(requests.length, 8);
   await advance(1);
   assert.equal(requests.length, 9, "a burst of mentions produces one answer over the full prompt");

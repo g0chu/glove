@@ -26,6 +26,7 @@ export interface ActivityOptions {
  */
 export class ChannelActivity {
   private readonly lastActivity = new Map<string, number>();
+  private readonly typingUntil = new Map<string, number>();
   private readonly watchers = new Map<string, Set<(mention: boolean) => void>>();
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
@@ -43,6 +44,12 @@ export class ChannelActivity {
       // Iterate over a copy: a watcher may unsubscribe itself while firing.
       for (const w of [...ws]) w(mention);
     }
+  }
+
+  /** Record typing, which Discord displays for ten seconds after each event. */
+  noteTyping(channelId: string): void {
+    this.typingUntil.set(channelId, this.now() + 10_000);
+    this.note(channelId);
   }
 
   /**
@@ -67,7 +74,8 @@ export class ChannelActivity {
 
   /**
    * Wait for the channel to go quiet: resolve once there has been no
-   * activity for `quietMs` after the most recent one (activity while
+   * activity for `quietMs` after the most recent one and all typing indicators
+   * have expired (activity while
    * waiting restarts the window). A channel with no recorded activity is
    * already quiet.
    */
@@ -75,7 +83,8 @@ export class ChannelActivity {
     for (;;) {
       const last = this.lastActivity.get(channelId);
       if (last === undefined) return; // nothing seen: already quiet
-      const waitMs = last + quietMs - this.now();
+      const deadline = Math.max(last + quietMs, this.typingUntil.get(channelId) ?? 0);
+      const waitMs = deadline - this.now();
       if (waitMs > 0) await this.sleep(waitMs);
       if (this.lastActivity.get(channelId) === last) return; // quiet for the window
     }
@@ -84,12 +93,14 @@ export class ChannelActivity {
   /** Forget a channel (it was deleted): its state and watchers are gone. */
   clearChannel(channelId: string): void {
     this.lastActivity.delete(channelId);
+    this.typingUntil.delete(channelId);
     this.watchers.delete(channelId);
   }
 
   /** Forget everything (shutdown). */
   clear(): void {
     this.lastActivity.clear();
+    this.typingUntil.clear();
     this.watchers.clear();
   }
 }

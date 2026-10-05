@@ -375,7 +375,9 @@ newest message's decision; ambient messages do not cancel an unanswered mention.
 The stability gate commits pending messages in Discord snowflake order within each channel. A newer stable mention waits for earlier pending messages to finish stabilizing, so their final content precedes it in the prompt. Other channels remain independent. Deleting an earlier pending message releases stable messages behind it; clearing a channel or shutting down discards all its pending messages.
 
 Before each mention or chime attempt, the bot waits for `DISCORD_MESSAGE_STABLE_MS`
-without messages, edits, deletions, or typing from other users/bots. It then fetches
+without messages, edits, deletions, or typing from other users/bots. Typing also
+holds the channel busy for ten seconds after its latest event, until the Discord
+typing indicator expires, even with a shorter stability window. It then fetches
 fresh Discord history, paginating new-message gaps and reconciling the latest 100
 tracked user messages for edits and confirmed deletions. Activity during the fetch
 discards that snapshot; discovered changes restart the quiet wait before rebuilding
