@@ -131,6 +131,26 @@ async function run(): Promise<void> {
   await ticks();
   assert(client);
   client.channels.cache.set(channel.id, channel);
+  if (process.env.FLOW_MODE === "chime-off") {
+    now += 100_000;
+    assert(entries().some((entry) => entry.content.includes("Stay silent for this message")), "restart retains old NO instructions");
+    for (const entry of entries()) {
+      for (const id of entry.ids) history.set(id, makeMessage(id, entry.content, entry.content.startsWith("answer") ? "bot" : "human"));
+    }
+    create("900", "<@bot> reply with chime disabled");
+    await advance(200);
+    assert.equal(requests.length, 1, "disabled chime makes only a reply call");
+    const reply = requests[0];
+    assert(reply.some((message) => String(message.content).includes("Stay silent for this message")), "historical decisions remain intact");
+    const instruction = String(reply.at(-1)?.content);
+    assert(instruction.includes("reply phase for Discord message 900"));
+    assert(instruction.includes("directly mentions the bot and requires a reply"));
+    const triggerIndex = Number(instruction.match(/message index (\d+)/)![1]);
+    assert(String(reply[triggerIndex].content).includes("@Glove reply with chime disabled"));
+    assert(!entries().some((entry) => entry.content.startsWith("This request is in the reply phase")), "phase instructions remain transient with chime disabled");
+    process.emit("SIGTERM");
+    return;
+  }
   if (process.env.FLOW_MODE === "restart") {
     now += 100_000;
     for (const entry of entries()) {

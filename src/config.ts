@@ -30,7 +30,7 @@ export interface DiscordConfig {
   chimeEnabled: boolean;
   /** Post chime NO decisions to Discord. */
   showChimeNo: boolean;
-  /** Custom chime system prompt; empty uses the built-in prompt. */
+  /** Custom decision guidance, followed by mandatory chime phase instructions. */
   chimePrompt: string;
 }
 
@@ -67,7 +67,7 @@ export interface ModelConfig {
   compactionAuto: boolean;
   /** How many of the newest messages survive a compaction verbatim. */
   compactionKeepMessages: number;
-  /** Custom summarization system prompt; empty uses the built-in prompt. */
+  /** Custom summary guidance, followed by mandatory summarization phase instructions. */
   compactionPrompt: string;
   /**
    * When true, the bot uses the model side's own tokenizer counts: the

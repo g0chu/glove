@@ -639,9 +639,11 @@ async function main(): Promise<void> {
             // intact in history, while the current phase never becomes stale history.
             const triggerEnd = prefixEndIndex(context, ctxOpts, turn.id);
             if (triggerEnd === null) throw new InterruptedError();
-            const replyMessages: ChatMessage[] = cfg.discord.chimeEnabled
-              ? [...msgs, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) }]
-              : msgs;
+            // Historical decisions can survive disabling chime between restarts.
+            // Always identify the current reply phase so an old NO cannot suppress it.
+            const replyMessages: ChatMessage[] = [
+              ...msgs, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) },
+            ];
             return runToolTurn(replyMessages, {
               chat: replyChat,
               registry: tools.registry,

@@ -94,7 +94,7 @@ export interface ContextOptions {
   maxTokens: number;
   /** How many of the newest messages survive a compaction verbatim. */
   keepMessages: number;
-  /** Trailing summarization system instruction; empty uses the built-in prompt. */
+  /** Custom summary guidance, followed by mandatory phase and boundary instructions. */
   compactionPrompt?: string;
   /** One chat call over the unchanged active context plus a system instruction (production: the same model endpoint). */
   summarize: (messages: ChatMessage[]) => Promise<string>;
@@ -195,9 +195,13 @@ export async function buildChannelContext(
       // Render exactly as a reply: keep roles, reasoning, tool pairs and attachments.
       const boundary = prefixEndIndex(context, opts, older.length);
       const active = await contextToMessages(context, opts);
+      const custom = opts.compactionPrompt?.trim();
+      const instruction = custom
+        ? `Custom summary guidance (subject to the phase rules below):\n${custom}\n\n${COMPACTION_SYSTEM_PROMPT}`
+        : COMPACTION_SYSTEM_PROMPT;
       return opts.summarize([...active, {
         role: "system",
-        content: `${opts.compactionPrompt?.trim() || COMPACTION_SYSTEM_PROMPT}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`,
+        content: `${instruction}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`,
       }]);
     }, mentionId);
     context.setMeasuredTokens(null);

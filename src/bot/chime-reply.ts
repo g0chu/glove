@@ -13,7 +13,9 @@ export function replyPhaseInstruction(triggerId: string, messageIndex: number, d
       : "The chime decision for this message is complete and allows a reply; continue answering. ") +
     "Previous chime decision instructions and decisions apply only to their earlier decision phases and messages. " +
     "They do not forbid answering this request. Answer the triggering message using the updated conversation above, including later activity and completed tool results. " +
-    "Use tools if needed. A chime call during this reply only acknowledges the call and does not stop the reply.";
+    "Use tools if needed. Do not call chime or report a respond-or-stay-silent decision; provide the chat reply. " +
+    "If chime was already called during this reply, its acknowledgment does not stop the reply. " +
+    "These phase instructions apply only to this reply request.";
 }
 
 /**

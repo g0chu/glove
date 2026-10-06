@@ -347,13 +347,25 @@ changes and intervening requests can reduce reuse. Matching request prefixes
 enables caching but cannot guarantee zero prompt reprocessing. No server
 settings are changed by the bot.
 
-Chime and compaction prompts can be overridden with `BOT_CHIME_PROMPT` and
+Chime and compaction guidance can be customized with `BOT_CHIME_PROMPT` and
 `CONTEXT_COMPACTION_PROMPT` in `.env`. Missing or blank values keep the built-in
-prompts. `BOT_CHIME_PROMPT` supplies the trailing decision instruction; the
+prompts. `BOT_CHIME_PROMPT` supplies decision guidance before the mandatory phase rules; the
 shared identity comes from `MODEL_SYSTEM_PROMPT`. `CONTEXT_COMPACTION_PROMPT`
-supplies the trailing summary instruction, never a replacement master prompt. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
+supplies summary guidance before the mandatory phase and fold-boundary rules, never a replacement master prompt. Use quoted values for multiline prompts. Set `BOT_CHIME_SHOW_NO=false`
 to hide chime NO decisions in Discord while keeping their diagnostic logs
 (default: `true`). Restart the bot after changing these settings.
+
+Custom guidance supplements the built-in phase instructions. Use chime guidance
+to describe when joining the conversation is useful, and summary guidance to
+describe which facts to preserve or how to format them. The gate always requires
+exactly one `chime` tool call and no chat text, even for a YES decision: the reply
+runs in a separate request. A response containing chat text alongside a valid
+decision call gets one repair; if still invalid, it stays silent and is not retained
+as conversation history. Separate reasoning remains allowed. Summary requests
+always retain the fold boundary, output limit, and prohibition on answering the chat.
+Repairs identify the validation failure without repeating the rejected response.
+Every reply identifies its current trigger and phase, including after chime is
+disabled, so retained YES/NO instructions cannot become rules for later messages.
 
 
 ### Channel activity interruptions

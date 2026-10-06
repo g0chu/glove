@@ -183,7 +183,7 @@ const ok = (name: string): void => {
         ZIMTOOLS_ENABLED: "false", VAULTTOOLS_ENABLED: "false", MEMORYTOOLS_ENABLED: "false",
         CONTEXT_COMPACTION_MAX_TOKENS: "100000", MODEL_SYSTEM_PROMPT: "test prompt", FLOW_MODE: mode },
     });
-    for (const mode of ["live", "restart", "chime"]) {
+    for (const mode of ["live", "restart", "chime", "chime-off"]) {
       if (mode === "chime") {
         fs.rmSync(path.join(dir, "chats.json"), { force: true });
         fs.rmSync(path.join(dir, "archive"), { recursive: true, force: true });
@@ -192,7 +192,7 @@ const ok = (name: string): void => {
       assert.equal(flow.status, 0, `Discord entrypoint ${mode} regression failed:\n${flow.stdout}\n${flow.stderr}\n${flow.error ?? ""}`);
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-  ok("Discord entrypoint: ordered stability, REST/reaction races, typing, interruptions, deletes, clear, paginated restart and chime");
+  ok("Discord entrypoint: ordered stability, REST/reaction races, typing, interruptions, deletes, clear, paginated restart and chime enable/disable");
 }
 
 // ---------------------------------------------------------------- config --
@@ -1039,11 +1039,12 @@ const ok = (name: string): void => {
   ok("chime: unrelated tools, reasoning and text beside broken arguments never decide");
 
   // Repairs preserve both the schema prefix and tool choice.
-  for (const first of ["empty", "invalid", "multiple", "unrelated"] as const) {
+  for (const first of ["empty", "invalid", "multiple", "unrelated", "mixed"] as const) {
     const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string; maxTokens?: number }> = [];
     const recovered = await decideChime(async (messages, tools, signal, options) => {
       requests.push({ messages, tools, choice: options?.toolChoice, maxTokens: options?.maxTokens });
       if (requests.length === 1) {
+        if (first === "mixed") return { content: "You should ship it today.", reasoning: "I can answer this question.", toolCalls: [{ id: "mixed", name: "chime", arguments: '{"respond":true,"reason":"question"}' }] };
         if (first === "unrelated") return { content: "", toolCalls: [{ id: "unrelated", name: "file_read", arguments: "{}" }] };
         if (first === "multiple") return { content: "", toolCalls: [
           { id: "1", name: "chime", arguments: '{"respond":true}' },
@@ -1062,6 +1063,16 @@ const ok = (name: string): void => {
     assert.equal(requests[0].maxTokens, undefined, "decision uses the endpoint output limit");
     assert.equal(requests[1].maxTokens, undefined, "repair also uses the endpoint output limit");
     assert.deepEqual(requests[1].messages.slice(0, -1), requests[0].messages, "repair preserves the message prefix");
+    const repair = String(requests[1].messages.at(-1)!.content);
+    const expectedFailure = {
+      empty: "the response was empty",
+      invalid: "plain text was returned",
+      multiple: "multiple tool calls were returned",
+      unrelated: "a different tool was called",
+      mixed: "chat text accompanied a tool call",
+    }[first];
+    assert.ok(repair.includes(expectedFailure), "repair explains the actual validation failure");
+    assert.ok(!repair.includes("You should ship it today."), "repair does not feed a rejected chat answer back to the model");
   }
   let attempts = 0;
   assert.equal(await decideChime(async () => { attempts++; return { content: "maybe", toolCalls: [] }; }, transcript), null);
@@ -1099,13 +1110,33 @@ const ok = (name: string): void => {
 
   let customCalls = 0;
   await decideChime(async (msgs) => {
-    assert.equal(msgs[transcript.length].content, "Custom chime\nSecond line");
+    assert.equal(msgs[transcript.length].content,
+      `Custom guidance for deciding whether to reply (subject to the phase rules below):\nCustom chime\nSecond line\n\n${CHIME_SYSTEM_PROMPT}`);
     customCalls++;
     return { content: customCalls === 1 ? "invalid" : "NO chatter", toolCalls: [] };
   }, transcript, undefined, undefined, undefined, "Custom chime\nSecond line");
   assert.equal(customCalls, 2, "custom prompt also reaches the repair request");
   await decideChime(spying, transcript, undefined, undefined, undefined, "  ");
   assert.equal(sent.at(-1)!.content, CHIME_SYSTEM_PROMPT);
+
+  // Mixed answers must never become a retained decision, even with valid arguments.
+  for (const respond of [true, false]) {
+    let calls = 0;
+    let accepted = 0;
+    assert.equal(await decideChime(async () => {
+      calls++;
+      return { content: "Here is my answer to the chat.", toolCalls: [{ id: "mixed", name: "chime", arguments: JSON.stringify({ respond, reason: "relevant" }) }] };
+    }, transcript, undefined, undefined, undefined, undefined, chimeTools([]), () => { accepted++; }), null);
+    assert.equal(calls, 2, "mixed answers receive one repair then stay silent");
+    assert.equal(accepted, 0, "mixed answers cannot enter shared history");
+  }
+  let whitespaceExchange: ChatMessage[] = [];
+  assert.deepEqual(await decideChime(async () => ({ content: " \n", reasoning: "Consider whether joining is helpful.",
+    toolCalls: [{ id: "clean", name: "chime", arguments: '{"respond":true,"reason":"relevant"}' }] }),
+  transcript, undefined, undefined, undefined, undefined, chimeTools([]), (exchange) => { whitespaceExchange = exchange; }),
+  { respond: true, reason: "relevant" });
+  assert.equal(whitespaceExchange[1].reasoningContent, "Consider whether joining is helpful.", "reasoning remains valid and retained");
+  ok("chime: mandatory phase rules accompany custom guidance; mixed chat answers repair without entering history");
 
   // The NO line posted to the channel: a UI line with the reason, truncated.
   assert.equal(formatChimeNo("just chatter"), "🔕 *chime: no — just chatter*");
@@ -1990,7 +2021,10 @@ const ok = (name: string): void => {
     summarize: async (msgs) => {
       assert.equal(msgs[0].content, "sys");
       assert.equal(msgs.at(-1)!.role, "system");
-      assert.ok(String(msgs.at(-1)!.content).startsWith("Custom summary"));
+      const instruction = String(msgs.at(-1)!.content);
+      assert.ok(instruction.startsWith(`Custom summary guidance (subject to the phase rules below):\nCustom summary\n\n${COMPACTION_SYSTEM_PROMPT}`));
+      assert.ok(instruction.includes("before message 2"), "custom guidance retains the fold boundary");
+      assert.ok(instruction.endsWith("Return only summary text, at most 4000 characters. Do not call any tools."));
       return "custom summary result";
     },
   });
@@ -5791,7 +5825,11 @@ const ok = (name: string): void => {
   }
   ok("prompt prefix: real HTTP decision, repair and reply retain identical schemas, choice and conversation bytes");
 
-  server.close();
+  // Finish socket teardown before later tests replace clearTimeout with a mock;
+  // otherwise Undici's real parser timers cannot be cancelled during close.
+  server.closeAllConnections();
+  await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+  await ticks(2);
 }
 
 // ---------------------------------------------------------------- metrics --
@@ -5846,7 +5884,9 @@ const ok = (name: string): void => {
     null,
     "connection refused",
   );
-  slotsServer.close();
+  slotsServer.closeAllConnections();
+  await new Promise<void>((resolve, reject) => slotsServer.close(err => err ? reject(err) : resolve()));
+  await ticks(2);
   ok("metrics: the /slots probe parses and aggregates, and fails soft to null");
 
   // Per-turn accounting: the endpoint's own counts, summed over the turn's
@@ -6825,7 +6865,7 @@ const ok = (name: string): void => {
       request = structuredClone(messages);
       if (++attempts === 1) return { content: "unusable", toolCalls: [] };
       return { content: "", reasoning: "  decision reasoning  ", toolCalls: [{ id: "decision", name: "chime", arguments: JSON.stringify({ respond, reason: "because" }) }] };
-    }, prefix, undefined, undefined, undefined, undefined, chimeTools([]), (messages) => {
+    }, prefix, undefined, undefined, undefined, "Prefer joining when a reply would help.", chimeTools([]), (messages) => {
       exchange = messages;
       context.appendExchange(messages, "exchange");
     });
