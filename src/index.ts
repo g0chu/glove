@@ -19,6 +19,8 @@ import { ConversationArchive } from "./llm/archive.js";
 import { archiveChat } from "./llm/archived-chat.js";
 import { archiveAttachments } from "./bot/attachment-store.js";
 import { ArchiveAttachmentCapture } from "./bot/archive-capture.js";
+import { WORKSPACE_ATTACHMENT_MAX_BYTES, WORKSPACE_ATTACHMENT_TIMEOUT_MS, WorkspaceAttachmentCapture } from "./bot/workspace-capture.js";
+import { humanBytes } from "./bot/images.js";
 import { captureCatchup, coveredDiscordCursor } from "./bot/catchup.js";
 import { archiveTools } from "./tools/archive.js";
 import { recoverTurns } from "./llm/recovery.js";
@@ -92,6 +94,28 @@ async function main(): Promise<void> {
     maxPerMessage: cfg.model.archiveAttachmentsMaxPerMessage,
     timeoutMs: cfg.model.archiveAttachmentTimeoutMs,
   }, (error) => log.warn(`archive attachment capture: ${errMsg(error)}`));
+  // Every committed trackable message's attachments — any type — are saved
+  // to the file workspace under their original names (collisions get
+  // Discord-style " (2)" suffixes), so shared files survive past the CDN
+  // URL expiry and are available to the file/shell tools. Background and
+  // best-effort: a missing workspace or a failed download is a log line,
+  // never a crash (see bot/workspace-capture.ts).
+  const workspaceCapture = new WorkspaceAttachmentCapture(
+    {
+      workspace: cfg.tools.file.workspace,
+      maxBytes: WORKSPACE_ATTACHMENT_MAX_BYTES,
+      timeoutMs: WORKSPACE_ATTACHMENT_TIMEOUT_MS,
+    },
+    (result) => {
+      for (const saved of result.saved) {
+        log.info(`saved attachment "${saved.attachment.name}" to the workspace: ${saved.file} (${humanBytes(saved.bytes)})`);
+      }
+      for (const skipped of result.skipped) {
+        log.warn(`attachment "${skipped.attachment.name}" not saved to the workspace: ${skipped.reason}`);
+      }
+    },
+    (error) => log.warn(`workspace attachment save failed: ${errMsg(error)}`),
+  );
   if (archive.recoveredTail) log.warn(`quarantined incomplete archive tail: ${archive.recoveredTail}`);
   const incomplete = archive.incomplete();
   if (incomplete.tools.length || incomplete.requests.length || incomplete.turns.length) {
@@ -881,6 +905,14 @@ async function main(): Promise<void> {
     if (!message.author) return;
     refreshChannelIdentity(contexts.get(channelId), message.channel as GuildTextBasedChannel);
     archiveMessage(message, "stable");
+    if (message.attachments.size > 0) {
+      // The message's attachments (any type) are saved to the file
+      // workspace in the background — best-effort, never blocking the
+      // commit (see WorkspaceAttachmentCapture).
+      workspaceCapture.observe([...message.attachments.values()].map((a) => ({
+        url: a.url, name: a.name, size: a.size, contentType: a.contentType ?? null,
+      })));
+    }
     if (!message.author.bot && isClearCommand(message.content, botId)) {
       archive.record("context.cleared", { channelId, messageId: message.id }, { authorId: message.author.id });
       // Drop entries + summary and suppress the startup seed: the next turn
@@ -1246,7 +1278,7 @@ async function main(): Promise<void> {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
-          Promise.allSettled([...activeTurns, ...catchups.values(), attachmentCapture.stop()]),
+          Promise.allSettled([...activeTurns, ...catchups.values(), attachmentCapture.stop(), workspaceCapture.stop()]),
           new Promise<void>((resolve) => { timer = setTimeout(resolve, 30_000); }),
         ]);
       } finally { if (timer) clearTimeout(timer); }

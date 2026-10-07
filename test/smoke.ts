@@ -46,6 +46,7 @@ import { recoverTurns } from "../src/llm/recovery.js";
 import { archiveTools } from "../src/tools/archive.js";
 import { archiveAttachments } from "../src/bot/attachment-store.js";
 import { captureArchiveAttachments, ArchiveAttachmentCapture } from "../src/bot/archive-capture.js";
+import { WorkspaceAttachmentCapture, captureWorkspaceAttachments, safeWorkspaceName, uniqueDestination } from "../src/bot/workspace-capture.js";
 import { exportArchive, archiveName, archiveTurnFolder, attachmentViewPath } from "../src/llm/archive-layout.js";
 import { archiveChannelName, archiveJournalPath, archiveSystemDirectory } from "../src/llm/archive-paths.js";
 import { migrateArchive } from "../src/llm/archive-migration.js";
@@ -8127,6 +8128,103 @@ const ok = (name: string): void => {
     assert.equal(path.extname(archiveName("a".repeat(300) + ".pdf")), ".pdf");
     ok("archive capture: binary downloads are independent, bounded, deduplicated, CDN-only, redirect-free and shutdown-aware; attachment metadata cannot collide with filenames");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-workspace-capture-"));
+  const workspace = path.join(dir, "workspace");
+  fs.mkdirSync(workspace);
+  const bytes = Buffer.from([0, 255, 1, 2]);
+  const att = { url: "https://cdn.discordapp.com/attachments/1/2/a.zip", name: "a.zip", size: bytes.length, contentType: "application/zip" };
+  try {
+    // Names become safe single path segments: separators/control characters
+    // replaced, leading dots and trailing spaces/dots dropped, the
+    // extension preserved under the filesystem's filename limit.
+    assert.equal(safeWorkspaceName("photo.png"), "photo.png");
+    assert.equal(safeWorkspaceName("../../escape.pdf"), "_.._escape.pdf");
+    assert.equal(safeWorkspaceName("my file?.txt"), "my file_.txt");
+    assert.equal(safeWorkspaceName(".hidden"), "hidden");
+    assert.equal(safeWorkspaceName("trail."), "trail");
+    assert.equal(safeWorkspaceName(""), "attachment");
+    assert.equal(safeWorkspaceName("a".repeat(300) + ".pdf"), "a".repeat(196) + ".pdf");
+    // Destinations never overwrite: Discord-style collision suffixes.
+    fs.writeFileSync(path.join(workspace, "a.zip"), "original");
+    assert.equal(uniqueDestination(workspace, "a.zip"), path.join(workspace, "a (2).zip"));
+    fs.writeFileSync(path.join(workspace, "a (2).zip"), "second");
+    assert.equal(uniqueDestination(workspace, "a.zip"), path.join(workspace, "a (3).zip"));
+    assert.equal(uniqueDestination(workspace, "other.bin"), path.join(workspace, "other.bin"));
+    assert.equal(uniqueDestination(workspace, "note"), path.join(workspace, "note"));
+    fs.rmSync(path.join(workspace, "a.zip"));
+    fs.rmSync(path.join(workspace, "a (2).zip"));
+    let requests = 0;
+    const saved: string[] = [];
+    const skipped: string[] = [];
+    const fetchImpl: typeof fetch = async (url, init) => {
+      requests++;
+      assert.equal(init?.redirect, "error", "workspace capture refuses redirects");
+      const u = String(url);
+      if (u.includes("declbig")) return new Response(bytes, { headers: { "content-length": "2048" } });
+      if (u.includes("?over")) return new Response(Buffer.alloc(2048));
+      if (u.includes("http500")) return new Response(null, { status: 500 });
+      return new Response(bytes);
+    };
+    const capture = new WorkspaceAttachmentCapture(
+      { workspace, maxBytes: 1024, timeoutMs: 1000, fetchImpl },
+      (result) => { for (const s of result.saved) saved.push(s.file); for (const k of result.skipped) skipped.push(k.reason); },
+      (error) => { throw error; },
+    );
+    // One commit per message: two messages with the same attachment name
+    // save two files, serialized, under suffixed names.
+    capture.observe([att]);
+    capture.observe([att]);
+    await ticks(8);
+    assert.equal(requests, 2);
+    assert.deepEqual(saved.map((f) => path.basename(f)), ["a.zip", "a (2).zip"]);
+    assert.deepEqual(fs.readFileSync(path.join(workspace, "a.zip")), bytes);
+    assert.deepEqual(fs.readFileSync(path.join(workspace, "a (2).zip")), bytes);
+    assert.equal(skipped.length, 0);
+    // Skips, never throws: non-CDN source, unknown size, metadata over the
+    // cap, declared content-length over the cap, actual bytes over the
+    // cap and an HTTP failure.
+    capture.observe([
+      { ...att, url: "https://evil.example/file" },
+      { ...att, url: att.url + "?badsize", size: Number.NaN },
+      { ...att, url: att.url + "?big", size: 2048 },
+      { ...att, url: att.url + "?declbig", size: 4 },
+      { ...att, url: att.url + "?over", size: 4 },
+      { ...att, url: att.url + "?http500", size: 4 },
+    ]);
+    await ticks(8);
+    assert.deepEqual(skipped, [
+      "not a discord attachment",
+      "attachment size is unknown",
+      "2 KB exceeds the 1 KB workspace limit",
+      "download exceeds the 1 KB workspace limit",
+      "download exceeds the 1 KB workspace limit",
+      "download failed: HTTP 500",
+    ]);
+    // A missing (or not-a-directory) workspace skips everything.
+    const missing = await captureWorkspaceAttachments([att], { workspace: path.join(dir, "nope"), maxBytes: 1024, timeoutMs: 1000, fetchImpl });
+    assert.equal(missing.saved.length, 0);
+    assert.equal(missing.skipped.length, 1);
+    assert.ok(missing.skipped[0].reason.includes("nope"), missing.skipped[0].reason);
+    const notDir = path.join(dir, "file");
+    fs.writeFileSync(notDir, "x");
+    const fileWorkspace = await captureWorkspaceAttachments([att], { workspace: notDir, maxBytes: 1024, timeoutMs: 1000, fetchImpl });
+    assert.equal(fileWorkspace.skipped.length, 1);
+    // An already-aborted signal skips unstarted work without fetching.
+    const abort = new AbortController();
+    abort.abort();
+    const before = requests;
+    const aborted = await captureWorkspaceAttachments([{ ...att, url: att.url + "?late" }], { workspace, maxBytes: 1024, timeoutMs: 1000, fetchImpl }, abort.signal);
+    assert.equal(requests, before);
+    assert.equal(aborted.skipped[0].reason, "shutdown");
+    // stop() awaits queued work; after it, observe is a no-op.
+    await capture.stop();
+    capture.observe([{ ...att, url: att.url + "?after-stop" }]);
+    await ticks(4);
+    assert.equal(requests, before);
+    ok("workspace capture: committed attachments are saved under their original names (collisions suffixed, never overwritten), bounded, CDN-only, redirect-free and shutdown-aware");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-response-"));

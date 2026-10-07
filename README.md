@@ -164,6 +164,14 @@ without the affected tensor/MTP combination.
   independently of model image/file input (`ARCHIVE_ATTACHMENTS_ENABLED`).
   Recovery restores completed work without repeating tools or Discord posts.
   See [ARCHIVE.md](ARCHIVE.md) for limits, recovery, folder export, migration, and purge.
+- **Workspace capture:** every message's attachments — any type, images
+  included — are saved to the file workspace (`FILETOOLS_WORKSPACE`,
+  default `./workspace`) under their original names. Name collisions get
+  Discord-style ` (2)` suffixes; existing files are never overwritten. The
+  save runs in the background and is best-effort (Discord CDN only, 512 MiB
+  per-file cap, 10-minute download deadline): a missing workspace or a failed
+  download is logged, never fatal. Saved files outlive the CDN URL expiry and
+  are available to the file/shell tools.
 - **Errors:** model timeouts, connection failures, bad SSE, and Discord API
   errors produce a short honest message in the channel; the bot keeps going.
 
