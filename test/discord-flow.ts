@@ -1,3 +1,4 @@
+import { gemmaMessages } from "../src/llm/gemma.js";
 /** Exercise the real entrypoint and event handlers without Discord or real sleeps. */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -43,17 +44,17 @@ const requests: ChatMessage[][] = [];
 let duringChat: ((signal?: AbortSignal) => Promise<ChatResult>) | undefined;
 let chimeRespond = false;
 LlmClient.prototype.chat = async function (messages, _callbacks, _tools, signal, options): Promise<ChatResult> {
-  requests.push(structuredClone(messages));
+  requests.push(structuredClone(process.env.FLOW_MODE === "gemma" ? gemmaMessages(messages, options?.reasoningFromIndex) : messages));
   if (signal?.aborted) throw new InterruptedError();
   const hook = duringChat;
   duringChat = undefined;
   if (hook) return hook(signal);
   if (messages.at(-1)?.role === "system" && messages.at(-1)?.content === CHIME_SYSTEM_PROMPT) {
     assert.equal(options?.maxTokens, undefined, "chime decisions use the endpoint output limit");
-    return { content: "", toolCalls: [{ id: `decision-${requests.length}`, name: "chime",
+    return { content: "", reasoning: "decision reasoning", toolCalls: [{ id: `decision-${requests.length}`, name: "chime",
       arguments: JSON.stringify({ respond: chimeRespond, reason: "conversation settled" }) }] };
   }
-  return { content: `answer ${requests.length}`, toolCalls: [] };
+  return { content: `answer ${requests.length}`, reasoning: "reply reasoning", toolCalls: [] };
 };
 
 type FakeMessage = Message & { content: string };
@@ -133,7 +134,7 @@ async function run(): Promise<void> {
   client.channels.cache.set(channel.id, channel);
   if (process.env.FLOW_MODE === "chime-off") {
     now += 100_000;
-    assert(entries().some((entry) => entry.content.includes("Stay silent for this message")), "restart retains old NO instructions");
+    assert(entries().some((entry) => entry.content.includes("Decision complete: no reply to this message.")), "restart retains old NO instructions");
     for (const entry of entries()) {
       for (const id of entry.ids) history.set(id, makeMessage(id, entry.content, entry.content.startsWith("answer") ? "bot" : "human"));
     }
@@ -141,13 +142,13 @@ async function run(): Promise<void> {
     await advance(200);
     assert.equal(requests.length, 1, "disabled chime makes only a reply call");
     const reply = requests[0];
-    assert(reply.some((message) => String(message.content).includes("Stay silent for this message")), "historical decisions remain intact");
+    assert(reply.some((message) => String(message.content).includes("Decision complete: no reply to this message.")), "historical decisions remain intact");
     const instruction = String(reply.at(-1)?.content);
-    assert(instruction.includes("reply phase for Discord message 900"));
-    assert(instruction.includes("directly mentions the bot and requires a reply"));
+    assert(instruction.includes("Reply to Discord message 900"));
+    assert(instruction.includes("It mentions you and requires an answer."));
     const triggerIndex = Number(instruction.match(/message index (\d+)/)![1]);
     assert(String(reply[triggerIndex].content).includes("@Glove reply with chime disabled"));
-    assert(!entries().some((entry) => entry.content.startsWith("This request is in the reply phase")), "phase instructions remain transient with chime disabled");
+    assert(!entries().some((entry) => entry.content.startsWith("Reply to Discord message")), "phase instructions remain transient with chime disabled");
     process.emit("SIGTERM");
     return;
   }
@@ -190,7 +191,7 @@ async function run(): Promise<void> {
     process.emit("SIGTERM");
     return;
   }
-  if (process.env.FLOW_MODE === "chime") {
+  if (process.env.FLOW_MODE === "chime" || process.env.FLOW_MODE === "gemma") {
     create("100", "first ambient message");
     await advance(100);
     create("200", "newest ambient message", "other-bot");
@@ -214,14 +215,18 @@ async function run(): Promise<void> {
     await advance(200);
     assert.equal(requests.length, 2, "a mention after NO bypasses the decision gate");
     const noMention = requests.at(-1)!;
-    assert(noMention.some((m) => typeof m.content === "string" && m.content.includes("Stay silent for this message")));
+    assert(noMention.some((m) => typeof m.content === "string" && m.content.includes("Decision complete: no reply to this message.")));
+    if (process.env.FLOW_MODE === "gemma") {
+      assert(!noMention.some(message => message.reasoningContent), "old NO thoughts are omitted from a new mention");
+      assert(entries().some(entry => entry.reasoning === "decision reasoning"), "stored decision thoughts survive wire filtering");
+    }
     assert.equal(noMention.at(-1)?.role, "system");
-    assert(String(noMention.at(-1)?.content).includes("reply phase for Discord message 250"));
-    assert(String(noMention.at(-1)?.content).includes("directly mentions the bot and requires a reply"));
-    assert(String(noMention.at(-1)?.content).includes("apply only to their earlier decision phases and messages"));
+    assert(String(noMention.at(-1)?.content).includes("Reply to Discord message 250"));
+    assert(String(noMention.at(-1)?.content).includes("It mentions you and requires an answer."));
+    assert(String(noMention.at(-1)?.content).includes("apply only to their original requests"));
     const triggerIndex = Number(String(noMention.at(-1)?.content).match(/message index (\d+)/)![1]);
     assert(String(noMention[triggerIndex].content).includes("@Glove answer after NO"));
-    assert(!entries().some((e) => e.content.startsWith("This request is in the reply phase")), "reply instruction is transient");
+    assert(!entries().some((e) => e.content.startsWith("Reply to Discord message")), "reply instruction is transient");
     duringChat = async (signal) => {
       const ambient = history.get("200")!;
       edit(ambient, "edited during chime decision");
@@ -234,6 +239,10 @@ async function run(): Promise<void> {
     assert.equal(requests.length, 3, "the interrupted decision produces no reply");
     await advance(200);
     assert.equal(requests.length, 5, "a fresh YES decision runs one reply");
+    if (process.env.FLOW_MODE === "gemma") {
+      assert.equal(requests.at(-1)!.filter(message => message.reasoningContent).length, 1, "only the current YES thoughts extend into the reply");
+      assert.equal(requests.at(-1)!.find(message => message.reasoningContent)?.reasoningContent, "decision reasoning");
+    }
     assert(prompt().includes("edited during chime decision"));
     assert(!prompt().includes("🔕"));
     create("400", "<@bot> mention always answers");
@@ -252,14 +261,15 @@ async function run(): Promise<void> {
     create("500", "ambient before interrupted YES");
     await advance(200);
     assert.equal(requests.length, 8, "YES enters reply before being interrupted");
-    assert(String(requests.at(-1)?.at(-1)?.content).includes("reply phase for Discord message 500"));
+    assert(String(requests.at(-1)?.at(-1)?.content).includes("Reply to Discord message 500"));
     await advance(200);
     assert.equal(requests.length, 9, "newer mention supersedes interrupted chime without a decision call");
     const afterYes = requests.at(-1)!;
+    if (process.env.FLOW_MODE === "gemma") assert(!afterYes.some(message => message.reasoningContent), "superseding turn drops previous YES reasoning");
     assert(afterYes.some((m) => m.toolCalls?.some((call) => call.id === "interrupted-yes")), "completed YES stays in history");
-    assert(String(afterYes.at(-1)?.content).includes("reply phase for Discord message 600"));
-    assert(String(afterYes.at(-1)?.content).includes("directly mentions the bot and requires a reply"));
-    assert(!entries().some((e) => e.content.startsWith("This request is in the reply phase")));
+    assert(String(afterYes.at(-1)?.content).includes("Reply to Discord message 600"));
+    assert(String(afterYes.at(-1)?.content).includes("It mentions you and requires an answer."));
+    assert(!entries().some((e) => e.content.startsWith("Reply to Discord message")));
     duringChat = async () => {
       duringChat = async (signal) => {
         client.emit("typingStart", { channel, user: { id: "human" } } as never);
@@ -277,11 +287,47 @@ async function run(): Promise<void> {
     assert.equal(requests.length, 13, "typing interruption retries the YES turn over retained history");
     const retriedYes = requests.at(-1)!;
     assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")));
-    assert(String(retriedYes.at(-1)?.content).includes("reply phase for Discord message 700"));
-    assert(String(retriedYes.at(-1)?.content).includes("chime decision for this message is complete and allows a reply"));
-    assert.equal(retriedYes.filter((m) => String(m.content).startsWith("This request is in the reply phase")).length, 1,
+    assert(String(retriedYes.at(-1)?.content).includes("Reply to Discord message 700"));
+    assert(String(retriedYes.at(-1)?.content).includes("Its chime decision allows an answer."));
+    assert.equal(retriedYes.filter((m) => String(m.content).startsWith("Reply to Discord message")).length, 1,
       "retry gets one fresh instruction, without accumulating earlier attempt instructions");
-    assert(!entries().some((e) => e.content.startsWith("This request is in the reply phase")));
+    assert(!entries().some((e) => e.content.startsWith("Reply to Discord message")));
+    if (process.env.FLOW_MODE === "gemma") {
+      const count = requests.length;
+      duringChat = async () => {
+        duringChat = async () => {
+          const secondRound = requests.at(-1)!;
+          assert(secondRound.some(message => message.reasoningContent === "active tool reasoning"), "tool thinking remains in the next round");
+          assert(!secondRound.some(message => message.reasoningContent === "reply reasoning"), "past final thoughts are omitted");
+          return { content: "tool continuation answer", toolCalls: [] };
+        };
+        return { content: "", reasoning: "active tool reasoning", toolCalls: [{ id: "reply-chime", name: "chime", arguments: '{"respond":true,"reason":"continue"}' }] };
+      };
+      create("800", "<@bot> continue with a tool");
+      await advance(200);
+      assert.equal(requests.length, count + 2, "Gemma completes a tool round and its reply");
+      assert(entries().some(entry => entry.reasoning === "active tool reasoning"));
+      const beforeInterrupt = requests.length;
+      duringChat = async () => {
+        duringChat = async signal => {
+          client.emit("typingStart", { channel, user: { id: "human" } } as never);
+          assert(signal?.aborted);
+          duringChat = async () => {
+            assert(requests.at(-1)!.some(message => message.reasoningContent === "retained tool reasoning"),
+              "current-turn thoughts survive an interrupted tool attempt");
+            return { content: "retained result answer", toolCalls: [] };
+          };
+          throw new InterruptedError();
+        };
+        return { content: "", reasoning: "retained tool reasoning", toolCalls: [{ id: "retained-chime", name: "chime", arguments: '{"respond":true}' }] };
+      };
+      create("900", "<@bot> continue after interruption");
+      await advance(200);
+      assert.equal(requests.length, beforeInterrupt + 2);
+      await advance(10000);
+      assert.equal(requests.length, beforeInterrupt + 3, "retained tool work continues without replaying the tool");
+
+    }
     process.emit("SIGTERM");
     return;
   }

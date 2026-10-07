@@ -44,6 +44,7 @@ async function main(): Promise<void> {
     "config loaded:",
     cfg.discord.guildId !== "" ? `guild=${cfg.discord.guildId}` : "guilds=all",
     `model=${cfg.model.name}`,
+    `compatibility=${cfg.model.compatibility}`,
     `endpoint=${cfg.model.apiUrl}`,
     `stream=${cfg.model.stream}`,
     `prompt-cache=${cfg.model.disablePromptCache ? "disabled" : "endpoint default"}`,
@@ -65,6 +66,11 @@ async function main(): Promise<void> {
     stream: cfg.model.stream,
     disablePromptCache: cfg.model.disablePromptCache,
     timeoutMs: cfg.model.timeoutMs,
+    compatibility: cfg.model.compatibility,
+    temperature: cfg.model.temperature,
+    topP: cfg.model.topP,
+    topK: cfg.model.topK,
+    chatTemplateKwargs: cfg.model.chatTemplateKwargs,
   });
   // The per-channel contexts are persisted to disk after every change (see
   // ChatPersistence): the full history — every message, the model's replies,
@@ -357,6 +363,7 @@ async function main(): Promise<void> {
     // real tokens too, so their model calls count in the turn's report.
     const tokens = new TurnTokens();
     let retainedToolRounds = 0;
+    const activeExchangeIds = new Set<string>();
 
     try {
       for (let attempt = 0; ; attempt++) {
@@ -522,6 +529,16 @@ async function main(): Promise<void> {
             return;
           }
           let coveredIds = context.snapshot().filter((entry) => entry.role === "user").flatMap((entry) => entry.ids);
+          // Keep thoughts only for this turn's accepted decision and retained tool
+          // attempts. Persisted entries remain intact; the Gemma wire profile
+          // strips older thoughts without changing the archive or other models.
+          const reasoningStart = (msgs: ChatMessage[]): number => {
+            const entries = context.snapshot();
+            const index = entries.findIndex(entry =>
+              (entry.turnId?.startsWith(`${turnId}:attempt:`) ?? false) ||
+              (entry.exchangeId !== undefined && activeExchangeIds.has(entry.exchangeId)));
+            return index === -1 ? msgs.length : (prefixEndIndex(context, ctxOpts, index + 1) ?? msgs.length + 1) - 1;
+          };
           if (turn.chime) {
             // A message that committed while the turn waited for stillness
             // (or while the context was being built) supersedes this chime:
@@ -542,7 +559,8 @@ async function main(): Promise<void> {
               const position = context.length;
               const timestamp = Date.now();
               return decideChime(
-                (m, tools, signal, options) => plainChat(m, undefined, tools, signal, options),
+                (m, tools, signal, options) => plainChat(m, undefined, tools, signal,
+                  { ...options, reasoningFromIndex: reasoningStart(msgs) }),
                 msgs,
                 attemptController.signal,
                 { sendTyping: () => textChannel.sendTyping(), intervalMs: cfg.discord.typingIntervalMs },
@@ -552,6 +570,7 @@ async function main(): Promise<void> {
                 (exchange) => {
                   if (!context.has(turn.id)) return;
                   const exchangeId = randomUUID();
+                  activeExchangeIds.add(exchangeId);
                   archive.record("chime.accepted", scope, { exchangeId, messages: exchange, position, timestamp });
                   context.appendExchange(exchange, exchangeId, position, timestamp);
                   msgs.push(...exchange);
@@ -645,7 +664,8 @@ async function main(): Promise<void> {
               ...msgs, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) },
             ];
             return runToolTurn(replyMessages, {
-              chat: replyChat,
+              chat: (m, callbacks, t, signal) => replyChat(m, callbacks, t, signal,
+                { reasoningFromIndex: reasoningStart(msgs) }),
               registry: tools.registry,
               maxRounds: Math.max(0, cfg.tools.maxRounds - retainedToolRounds),
               signal: attemptController.signal,

@@ -1,4 +1,5 @@
 import "dotenv/config";
+import type { ModelCompatibility } from "./llm/gemma.js";
 
 export interface DiscordConfig {
   token: string;
@@ -38,6 +39,11 @@ export interface ModelConfig {
   apiUrl: string;
   apiKey: string;
   name: string;
+  compatibility: ModelCompatibility;
+  temperature?: number;
+  topP?: number;
+  topK?: number | null;
+  chatTemplateKwargs?: Record<string, unknown>;
   enableImages: boolean;
   /** Max bytes per downloaded image attachment (bigger ones are skipped). */
   imagesMaxBytes: number;
@@ -256,6 +262,35 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
   const guildId = optional("DISCORD_GUILD_ID", "");
   const apiUrl = required("MODEL_API_URL");
   if (apiUrl) httpUrlOk("MODEL_API_URL", apiUrl);
+  const profile = optional("MODEL_COMPATIBILITY", "auto").toLowerCase();
+  const compatibility: ModelCompatibility = profile === "gemma4" || profile === "generic" ? profile : "auto";
+  if (!["auto", "generic", "gemma4"].includes(profile)) errors.push("MODEL_COMPATIBILITY must be auto, generic or gemma4");
+  const sampling = (name: string, max: number, integer = false): number | undefined => {
+    const raw = env[name]?.trim();
+    if (!raw) return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0 || value > max || (integer && !Number.isInteger(value))) {
+      errors.push(`${name} must be ${integer ? "an integer" : "a number"} between 0 and ${max}`);
+      return undefined;
+    }
+    return value;
+  };
+  let chatTemplateKwargs: Record<string, unknown> | undefined;
+  const templateOptions = env.MODEL_CHAT_TEMPLATE_KWARGS?.trim();
+  if (templateOptions) {
+    try {
+      const parsed: unknown = JSON.parse(templateOptions);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+      chatTemplateKwargs = parsed as Record<string, unknown>;
+      for (const key of ["enable_thinking", "preserve_thinking"]) {
+        if (key in chatTemplateKwargs && typeof chatTemplateKwargs[key] !== "boolean") {
+          errors.push(`MODEL_CHAT_TEMPLATE_KWARGS.${key} must be a boolean`);
+        }
+      }
+    } catch {
+      errors.push("MODEL_CHAT_TEMPLATE_KWARGS must be a JSON object");
+    }
+  }
 
   const config: Config = {
     discord: {
@@ -275,6 +310,11 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       apiUrl,
       apiKey: optional("MODEL_API_KEY", "none"),
       name: optional("MODEL_NAME", "local"),
+      compatibility,
+      temperature: sampling("MODEL_TEMPERATURE", 2),
+      topP: sampling("MODEL_TOP_P", 1),
+      topK: env.MODEL_TOP_K?.trim().toLowerCase() === "endpoint" ? null : sampling("MODEL_TOP_K", Number.MAX_SAFE_INTEGER, true),
+      chatTemplateKwargs,
       enableImages: boolEnv("MODEL_ENABLE_IMAGES", false),
       imagesMaxBytes: intEnv("MODEL_IMAGES_MAX_BYTES", 10_485_760, 1024),
       enableFileContents: boolEnv("MODEL_ENABLE_FILE_CONTENTS", false),

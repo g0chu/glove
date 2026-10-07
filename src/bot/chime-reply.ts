@@ -7,15 +7,13 @@ import { CHIME_TOOL_NAME, chimeTools } from "./chime.js";
 
 /** Transient instruction for the current reply, appended after the shared history. */
 export function replyPhaseInstruction(triggerId: string, messageIndex: number, directMention: boolean): string {
-  return `This request is in the reply phase for Discord message ${triggerId}, at message index ${messageIndex} (zero-based) in this request. ` +
+  return `Reply to Discord message ${triggerId} at message index ${messageIndex} (zero-based). ` +
     (directMention
-      ? "This message directly mentions the bot and requires a reply; do not make another respond-or-stay-silent decision. "
-      : "The chime decision for this message is complete and allows a reply; continue answering. ") +
-    "Previous chime decision instructions and decisions apply only to their earlier decision phases and messages. " +
-    "They do not forbid answering this request. Answer the triggering message using the updated conversation above, including later activity and completed tool results. " +
-    "Use tools if needed. Do not call chime or report a respond-or-stay-silent decision; provide the chat reply. " +
-    "If chime was already called during this reply, its acknowledgment does not stop the reply. " +
-    "These phase instructions apply only to this reply request.";
+      ? "It mentions you and requires an answer. "
+      : "Its chime decision allows an answer. ") +
+    "Use the full updated conversation, including later messages and completed tool results. " +
+    "Earlier phase instructions apply only to their original requests. Use tools as needed, but do not call chime; a chime acknowledgment does not end this reply. " +
+    "Reply text must contain the user-facing answer, not internal planning or thinking-process notes. Keep internal reasoning in the endpoint's separate reasoning field, if supported.";
 }
 
 /**

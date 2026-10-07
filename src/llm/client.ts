@@ -1,4 +1,6 @@
 import { errMsg, truncate } from "../log.js";
+import { gemmaMessages, ThoughtSplitter, usesGemma4 } from "./gemma.js";
+import type { ModelCompatibility } from "./gemma.js";
 
 /** One tool invocation requested by the model. */
 export interface ToolCall {
@@ -106,6 +108,8 @@ export interface ChatRequestOptions {
   toolChoice?: "auto" | "required";
   /** Maximum generated tokens for this call, including reasoning at compatible endpoints. */
   maxTokens?: number;
+  /** Gemma only: first message belonging to the active tool sequence; older thoughts are omitted. */
+  reasoningFromIndex?: number;
 }
 
 export interface LlmClientOptions {
@@ -116,6 +120,15 @@ export interface LlmClientOptions {
   /** llama-server compatibility: evaluate each prompt without reusing prior KV state. */
   disablePromptCache?: boolean;
   timeoutMs: number;
+  /** Auto-detect Gemma 4 from the model ID, or explicitly select a wire profile. */
+  compatibility?: ModelCompatibility;
+  /** Undefined retains endpoint defaults, except for Gemma's documented sampling defaults. */
+  temperature?: number;
+  topP?: number;
+  /** null omits this nonstandard parameter, including in the Gemma profile. */
+  topK?: number | null;
+  /** Optional server-specific Jinja controls (for example enable_thinking). */
+  chatTemplateKwargs?: Record<string, unknown>;
 }
 
 /** Stream callbacks for one request (both optional). */
@@ -231,6 +244,47 @@ function isAbortError(err: unknown): boolean {
   return err instanceof Error && err.name === "AbortError";
 }
 
+const TRANSIENT_CONNECTION_CODES = new Set([
+  "ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", "EAI_AGAIN",
+]);
+
+/** A fetch failure before response headers; cause details distinguish transport from HTTP errors. */
+export class ModelConnectionError extends Error {
+  readonly retryable: boolean;
+
+  constructor(apiUrl: string, cause: unknown) {
+    const codes: string[] = [];
+    const addresses: string[] = [];
+    const messages: string[] = [];
+    const seen = new Set<object>();
+    const inspect = (error: unknown, depth: number): void => {
+      if (!error || typeof error !== "object" || seen.has(error) || depth > 4) return;
+      seen.add(error);
+      const value = error as { code?: unknown; message?: unknown; address?: unknown; port?: unknown; cause?: unknown; errors?: unknown;
+        socket?: { remoteAddress?: unknown; remotePort?: unknown } };
+      if (typeof value.code === "string" && !codes.includes(value.code)) codes.push(value.code);
+      if (depth > 0 && typeof value.message === "string" && value.message !== errMsg(cause) && !messages.includes(value.message)) {
+        messages.push(truncate(value.message, 200));
+      }
+      // Undici's SocketError stores peer information in socket rather than address.
+      const peer = value.address ?? value.socket?.remoteAddress;
+      const port = value.port ?? value.socket?.remotePort;
+      if (typeof peer === "string") {
+        const address = `${peer}${typeof port === "number" ? `:${port}` : ""}`;
+        if (!addresses.includes(address)) addresses.push(address);
+      }
+      inspect(value.cause, depth + 1);
+      if (Array.isArray(value.errors)) for (const nested of value.errors.slice(0, 8)) inspect(nested, depth + 1);
+    };
+    inspect(cause, 0);
+    const details = [...codes, ...addresses, ...messages];
+    super(`could not reach model endpoint ${apiUrl}: ${errMsg(cause)}${details.length ? ` (${details.join(", ")})` : ""}`, { cause });
+    // A mixed AggregateError containing a permanent failure does not qualify.
+    this.retryable = codes.length > 0 && codes.every(code => TRANSIENT_CONNECTION_CODES.has(code));
+    this.name = "ModelConnectionError";
+  }
+}
+
 /**
  * A model request aborted by the caller's signal — the channel-activity
  * interruption (index.ts): the channel changed (a new message, an edit, a
@@ -310,8 +364,11 @@ export class LlmClient {
    * cancel all of them, not just the most recently started one.
    */
   private readonly active = new Set<AbortController>();
+  private readonly gemma4: boolean;
 
-  constructor(private readonly opts: LlmClientOptions) {}
+  constructor(private readonly opts: LlmClientOptions) {
+    this.gemma4 = usesGemma4(opts.model, opts.compatibility);
+  }
 
   /** Cancel all in-flight requests (graceful shutdown). */
   abort(): void {
@@ -397,9 +454,16 @@ export class LlmClient {
     let res: Response;
     const body: Record<string, unknown> = {
       model: this.opts.model,
-      messages: messages.map(toWireMessage),
+      messages: (this.gemma4 ? gemmaMessages(messages, options?.reasoningFromIndex) : messages).map(toWireMessage),
       stream: this.opts.stream,
     };
+    const temperature = this.opts.temperature ?? (this.gemma4 ? 1 : undefined);
+    const topP = this.opts.topP ?? (this.gemma4 ? 0.95 : undefined);
+    const topK = this.opts.topK === null ? undefined : this.opts.topK ?? (this.gemma4 ? 64 : undefined);
+    if (temperature !== undefined) body.temperature = temperature;
+    if (topP !== undefined) body.top_p = topP;
+    if (topK !== undefined) body.top_k = topK;
+    if (this.opts.chatTemplateKwargs) body.chat_template_kwargs = this.opts.chatTemplateKwargs;
     // Apply centrally to replies, tool rounds, chime/repair calls and summaries.
     // Omit this nonstandard extension unless explicitly enabled.
     if (this.opts.disablePromptCache) body.cache_prompt = false;
@@ -424,8 +488,9 @@ export class LlmClient {
         signal: controller.signal,
       });
     } catch (err) {
+      if (controller.signal.aborted) throw new DOMException("model request aborted", "AbortError");
       if (isAbortError(err)) throw err; // mapped to "timed out" by the caller
-      throw new Error(`could not reach model endpoint ${this.opts.apiUrl}: ${errMsg(err)}`);
+      throw new ModelConnectionError(this.opts.apiUrl, err);
     }
     callbacks.onResponse?.(res.status);
     if (!res.ok) {
@@ -455,10 +520,20 @@ export class LlmClient {
     }
     // Non-stream reasoning arrives as one blob; hand it over whole so a
     // live preview can still show it (there is no "in real time" in this mode).
-    const reasoning = reasoningOf(message);
+    let reasoning = reasoningOf(message);
+    let content = typeof message.content === "string" ? message.content : "";
+    if (this.gemma4) {
+      let answer = "";
+      let thought = "";
+      const splitter = new ThoughtSplitter(text => { answer += text; }, text => { thought += text; });
+      splitter.push(content);
+      splitter.finish();
+      content = answer;
+      reasoning += thought;
+    }
     if (reasoning.length > 0) callbacks.onReasoning?.(reasoning);
     const result: ChatResult = {
-      content: typeof message.content === "string" ? message.content : "",
+      content,
       toolCalls: (message.tool_calls ?? []).map(normalizeToolCall).filter((c): c is ToolCall => c !== null),
     };
     if (reasoning.length > 0) result.reasoning = reasoning;
@@ -494,12 +569,24 @@ export class LlmClient {
     // (the callback shows it live; the result keeps the whole thing for the
     // history).
     let fullReasoning = "";
+    const answer = (text: string): void => {
+      full += text;
+      callbacks.onDelta?.(text);
+      if (signal.aborted) throw new DOMException("model request aborted", "AbortError");
+    };
+    const thought = (text: string): void => {
+      fullReasoning += text;
+      callbacks.onReasoning?.(text);
+      if (signal.aborted) throw new DOMException("model request aborted", "AbortError");
+    };
+    const splitter = this.gemma4 ? new ThoughtSplitter(answer, thought) : undefined;
     // Streamed tool calls arrive as fragments keyed by index; reassemble them.
     const calls = new Map<number, ToolCall>();
     // The endpoint's token count, when a chunk reports it (the final chunk
     // carries it; the last report wins).
     let usage: TokenUsage | undefined;
     const finish = (): ChatResult => {
+      splitter?.finish();
       const result: ChatResult = { content: full, toolCalls: [...calls.values()] };
       if (usage) result.usage = usage;
       if (fullReasoning.length > 0) result.reasoning = fullReasoning;
@@ -540,16 +627,14 @@ export class LlmClient {
           const content = delta.content;
           if (typeof content === "string" && content.length > 0) {
             phase.generating = true; // generation state is used only for timeout diagnostics
-            full += content;
-            callbacks.onDelta?.(content);
+            if (splitter) splitter.push(content);
+            else answer(content);
             if (signal.aborted) throw new DOMException("model request aborted", "AbortError");
           }
           const reasoning = reasoningOf(delta);
           if (reasoning.length > 0) {
             phase.generating = true; // generation state is used only for timeout diagnostics
-            callbacks.onReasoning?.(reasoning);
-            if (signal.aborted) throw new DOMException("model request aborted", "AbortError");
-            fullReasoning += reasoning;
+            thought(reasoning);
           }
           for (const tc of delta.tool_calls ?? []) {
             // Fragments arrive incrementally: the first usually carries

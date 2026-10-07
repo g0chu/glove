@@ -160,13 +160,17 @@ function promptMessages(detail, previous) {
     const current = all.filter(m => m.role !== 'system');
     // Start the loaded window at its latest input rather than replaying the
     // entire earlier conversation embedded in the first request.
-    if (!previous) return current.slice(Math.max(0, current.findLastIndex(m => m.role === 'user')));
+    if (!previous) return all.slice(Math.max(0, all.findLastIndex(m => m.role === 'user')));
     const before = (event(previous, 'model.request')?.messages || []).filter(m => m.role !== 'system');
     const result = event(previous, 'model.finished');
     if (result) before.push({ role: 'assistant', content: result.content, reasoning_content: result.reasoning, tool_calls: result.toolCalls });
     let common = 0;
     while (common < before.length && common < current.length && messageKey(before[common]) === messageKey(current[common])) common++;
-    return current.slice(common);
+    // Compare conversation entries without phase instructions, but render the
+    // original suffix so chime/reply instructions remain visible on every call,
+    // including identical retries that add no conversation entries.
+    const start = common > 0 ? all.indexOf(current[common - 1]) + 1 : 0;
+    return all.slice(start);
 }
 function drawEntry(detail, previous) {
     const root = node('section', undefined, 'entry');

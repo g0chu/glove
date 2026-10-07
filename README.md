@@ -26,6 +26,21 @@ npm install
 npm run dev            # or: npm run build && npm start
 ```
 
+## Gemma 4
+
+The client recognizes Gemma 4 model names automatically. If your server uses an
+alias such as `MODEL_NAME=local`, set `MODEL_COMPATIBILITY=gemma4`.
+The Gemma profile separates marked thinking from answer text in SSE and JSON,
+omits completed-turn reasoning from outgoing history while preserving active
+tool reasoning, puts images before text, and uses Google's recommended sampling
+settings. Stored history and original archive captures remain complete.
+
+Optional `MODEL_TEMPERATURE`, `MODEL_TOP_P`, `MODEL_TOP_K`, and
+`MODEL_CHAT_TEMPLATE_KWARGS` configure sampling and supported server template
+controls. `MODEL_COMPATIBILITY=generic` keeps generic endpoint behavior.
+See [GEMMA.md](GEMMA.md) for the documentation audit, configuration examples,
+server requirements, and capabilities this bridge does not expose.
+
 ## Behavior
 
 For llama-server installations affected by [llama.cpp #24440](https://github.com/ggml-org/llama.cpp/issues/24440)
@@ -59,9 +74,14 @@ without the affected tensor/MTP combination.
   bot shows a typing indicator while the model decides. YES runs a normal
   reply; NO optionally posts a short decision and reason. Only a `chime` tool
   call is accepted; plain text (including YES/NO and JSON) never decides. Chime decision and repair calls use the endpoint's default output limit; the bot sends no `max_tokens` cap.
-  An unusable decision gets one repair with unchanged tool schemas and an extra instruction; HTTP
-  failures, timeouts and outages do not retry. Both decision requests cap
-  output at 1,024 tokens (including reasoning on compatible endpoints).
+  Unusable decisions retry until valid or cancelled, with unchanged tool schemas and
+  one replaceable reminder describing the latest validation failure. Rejected text,
+  reasoning and tool calls are never added to the conversation. Recognized transient
+  connection failures before response headers get up to two delayed, cancellable
+  retries (250 ms, then 500 ms), with the prompt unchanged and each attempt archived.
+  HTTP failures, timeouts and permanent connection errors do not retry; persistent
+  connection outages stay silent after those two retries. Connection logs include
+  the underlying socket/DNS error code and address when available.
   Typing refreshes stop when the decision finishes. Failure logs
   identify the channel and message; streaming timeouts report whether generation
   started, distinguishing a first-token wait from unfinished generation.
@@ -283,17 +303,31 @@ request prefix; a NO waits for new activity with its decision still in history.
 The decision exchange is checkpointed atomically and survives restart and
 crash recovery without duplication. Compaction and overflow remove exchanges
 whole, preserving call/result pairing. Interrupted or unusable decisions are
-not retained. Unusable decisions still get one repair with unchanged schemas
-and `tool_choice: "auto"`.
+not retained. Unusable decisions retry with unchanged schemas and `tool_choice: "auto"`,
+keeping only the latest validation reminder.
 
 Each reply with chime enabled appends a fresh system instruction identifying
 its triggering Discord message and the message's index in that request. A direct
 mention requires a reply immediately; a YES turn continues its accepted decision.
 The instruction scopes historical chime instructions and decisions to their
-earlier phases, so a previous NO does not silence a later mention. It is transient:
+original requests, so a previous NO does not silence a later mention. It also keeps
+internal planning out of reply text while allowing user-facing explanations. It is transient:
 it stays with the current tool loop, is rebuilt for interruption/overflow retries,
 and never becomes a persistent conversation entry. Decision history and the shared
 request prefix remain intact.
+
+Built-in instructions keep each task separate: replies answer a specific message,
+chime decisions return one tool call, and compaction summarizes a specified older
+portion. Output rules live in the trailing task instruction; the chime schema
+only describes the tool. These suffixes stay after the shared history, preserving
+the common prefix instead of inserting a changing task at the start. Prompt or
+schema edits invalidate previously cached prefixes once; subsequent requests use
+the same layout. Existing archived decision instructions remain unchanged.
+
+Keep `MODEL_SYSTEM_PROMPT` focused on identity, subject guidance, tone, and resource
+locations. Avoid repeating phase rules there or requesting a written thinking
+process. If you want careful reasoning and concise replies, ask for careful
+answers with relevant explanations rather than exhaustive reasoning output.
 
 During replies, chime is a registered local tool. Its call and result are
 retained with any other calls in the round, including mixed responses. The
@@ -360,8 +394,11 @@ to describe when joining the conversation is useful, and summary guidance to
 describe which facts to preserve or how to format them. The gate always requires
 exactly one `chime` tool call and no chat text, even for a YES decision: the reply
 runs in a separate request. A response containing chat text alongside a valid
-decision call gets one repair; if still invalid, it stays silent and is not retained
-as conversation history. Separate reasoning remains allowed. Summary requests
+decision call keeps retrying; rejected responses stay silent and are not retained
+as conversation history. Separate reasoning remains allowed; leading closed `<think>` or `<analysis>` blocks
+and Gemma 4 `<|channel>thought ... <channel|>` blocks in decision response
+text are moved into reasoning before validation. Unmarked text
+or an unfinished block still retries. Summary requests
 always retain the fold boundary, output limit, and prohibition on answering the chat.
 Repairs identify the validation failure without repeating the rejected response.
 Every reply identifies its current trigger and phase, including after chime is

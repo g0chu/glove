@@ -1,3 +1,4 @@
+import { gemmaMessages, ThoughtSplitter, usesGemma4 } from "../src/llm/gemma.js";
 import { MemoryTools, registerMemoryTools } from "../src/tools/memorytools.js";
 import { FileTools, registerFileTools } from "../src/tools/filetools.js";
 import { articleText } from "../src/tools/zim/text.js";
@@ -54,7 +55,7 @@ import { MessageObservations } from "../src/bot/observations.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
 import { chimeReplyChat } from "../src/bot/chime-reply.js";
 import { executeReplyChime, chimeTools, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
-import { InterruptedError, isInterruptedError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
+import { InterruptedError, isInterruptedError, ModelConnectionError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { recordTurn } from "../src/bot/turn-record.js";
@@ -178,13 +179,13 @@ const ok = (name: string): void => {
         MODEL_API_URL: "http://localhost:1/v1/chat/completions", DISCORD_MESSAGE_STABLE_MS: "200",
         CHATS_FILE: path.join(dir, "chats.json"), CHATS_ARCHIVE_DIR: path.join(dir, "archive"),
         ARCHIVE_ATTACHMENTS_ENABLED: "false", MODEL_METRICS_ENABLED: "false",
-        MODEL_ENABLE_IMAGES: "false", MODEL_ENABLE_FILE_CONTENTS: "false", BOT_CHIME_ENABLED: mode === "chime" ? "true" : "false",
+        MODEL_ENABLE_IMAGES: "false", MODEL_ENABLE_FILE_CONTENTS: "false", BOT_CHIME_ENABLED: mode === "chime" || mode === "gemma" ? "true" : "false",
         WEBTOOLS_ENABLED: "false", FILETOOLS_ENABLED: "false", SHELLTOOLS_ENABLED: "false",
         ZIMTOOLS_ENABLED: "false", VAULTTOOLS_ENABLED: "false", MEMORYTOOLS_ENABLED: "false",
         CONTEXT_COMPACTION_MAX_TOKENS: "100000", MODEL_SYSTEM_PROMPT: "test prompt", FLOW_MODE: mode },
     });
-    for (const mode of ["live", "restart", "chime", "chime-off"]) {
-      if (mode === "chime") {
+    for (const mode of ["live", "restart", "chime", "chime-off", "gemma"]) {
+      if (mode === "chime" || mode === "gemma") {
         fs.rmSync(path.join(dir, "chats.json"), { force: true });
         fs.rmSync(path.join(dir, "archive"), { recursive: true, force: true });
       }
@@ -1008,6 +1009,14 @@ const ok = (name: string): void => {
     { role: "user", content: "Alice: hi" },
     { role: "user", content: "Bob (bot): should we ship it?" },
   ];
+  // Invalid responses keep retrying; end rejection-only tests with an endpoint failure.
+  const eventuallyUnavailable = (chat: ChimeChat): ChimeChat => {
+    let calls = 0;
+    return async (...args) => {
+      if (++calls > 3) throw new Error("test endpoint unavailable");
+      return chat(...args);
+    };
+  };
   const toolChat = (args: Record<string, unknown>): ChimeChat => async () => ({
     content: "",
     toolCalls: [{ id: "t1", name: "chime", arguments: JSON.stringify(args) }],
@@ -1024,18 +1033,18 @@ const ok = (name: string): void => {
     { respond: true, reason: "asks about me" }, "a string 'yes' decides");
   assert.deepEqual(await decideChime(toolChat({ respond: "no", reason: "off topic" }), transcript),
     { respond: false, reason: "off topic" }, "a string 'no' decides");
-  assert.equal(await decideChime(toolChat({ reason: "no flag" }), transcript), null, "a missing respond flag stays silent");
+  assert.equal(await decideChime(eventuallyUnavailable(toolChat({ reason: "no flag" })), transcript), null, "a missing respond flag stays silent");
   assert.deepEqual(await decideChime(toolChat({ respond: false }), transcript),
     { respond: false, reason: "" }, "a missing reason is tolerated");
   for (const answer of ["YES — direct question", "NO chatter", "**YES**", "maybe", "",
     '{"respond":true,"reason":"question"}', '```json\n{"respond":false}\n```']) {
-    assert.equal(await decideChime(textChat(answer), transcript), null, "text never decides");
+    assert.equal(await decideChime(eventuallyUnavailable(textChat(answer)), transcript), null, "text never decides");
   }
   assert.equal(await decideChime(textChat("", true), transcript), null);
   ok("chime: only tool calls decide; text, JSON and failed calls stay silent");
-  assert.equal(await decideChime(async () => ({ content: "", reasoning: "YES", toolCalls: [] }), transcript), null);
-  assert.equal(await decideChime(async () => ({ content: "YES", toolCalls: [{ id: "t", name: "other", arguments: '{"respond":true}' }] }), transcript), null);
-  assert.equal(await decideChime(async () => ({ content: "NO chatter", toolCalls: [{ id: "t", name: "chime", arguments: "broken" }] }), transcript), null);
+  assert.equal(await decideChime(eventuallyUnavailable(async () => ({ content: "", reasoning: "YES", toolCalls: [] })), transcript), null);
+  assert.equal(await decideChime(eventuallyUnavailable(async () => ({ content: "YES", toolCalls: [{ id: "t", name: "other", arguments: '{"respond":true}' }] })), transcript), null);
+  assert.equal(await decideChime(eventuallyUnavailable(async () => ({ content: "NO chatter", toolCalls: [{ id: "t", name: "chime", arguments: "broken" }] })), transcript), null);
   ok("chime: unrelated tools, reasoning and text beside broken arguments never decide");
 
   // Repairs preserve both the schema prefix and tool choice.
@@ -1075,8 +1084,31 @@ const ok = (name: string): void => {
     assert.ok(!repair.includes("You should ship it today."), "repair does not feed a rejected chat answer back to the model");
   }
   let attempts = 0;
-  assert.equal(await decideChime(async () => { attempts++; return { content: "maybe", toolCalls: [] }; }, transcript), null);
-  assert.equal(attempts, 2, "unusable decisions stop after one repair");
+  const retryRequests: ChatMessage[][] = [];
+  let acceptedRetry: ChatMessage[] = [];
+  assert.deepEqual(await decideChime(async (messages) => {
+    retryRequests.push(messages);
+    attempts++;
+    if (attempts <= 12) return { content: attempts % 2 ? "rejected secret answer" : "", reasoning: "rejected secret reasoning", toolCalls: [] };
+    return { content: "", toolCalls: [{ id: "accepted", name: "chime", arguments: '{"respond":false,"reason":"quiet"}' }] };
+  }, transcript, undefined, undefined, undefined, undefined, chimeTools([]), exchange => { acceptedRetry = exchange; }),
+  { respond: false, reason: "quiet" });
+  assert.equal(attempts, 13, "validation retries have no fixed limit");
+  for (let i = 1; i < retryRequests.length; i++) {
+    assert.deepEqual(retryRequests[i].slice(0, -1), retryRequests[0], "every retry preserves the original prefix");
+    assert.equal(retryRequests[i].length, transcript.length + 2, "only one failure reminder is kept");
+    assert.ok(String(retryRequests[i].at(-1)!.content).includes(i % 2 ? "plain text was returned" : "reasoning was returned"), "reminder describes the latest failure");
+    assert.ok(!JSON.stringify(retryRequests[i]).includes("rejected secret"), "rejected content and reasoning never enter requests");
+  }
+  assert.equal(acceptedRetry.length, 5, "retained exchange contains one reminder and only the accepted response");
+  assert.ok(!JSON.stringify(acceptedRetry).includes("rejected secret"));
+  const cancelRetries = new AbortController();
+  let cancelledCalls = 0;
+  await assert.rejects(decideChime(async () => {
+    if (++cancelledCalls === 4) setImmediate(() => cancelRetries.abort());
+    return { content: "invalid", toolCalls: [] };
+  }, transcript, cancelRetries.signal), InterruptedError);
+  assert.equal(cancelledCalls, 4, "activity stops retries before another request");
   for (const failure of [new Error("HTTP 400: tool_choice unsupported"), new Error("HTTP 422: tools unsupported"), new Error("model endpoint returned HTTP 401: unauthorized"), new Error("model request timed out"), new Error("HTTP 500: unavailable")]) {
     attempts = 0;
     assert.equal(await decideChime(async () => { attempts++; throw failure; }, transcript), null);
@@ -1090,7 +1122,109 @@ const ok = (name: string): void => {
     }, transcript), err => err === failure);
     assert.equal(attempts, 2, "repair propagates interruption/overflow to the turn runner");
   }
-  ok("chime: validated decisions repair once, reject conflicts, preserve the prefix and propagate cancellation/overflow");
+  ok("chime: validated decisions retry until valid, reject conflicts, preserve the prefix and propagate cancellation/overflow");
+
+  const connectionError = (code: string): ModelConnectionError => new ModelConnectionError("http://localhost:8080/v1/chat/completions",
+    new TypeError("fetch failed", { cause: Object.assign(new Error("socket error"), { code, address: "127.0.0.1", port: 8080 }) }));
+  const socketError = connectionError("ECONNRESET");
+  assert.ok(socketError.retryable);
+  assert.match(socketError.message, /fetch failed.*ECONNRESET.*127\.0\.0\.1:8080/);
+  assert.ok(socketError.cause instanceof TypeError, "original connection cause is preserved");
+  const undiciError = new ModelConnectionError("http://localhost:8080", new TypeError("fetch failed", {
+    cause: Object.assign(new Error("other side closed"), { code: "UND_ERR_SOCKET", socket: { remoteAddress: "127.0.0.1", remotePort: 8080 } }),
+  }));
+  assert.ok(undiciError.retryable);
+  assert.match(undiciError.message, /UND_ERR_SOCKET.*127\.0\.0\.1:8080.*other side closed/);
+  const refused = new ModelConnectionError("http://localhost:8080", new TypeError("fetch failed", {
+    cause: new AggregateError([Object.assign(new Error("refused v6"), { code: "ECONNREFUSED", address: "::1", port: 8080 }),
+      Object.assign(new Error("refused v4"), { code: "ECONNREFUSED", address: "127.0.0.1", port: 8080 })]),
+  }));
+  assert.ok(refused.retryable);
+  assert.match(refused.message, /::1:8080/);
+  assert.match(refused.message, /127\.0\.0\.1:8080/);
+  for (const error of [connectionError("CERT_HAS_EXPIRED"), connectionError("UND_ERR_INVALID_ARG"),
+    connectionError("UND_ERR_CONNECT_TIMEOUT"), new ModelConnectionError("http://localhost", new TypeError("fetch failed"))]) {
+    let calls = 0;
+    assert.ok(!error.retryable);
+    assert.equal(await decideChime(async () => { calls++; throw error; }, transcript), null);
+    assert.equal(calls, 1, "permanent or unknown connection failures never retry");
+  }
+  const connectionArchiveDir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-chime-connection-"));
+  const connectionArchive = new ConversationArchive(connectionArchiveDir);
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    let calls = 0;
+    const requests: ChatMessage[][] = [];
+    let accepted: ChatMessage[] = [];
+    const connectionChat = archiveChat(connectionArchive, { purpose: "chime" }, async (messages, callbacks) => {
+      callbacks?.onRequest?.({ model: "test", messages });
+      requests.push(messages);
+      if (++calls < 3) throw socketError;
+      return { content: "", toolCalls: [{ id: "reconnected", name: "chime", arguments: '{"respond":false,"reason":"quiet"}' }] };
+    });
+    const pending = decideChime((messages, tools, signal, options) => connectionChat(messages, undefined, tools, signal, options),
+      transcript, undefined, undefined, undefined, undefined, chimeTools([]), value => { accepted = value; });
+    await ticks(3);
+    assert.equal(calls, 1);
+    mock.timers.tick(249);
+    await ticks(3);
+    assert.equal(calls, 1, "retry waits instead of spinning against a broken connection");
+    mock.timers.tick(1);
+    await ticks(3);
+    assert.equal(calls, 2);
+    mock.timers.tick(500);
+    assert.deepEqual(await pending, { respond: false, reason: "quiet" });
+    assert.equal(calls, 3);
+    for (const request of requests) assert.deepEqual(request, requests[0], "network failures never change the model's prompt");
+    assert.equal(accepted.length, 4, "only the successful decision exchange is retained");
+    assert.ok(!JSON.stringify(accepted).includes("fetch failed"));
+    const connectionRecords = [...connectionArchive.records()];
+    assert.equal(connectionRecords.filter(record => record.type === "model.started").length, 3);
+    assert.equal(connectionRecords.filter(record => record.type === "model.request").length, 3);
+    assert.equal(connectionRecords.filter(record => record.type === "model.failed").length, 2);
+    assert.equal(connectionRecords.filter(record => record.type === "model.finished").length, 1);
+    assert.equal(new Set(connectionRecords.filter(record => record.type === "model.started").map(record => record.scope.requestId)).size, 3,
+      "each transport retry has independent durable evidence");
+
+
+    calls = 0;
+    const unavailable = decideChime(async () => { calls++; throw connectionError("ECONNREFUSED"); }, transcript);
+    await ticks(3);
+    mock.timers.tick(250);
+    await ticks(3);
+    mock.timers.tick(500);
+    assert.equal(await unavailable, null);
+    assert.equal(calls, 3, "persistent outages stop after two retries");
+
+    for (const secondRetry of [false, true]) {
+      calls = 0;
+      const controller = new AbortController();
+      const cancelled = decideChime(async () => { calls++; throw socketError; }, transcript, controller.signal);
+      const checked = assert.rejects(cancelled, InterruptedError);
+      await ticks(3);
+      if (secondRetry) { mock.timers.tick(250); await ticks(3); }
+      controller.abort();
+      await checked;
+      mock.timers.tick(10000);
+      await ticks(3);
+      assert.equal(calls, secondRetry ? 2 : 1, "activity during backoff prevents another request");
+    }
+
+    calls = 0;
+    const invalidThenDisconnected: ChatMessage[][] = [];
+    const repaired = decideChime(async messages => {
+      invalidThenDisconnected.push(messages);
+      if (++calls === 1) return { content: "invalid secret answer", toolCalls: [] };
+      if (calls === 2) throw socketError;
+      return { content: "", toolCalls: [{ id: "fixed", name: "chime", arguments: '{"respond":false}' }] };
+    }, transcript);
+    await ticks(3);
+    mock.timers.tick(250);
+    assert.deepEqual(await repaired, { respond: false, reason: "" });
+    assert.deepEqual(invalidThenDisconnected[2], invalidThenDisconnected[1], "connection retry preserves only the latest validation reminder");
+    assert.ok(!JSON.stringify(invalidThenDisconnected).includes("invalid secret answer"));
+  } finally { mock.timers.reset(); connectionArchive.close(); fs.rmSync(connectionArchiveDir, { recursive: true, force: true }); }
+  ok("chime connections: actionable causes, bounded delayed retries, clean prompts and cancellable backoff");
 
   // The decision instruction follows the shared context; chime is on the wire.
   let sent: ChatMessage[] = [];
@@ -1113,7 +1247,7 @@ const ok = (name: string): void => {
     assert.equal(msgs[transcript.length].content,
       `Custom guidance for deciding whether to reply (subject to the phase rules below):\nCustom chime\nSecond line\n\n${CHIME_SYSTEM_PROMPT}`);
     customCalls++;
-    return { content: customCalls === 1 ? "invalid" : "NO chatter", toolCalls: [] };
+    return customCalls === 1 ? { content: "invalid", toolCalls: [] } : { content: "", toolCalls: [{ id: "custom", name: "chime", arguments: '{"respond":false,"reason":"chatter"}' }] };
   }, transcript, undefined, undefined, undefined, "Custom chime\nSecond line");
   assert.equal(customCalls, 2, "custom prompt also reaches the repair request");
   await decideChime(spying, transcript, undefined, undefined, undefined, "  ");
@@ -1123,11 +1257,11 @@ const ok = (name: string): void => {
   for (const respond of [true, false]) {
     let calls = 0;
     let accepted = 0;
-    assert.equal(await decideChime(async () => {
+    assert.equal(await decideChime(eventuallyUnavailable(async () => {
       calls++;
       return { content: "Here is my answer to the chat.", toolCalls: [{ id: "mixed", name: "chime", arguments: JSON.stringify({ respond, reason: "relevant" }) }] };
-    }, transcript, undefined, undefined, undefined, undefined, chimeTools([]), () => { accepted++; }), null);
-    assert.equal(calls, 2, "mixed answers receive one repair then stay silent");
+    }), transcript, undefined, undefined, undefined, undefined, chimeTools([]), () => { accepted++; }), null);
+    assert.equal(calls, 3, "mixed answers keep retrying until the endpoint fails");
     assert.equal(accepted, 0, "mixed answers cannot enter shared history");
   }
   let whitespaceExchange: ChatMessage[] = [];
@@ -1136,6 +1270,40 @@ const ok = (name: string): void => {
   transcript, undefined, undefined, undefined, undefined, chimeTools([]), (exchange) => { whitespaceExchange = exchange; }),
   { respond: true, reason: "relevant" });
   assert.equal(whitespaceExchange[1].reasoningContent, "Consider whether joining is helpful.", "reasoning remains valid and retained");
+  for (const [open, close] of [["<think>", "</think>"], ["<analysis>", "</analysis>"], ["<|channel>thought\n", "<channel|>"]]) {
+    let exchange: ChatMessage[] = [];
+    let calls = 0;
+    assert.deepEqual(await decideChime(async () => {
+      calls++;
+      return { content: `${open}Consider joining.${close}`, reasoning: "Separate thinking.",
+        toolCalls: [{ id: "marked", name: "chime", arguments: '{"respond":false,"reason":"quiet"}' }] };
+    }, transcript, undefined, undefined, undefined, undefined, chimeTools([]), value => { exchange = value; }),
+    { respond: false, reason: "quiet" });
+    assert.equal(calls, 1, "explicitly marked thinking does not reject a valid tool call");
+    assert.equal(exchange[1].content, "", "marked thinking stays out of response text");
+    assert.equal(exchange[1].reasoningContent, "Separate thinking.\n\nConsider joining.");
+  }
+  for (const content of ["<|channel>thought\nUnfinished thinking", "<|channel>thought\nThinking.<channel|>Here is my answer.", "<think>Unfinished thinking", "<think>Thinking.</think>Here is my answer.", "Unmarked thinking beside a call."]) {
+    let calls = 0;
+    assert.equal(await decideChime(eventuallyUnavailable(async () => {
+      calls++;
+      return { content, toolCalls: [{ id: "bad", name: "chime", arguments: '{"respond":true}' }] };
+    }), transcript), null);
+    assert.equal(calls, 3, "unclosed thinking or remaining response text keeps retrying");
+  }
+  assert.deepEqual(await decideChime(async () => ({ content: "<|channel>thought\n<channel|>",
+    toolCalls: [{ id: "empty-thought", name: "chime", arguments: '{"respond":false}' }] }), transcript),
+  { respond: false, reason: "" }, "Gemma's empty thinking block is allowed");
+  let thinkingCalls = 0;
+  let thinkingExchange: ChatMessage[] = [];
+  assert.deepEqual(await decideChime(async messages => {
+    if (++thinkingCalls === 1) return { content: "<think>Rejected thinking.</think>", toolCalls: [] };
+    assert.ok(String(messages.at(-1)!.content).includes("reasoning was returned without a chime"));
+    assert.ok(!JSON.stringify(messages).includes("Rejected thinking"));
+    return { content: "", toolCalls: [{ id: "fixed", name: "chime", arguments: '{"respond":false}' }] };
+  }, transcript, undefined, undefined, undefined, undefined, chimeTools([]), value => { thinkingExchange = value; }),
+  { respond: false, reason: "" });
+  assert.ok(!JSON.stringify(thinkingExchange).includes("Rejected thinking"));
   ok("chime: mandatory phase rules accompany custom guidance; mixed chat answers repair without entering history");
 
   // The NO line posted to the channel: a UI line with the reason, truncated.
@@ -1157,7 +1325,7 @@ const ok = (name: string): void => {
     let seenSignal: AbortSignal | undefined;
     const signalChat: ChimeChat = async (_msgs, _tools, signal) => {
       seenSignal = signal;
-      return { content: "", toolCalls: [] };
+      return { content: "", toolCalls: [{ id: "signal", name: "chime", arguments: '{"respond":false}' }] };
     };
     const ctrl = new AbortController();
     await decideChime(signalChat, transcript, ctrl.signal);
@@ -5239,6 +5407,85 @@ const ok = (name: string): void => {
   }
 }
 
+// ---------------------------------------------------------- Gemma 4 wire compatibility --
+{
+  const env = { DISCORD_TOKEN: "test", MODEL_API_URL: "http://localhost:8080/v1/chat/completions" };
+  const defaults = parseConfig(env);
+  assert.deepEqual(defaults.errors, []);
+  assert.equal(defaults.config.model.compatibility, "auto");
+  assert.equal(defaults.config.model.temperature, undefined);
+  assert.equal(defaults.config.model.chatTemplateKwargs, undefined);
+  const configured = parseConfig({ ...env, MODEL_COMPATIBILITY: "gemma4", MODEL_TEMPERATURE: "1", MODEL_TOP_P: "0.95", MODEL_TOP_K: "64",
+    MODEL_CHAT_TEMPLATE_KWARGS: '{"enable_thinking":true,"preserve_thinking":true}' });
+  assert.deepEqual(configured.errors, []);
+  assert.equal(configured.config.model.topK, 64);
+  assert.deepEqual(configured.config.model.chatTemplateKwargs, { enable_thinking: true, preserve_thinking: true });
+  assert.equal(parseConfig({ ...env, MODEL_TOP_K: "endpoint" }).config.model.topK, null);
+  for (const [key, value] of [["MODEL_COMPATIBILITY", "gemma3"], ["MODEL_TEMPERATURE", "NaN"], ["MODEL_TEMPERATURE", "-1"],
+    ["MODEL_TOP_P", "1.1"], ["MODEL_TOP_K", "1.5"], ["MODEL_CHAT_TEMPLATE_KWARGS", "null"],
+    ["MODEL_CHAT_TEMPLATE_KWARGS", "[]"], ["MODEL_CHAT_TEMPLATE_KWARGS", "broken"],
+    ["MODEL_CHAT_TEMPLATE_KWARGS", '{"enable_thinking":"false"}']]) {
+    assert.ok(parseConfig({ ...env, [key]: value }).errors.some(error => error.includes(key)), `${key} rejects ${value}`);
+  }
+  for (const model of ["google/gemma-4-31B-it-qat-q4_0-gguf", "gemma4:31b", "Gemma_4_31B", "unsloth/gemma-4-31B-it-QAT.gguf"]) assert.ok(usesGemma4(model));
+  for (const model of ["local", "gemma-3-27b", "gemma-40", "other-gemma-42"]) assert.ok(!usesGemma4(model));
+  assert.ok(usesGemma4("local", "gemma4"));
+  assert.ok(!usesGemma4("gemma-4-31b", "generic"));
+  ok("Gemma config: profiles, model IDs, sampling overrides and typed template controls");
+
+  for (const [open, close] of [["<|channel>thought\n", "<channel|>"], ["<think>", "</think>"], ["<analysis>", "</analysis>"]]) {
+    const raw = `${open}Think 🌍 carefully.${close}Answer 🌍.`;
+    for (let split = 0; split <= raw.length; split++) {
+      let answer = "";
+      let thought = "";
+      const splitter = new ThoughtSplitter(text => { answer += text; }, text => { thought += text; });
+      splitter.push(raw.slice(0, split));
+      splitter.push(raw.slice(split));
+      splitter.finish();
+      assert.equal(answer, "Answer 🌍.", `answer at split ${split}`);
+      assert.equal(thought.trim(), "Think 🌍 carefully.", `thought at split ${split}`);
+    }
+  }
+  for (const [raw, expectedAnswer, expectedThought] of [
+    ["<|channel>thought\n<channel|>Answer", "Answer", ""],
+    ["<|channel>thought\nUnfinished thought", "", "Unfinished thought"],
+    ["<think>First</think><|channel>thought\nSecond<channel|>Answer", "Answer", "First\nSecond"],
+    ["A code sample: <|channel>thought\nexample<channel|>", "A code sample: <|channel>thought\nexample<channel|>", ""],
+    ["  <ordinary> text", "  <ordinary> text", ""],
+    ["<", "<", ""],
+  ]) {
+    let answer = "";
+    let thought = "";
+    const splitter = new ThoughtSplitter(text => { answer += text; }, text => { thought += text; });
+    for (const character of raw) splitter.push(character);
+    splitter.finish();
+    assert.equal(answer, expectedAnswer);
+    assert.equal(thought.trim(), expectedThought);
+  }
+  ok("Gemma thoughts: every marker split, Unicode, empty/unfinished blocks and literal answer examples");
+
+  const messages: ChatMessage[] = [
+    { role: "system", content: "Master prompt" },
+    { role: "user", content: "Old question" },
+    { role: "assistant", content: "<|channel>thought\nold inline<channel|>Old answer", reasoningContent: "old separate" },
+    { role: "user", content: [{ type: "text", text: "new question" }, { type: "image_url", image_url: { url: "data:image/png;base64,eA==" } }, { type: "text", text: "caption" }] },
+    { role: "assistant", content: "<think>active inline</think>", reasoningContent: "active separate", toolCalls: [{ id: "active", name: "echo", arguments: "{}" }] },
+    { role: "tool", toolCallId: "active", name: "echo", content: "<think>literal tool data</think>" },
+  ];
+  const original = JSON.stringify(messages);
+  const prepared = gemmaMessages(messages, 4);
+  assert.equal(prepared[2].content, "Old answer");
+  assert.equal(prepared[2].reasoningContent, undefined);
+  assert.equal(prepared[4].content, "");
+  assert.equal(prepared[4].reasoningContent, "active separateactive inline");
+  assert.deepEqual(prepared[4].toolCalls, messages[4].toolCalls);
+  assert.equal(prepared[5].content, messages[5].content, "tool data is never interpreted as model thinking");
+  assert.deepEqual((prepared[3].content as ContentPart[]).map(part => part.type), ["image_url", "text", "text"]);
+  assert.equal(gemmaMessages(messages)[4].reasoningContent, undefined, "completed history strips all reasoning by default");
+  assert.equal(JSON.stringify(messages), original, "wire preparation does not mutate persisted history or attachments");
+  ok("Gemma history: old thoughts omitted, active tool thoughts preserved, image order stable and stored data untouched");
+}
+
 // ------------------------------------------------------------------- llm --
 {
   const seenRequests: Array<{ auth: string | undefined; ct: string | undefined; body: unknown; url: string }> = [];
@@ -5249,6 +5496,43 @@ const ok = (name: string): void => {
     req.on("end", () => {
       const url = req.url ?? "";
       seenRequests.push({ auth: req.headers.authorization, ct: req.headers["content-type"], body: JSON.parse(body), url });
+      if (url.includes("reconnect-chime")) {
+        if (seenRequests.filter(request => request.url === url).length === 1) {
+          req.socket.destroy();
+          return;
+        }
+        const toolCalls = [{ id: "reconnected", type: "function", function: { name: "chime", arguments: '{"respond":false,"reason":"quiet"}' } }];
+        if (JSON.parse(body).stream) {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.end(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: toolCalls.map(call => ({ ...call, index: 0 })) } }] })}\n\ndata: [DONE]\n\n`);
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ choices: [{ message: { content: "", tool_calls: toolCalls } }] }));
+        }
+        return;
+      }
+      if (url.includes("disconnect")) {
+        req.socket.destroy();
+        return;
+      }
+      if (url.includes("gemma")) {
+        const request = JSON.parse(body);
+        const toolCalls = url.includes("tools") ? [{ id: "gemma-call", type: "function", function: { name: "echo", arguments: { value: "🌍" } } }] : [];
+        const content = "<|channel>thought\nInline thinking 🌍.<channel|>" + (toolCalls.length ? "" : "Visible answer 🌍.");
+        if (!request.stream) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ choices: [{ message: { content, reasoning_content: "Separate thinking. ", tool_calls: toolCalls } }],
+            usage: { prompt_tokens: 123, completion_tokens: 45 } }));
+        } else {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "Separate thinking. " } }] })}\n\n`);
+          for (const character of content) res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: character } }] })}\n\n`);
+          if (toolCalls.length) res.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: toolCalls.map((call, index) => ({ ...call, index })) } }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 123, completion_tokens: 45 } })}\n\n`);
+          res.end("data: [DONE]\n\n");
+        }
+        return;
+      }
       if (url.includes("chime-recovery")) {
         const request = JSON.parse(body);
         if (request.tools) {
@@ -5501,6 +5785,66 @@ const ok = (name: string): void => {
   });
   ok("llm: streaming SSE (malformed/comment lines tolerated, contract correct)");
 
+  for (const stream of [true, false]) {
+    for (const withTools of [false, true]) {
+      let answer = "";
+      let thought = "";
+      let bytes = "";
+      const model = new LlmClient({ apiUrl: `${base}/gemma${withTools ? "-tools" : ""}`, apiKey: "none", model: "google/gemma-4-31B-it-qat",
+        stream, timeoutMs: 5000, chatTemplateKwargs: { enable_thinking: true } });
+      const input: ChatMessage[] = [
+        { role: "user", content: "old" }, { role: "assistant", content: "previous answer", reasoningContent: "old thoughts" },
+        { role: "user", content: "new" }, { role: "assistant", content: "", reasoningContent: "active thoughts", toolCalls: [{ id: "current", name: "echo", arguments: "{}" }] },
+        { role: "tool", toolCallId: "current", name: "echo", content: "result" },
+      ];
+      const result = await model.chat(input, { onDelta: text => { answer += text; }, onReasoning: text => { thought += text; },
+        onResponseBytes: value => { bytes += Buffer.from(value).toString("utf8"); } }, withTools ? [{ name: "echo", description: "echo", parameters: { type: "object" } }] : undefined,
+      undefined, { reasoningFromIndex: 3 });
+      assert.equal(result.content, withTools ? "" : "Visible answer 🌍.");
+      assert.equal(result.reasoning, "Separate thinking. \nInline thinking 🌍.");
+      assert.equal(thought, result.reasoning);
+      if (stream) assert.equal(answer, result.content, "live callbacks never expose thinking as reply text");
+      const rawContent = stream ? bytes.split("\n").filter(line => line.startsWith("data: {")).map(line =>
+        (JSON.parse(line.slice(6)).choices?.[0]?.delta?.content as string | undefined) ?? "").join("")
+        : JSON.parse(bytes).choices[0].message.content;
+      assert.ok(rawContent.includes("<|channel>thought"), "raw archive bytes keep the original marked response");
+      assert.deepEqual(result.usage, { input: 123, output: 45 });
+      if (withTools) assert.deepEqual(result.toolCalls, [{ id: "gemma-call", name: "echo", arguments: '{"value":"🌍"}' }]);
+      const request = seenRequests.at(-1)!.body as Record<string, unknown>;
+      assert.equal(request.temperature, 1);
+      assert.equal(request.top_p, 0.95);
+      assert.equal(request.top_k, 64);
+      assert.deepEqual(request.chat_template_kwargs, { enable_thinking: true });
+      const wire = request.messages as Array<Record<string, unknown>>;
+      assert.equal(wire[1].reasoning_content, undefined);
+      assert.equal(wire[3].reasoning_content, "active thoughts");
+      assert.equal(input[1].reasoningContent, "old thoughts", "stored input remains complete");
+    }
+  }
+  const gemmaAbort = new AbortController();
+  let cancelledAnswer = "";
+  let cancelledThinking = "";
+  await assert.rejects(new LlmClient({ apiUrl: `${base}/gemma`, apiKey: "none", model: "gemma-4-31b", stream: true, timeoutMs: 5000 })
+    .chat([], { onDelta: text => { cancelledAnswer += text; }, onReasoning: text => {
+      cancelledThinking += text;
+      if (cancelledThinking.includes("Inline")) gemmaAbort.abort();
+    } }, undefined, gemmaAbort.signal), InterruptedError);
+  assert.equal(cancelledAnswer, "", "activity during inline Gemma reasoning prevents reply delivery");
+  const overriddenGemma = new LlmClient({ apiUrl: `${base}/gemma`, apiKey: "none", model: "local", compatibility: "gemma4", stream: false,
+    timeoutMs: 5000, temperature: 0.7, topP: 0.8, topK: null });
+  await overriddenGemma.chat([]);
+  const overrideBody = seenRequests.at(-1)!.body as Record<string, unknown>;
+  assert.equal(overrideBody.temperature, 0.7);
+  assert.equal(overrideBody.top_p, 0.8);
+  assert.equal(Object.hasOwn(overrideBody, "top_k"), false);
+  assert.equal(Object.hasOwn(overrideBody, "chat_template_kwargs"), false);
+  const genericGemma = new LlmClient({ apiUrl: `${base}/gemma`, apiKey: "none", model: "gemma-4-31B", compatibility: "generic", stream: false, timeoutMs: 5000 });
+  assert.ok((await genericGemma.chat([])).content.includes("<|channel>thought"), "generic opt-out leaves model behavior unchanged");
+  const genericBody = seenRequests.at(-1)!.body as Record<string, unknown>;
+  assert.equal(Object.hasOwn(genericBody, "temperature"), false);
+  assert.equal(Object.hasOwn(genericBody, "top_k"), false);
+  ok("Gemma HTTP: SSE/JSON thinking separation, tool arguments, exact raw captures, sampling and history controls");
+
   const nsClient = new LlmClient({
     apiUrl: `${base}/v1/nonstream`,
     apiKey: "k",
@@ -5699,6 +6043,25 @@ const ok = (name: string): void => {
     /could not reach model endpoint/,
   );
   ok("llm: connection refused reported honestly");
+  await assert.rejects(new LlmClient({ apiUrl: `${base}/v1/disconnect`, apiKey: "none", model: "m", stream: false, timeoutMs: 5000 }).chat([]),
+    error => error instanceof ModelConnectionError && error.retryable && /UND_ERR_SOCKET|ECONNRESET/.test(error.message));
+  ok("llm: a live server closing a connection reports its actual retryable socket cause");
+
+  for (const stream of [false, true]) {
+    const apiUrl = `${base}/v1/reconnect-chime-${stream}`;
+    const client = new LlmClient({ apiUrl, apiKey: "none", model: "qwen", stream, timeoutMs: 5000 });
+    const decision = await decideChime((messages, tools, signal, options) => client.chat(messages, undefined, tools, signal, options),
+      [{ role: "user", content: "hello" }]);
+    assert.deepEqual(decision, { respond: false, reason: "quiet" });
+    const requests = seenRequests.filter(request => request.url === new URL(apiUrl).pathname);
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[0].body, requests[1].body, "transport recovery preserves the exact generic request");
+    for (const key of ["temperature", "top_p", "top_k", "chat_template_kwargs"]) {
+      assert.ok(!(key in (requests[0].body as Record<string, unknown>)), "generic models receive no implicit Gemma controls");
+    }
+  }
+  ok("llm: non-Gemma chime recovers from a real dropped connection in JSON and SSE modes");
+
 
   // tool calls: streamed fragments reassembled by index; tools on the wire;
   // assistant+tool messages serialized to the OpenAI wire shape
@@ -5810,7 +6173,11 @@ const ok = (name: string): void => {
   const prefixStart = seenRequests.length;
   const wireChat: ChatFn = (...args) => nsClient.chat(...args);
   // This mock returns plain text, so the decision exercises its repair too.
-  await decideChime((messages, tools, signal, options) => wireChat(messages, undefined, tools, signal, options),
+  let prefixAttempts = 0;
+  await decideChime(async (messages, tools, signal, options) => {
+    const response = await wireChat(messages, undefined, tools, signal, options);
+    return ++prefixAttempts === 1 ? response : { content: "", toolCalls: [{ id: "wire", name: "chime", arguments: '{"respond":false}' }] };
+  },
     prefixMessages, undefined, undefined, undefined, undefined, chimeTools(prefixTools));
   await chimeReplyChat(wireChat)(prefixMessages, undefined, prefixTools);
   const prefixBodies = seenRequests.slice(prefixStart).map((r) => r.body as Record<string, unknown>);
@@ -6065,7 +6432,11 @@ const ok = (name: string): void => {
       let finish!: (result: ChatResult) => void;
       let fail!: (error: Error) => void;
       const response = new Promise<ChatResult>((resolve, reject) => { finish = resolve; fail = reject; });
-      const pending = decideChime(() => response, [], undefined,
+      let typingCalls = 0;
+      const pending = decideChime(() => {
+        if (++typingCalls > 1) throw new Error("test endpoint unavailable");
+        return response;
+      }, [], undefined,
         { sendTyping: async () => { typing++; }, intervalMs: 100 });
       const checked = outcome === "interrupted" || outcome === "overflow" ? assert.rejects(pending) : pending;
       assert.equal(typing, 1, "decision starts typing immediately");
@@ -6895,7 +7266,7 @@ const ok = (name: string): void => {
   let accepted = 0;
   await assert.rejects(decideChime(async () => { throw new InterruptedError(); }, [], undefined, undefined,
     undefined, undefined, chimeTools([]), () => { accepted++; }), InterruptedError);
-  await decideChime(async () => ({ content: "invalid", toolCalls: [] }), [], undefined, undefined,
+  await decideChime(async () => { throw new Error("endpoint unavailable"); }, [], undefined, undefined,
     undefined, undefined, chimeTools([]), () => { accepted++; });
   assert.equal(accepted, 0, "interrupted and invalid decisions cannot enter history");
   ok("chime history: YES/NO repairs preserve exact prefixes through restart, catch-up, compaction, overflow and clear");
@@ -7185,6 +7556,36 @@ const ok = (name: string): void => {
       { role: 'user', content: 'Already in earlier history' }, { role: 'assistant', content: 'Earlier answer' }, { role: 'user', content: 'Latest input' }
     ] } }])).map(m => m.content).join(' ')`).runInNewContext(browser) as string;
     assert.equal(initialWindow, "Latest input", "initial page does not replay history embedded in the first request");
+
+    const phasePrompts = JSON.parse(new Script(`
+      const chimeMessages = [
+        { role: 'system', content: 'Master instructions' },
+        { role: 'user', content: 'Earlier input' },
+        { role: 'assistant', content: 'Earlier answer' },
+        { role: 'user', content: 'Latest input' },
+        { role: 'system', content: 'Return exactly one chime tool call' }
+      ];
+      const chimeRequest = fixture('chime-prompt', [{ type: 'model.request', data: { messages: chimeMessages } }]);
+      const repairRequest = fixture('chime-repair', [{ type: 'model.request', data: { messages: chimeMessages.concat([
+        { role: 'system', content: 'Invalid decision: retry with a tool call' }
+      ]) } }]);
+      const compactInitial = promptMessages(chimeRequest).map(m => m.content);
+      const compactRetry = promptMessages(chimeRequest, chimeRequest).map(m => m.content);
+      const compactRepair = promptMessages(repairRequest, chimeRequest).map(m => m.content);
+      $('entries').replaceChildren(drawEntry(repairRequest, chimeRequest));
+      $('prompts').checked = true;
+      const full = promptMessages(chimeRequest).map(m => m.content);
+      $('prompts').checked = false;
+      JSON.stringify({ compactInitial, compactRetry, compactRepair, full });
+    `).runInNewContext(browser) as string);
+    assert.deepEqual(phasePrompts.compactInitial, ["Latest input", "Return exactly one chime tool call"]);
+    assert.deepEqual(phasePrompts.compactRetry, ["Return exactly one chime tool call"], "unchanged retries still display their phase instructions");
+    assert.deepEqual(phasePrompts.compactRepair, ["Return exactly one chime tool call", "Invalid decision: retry with a tool call"]);
+    assert.equal(phasePrompts.full[0], "Master instructions", "full prompts retain leading system instructions");
+    const instructionText = visibleText(element("entries"));
+    assert.ok(instructionText.includes("Instructions") && instructionText.includes("Return exactly one chime tool call"));
+    assert.ok(instructionText.includes("Invalid decision: retry with a tool call"), "compact feed renders both trailing system blocks");
+    new Script(`items = [first]; rendered.clear(); renderFeed();`).runInNewContext(browser);
 
     assert.equal(element("feed").scrollTop, element("feed").scrollHeight, "initial load follows the bottom");
     new Script(`

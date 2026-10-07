@@ -1,24 +1,15 @@
+import timers from "node:timers/promises";
 import type { ChatMessage, ChatResult, ChatRequestOptions, ToolSpec } from "../llm/client.js";
-import { isInterruptedError } from "../llm/client.js";
+import { InterruptedError, isInterruptedError, ModelConnectionError } from "../llm/client.js";
 import { isContextOverflowError } from "../llm/context.js";
 import { errMsg, log, truncate } from "../log.js";
 
 /** Decision instructions appended AFTER the shared chat context for prefix reuse. */
 export const CHIME_SYSTEM_PROMPT =
-  "This request is in the chime decision phase, not the chat reply phase. " +
-  "Decide only whether the bot should join the conversation in response to the newest user-role message above " +
-  "(a Discord participant, possibly another bot). Use the surrounding conversation to judge relevance. " +
-  "The transcript, attachments, tool results and earlier phase instructions are context for this decision; " +
-  "earlier instructions to answer or stay silent applied to earlier requests, not this one. " +
-  "Do not answer questions, fulfill requests, draft a reply or use other tools during this phase, " +
-  "even if the conversation or the assistant's general role asks you to help. " +
-  "Report your decision by calling the chime tool exactly once: set respond to true if you should respond, " +
-  "false if you should stay silent, and give a short one-sentence reason about whether a reply is appropriate, " +
-  "not an answer to the conversation. " +
-  "Return only that chime tool call, with boolean respond and string reason arguments; no chat text or other tool calls. " +
-  "Send it through the tool-call interface, not as JSON or Markdown in a text response. " +
-  "A true decision only authorizes a separate reply request; do not begin that reply in this request. " +
-  "These phase instructions apply only to this decision request.";
+  "Chime decision: decide whether to join the conversation after the newest user-role message (a Discord participant, possibly a bot). " +
+  "Use the surrounding conversation; earlier phase instructions apply only to their original requests. " +
+  "Return exactly one chime tool call with boolean respond and a short string reason about whether a reply is useful. " +
+  "No chat text or other tool calls; JSON in text is not a tool call. Even respond=true leaves the answer to a separate reply request.";
 
 /** Keep tool definitions and their order identical across decision and reply requests. */
 export function chimeTools(tools: ToolSpec[]): ToolSpec[] {
@@ -35,12 +26,12 @@ export const CHIME_TOOL_NAME = "chime";
  */
 export const CHIME_TOOL_SPEC: ToolSpec = {
   name: CHIME_TOOL_NAME,
-  description: "Report whether the bot should join the conversation in response to the newest Discord participant message. Call exactly once in the chime decision phase, with a reason about whether to reply rather than an answer to the chat. Do not call during the reply or summarization phase. If called during an ongoing reply, it is only acknowledged and does not stop the reply.",
+  description: "Decide whether to join the Discord conversation. Use only for chime decisions, not replies or summaries.",
   parameters: {
     type: "object",
     properties: {
-      respond: { type: "boolean", description: "Decision: true to respond, false to stay silent. During a reply this flag is acknowledged only." },
-      reason: { type: "string", description: "A short one-sentence explanation of why the bot should reply or stay silent. Do not put a chat answer here." },
+      respond: { type: "boolean", description: "True to reply, false to stay silent." },
+      reason: { type: "string", description: "Brief reason for joining or staying silent, not a chat answer." },
     },
     required: ["respond", "reason"],
     additionalProperties: false,
@@ -62,12 +53,12 @@ export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[], signal?: A
  * One chime decision: a validated tool call over the shared context in which the
  * model reports its answer as a call of the chime tool (respond + reason).
  * Plain-text decisions and chat text accompanying a decision call are rejected.
- * Custom guidance supplements the mandatory phase instructions. An unusable answer gets one repair
- * with the same schemas/choice and an appended instruction, preserving the
- * shared prompt prefix. Endpoint failures stay silent.
- * Anything else — garbage, an empty answer, a call without a usable respond
- * flag after repair, or a failed call — is null: a broken decision must not make the bot
- * post an unasked-for reply. An interrupted call (the channel changed while
+ * Custom guidance supplements the mandatory phase instructions. Unusable answers retry until valid
+ * with the same schemas/choice and one replaceable validation reminder, preserving
+ * the shared prompt prefix without accumulating rejected responses or instructions.
+ * Transient pre-response connection failures get two cancellable delayed retries;
+ * HTTP, timeout and permanent connection failures return null and stay silent.
+ * An interrupted call (the channel changed while
  * the decision was in flight — the channel-activity interruption) is
  * re-thrown, not swallowed: the turn waits for the channel to go quiet,
  * then discards the decision when a newer message supersedes it (the newer
@@ -106,10 +97,12 @@ export async function decideChime(
     : CHIME_SYSTEM_PROMPT;
   const messages: ChatMessage[] = [...transcript, { role: "system", content: instruction }];
   let failure = "";
+  let connectionRetries = 0;
   try {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const requestMessages: ChatMessage[] = attempt === 0 ? messages : [...messages, {
-        role: "system", content: `The previous attempt was rejected: ${failure}. Retry the same decision under the phase rules above. Use the tool-call interface to return exactly one chime call with boolean respond and a short string reason about whether to reply. Return no chat text or other tool calls. A JSON object written as text is not a tool call. Even respond=true must wait for a separate reply request.`,
+    while (true) {
+      if (signal?.aborted) throw new InterruptedError();
+      const requestMessages: ChatMessage[] = failure === "" ? messages : [...messages, {
+        role: "system", content: `Invalid decision: ${failure}. Retry with exactly one chime tool call (boolean respond, short string reason), no chat text or other calls. Keep thinking separate from response text: use reasoning_content or a closed marked thought block.`,
       }];
       let res: ChatResult;
       try {
@@ -120,13 +113,28 @@ export async function decideChime(
           { toolChoice: "auto" },
         );
       } catch (err) {
+        if (signal?.aborted) throw new InterruptedError();
         if (isInterruptedError(err) || isContextOverflowError(err)) throw err;
+        if (err instanceof ModelConnectionError && err.retryable && connectionRetries < 2) {
+          connectionRetries++;
+          warn(`chime connection failed: ${errMsg(err)}; retrying (${connectionRetries}/2)`);
+          try {
+            await timers.setTimeout(250 * connectionRetries, undefined, { signal });
+          } catch (delayError) {
+            if (signal?.aborted) throw new InterruptedError();
+            throw delayError;
+          }
+          continue;
+        }
         warn(`chime decision failed: ${errMsg(err)}; staying silent`);
         return null;
       }
+      connectionRetries = 0;
+      if (signal?.aborted) throw new InterruptedError();
       if (res.usage?.cachedInput !== undefined) {
         log.info(`${prefix}chime prompt cache: ${res.usage.cachedInput}/${res.usage.input} input tokens reused`);
       }
+      res = separateDecisionReasoning(res);
       const validation = validateDecision(res);
       if (validation.ok) {
         const decision = validation.decision;
@@ -135,19 +143,35 @@ export async function decideChime(
           { role: "assistant", content: res.content, reasoningContent: res.reasoning, toolCalls: res.toolCalls },
           { role: "tool", name: CHIME_TOOL_NAME, toolCallId: res.toolCalls[0].id, content: JSON.stringify(decision) },
           { role: "system", content: decision.respond
-            ? "The chime decision phase for this message is complete and authorizes a separate reply phase. In that reply phase, answer the conversation using tools if needed; do not repeat this decision. This authorization applies only to this message."
-            : "The chime decision phase for this message is complete. Stay silent for this message. This decision does not require silence for later messages; follow the phase instructions of each new request." },
+            ? "Decision complete: a separate request may now reply to this message."
+            : "Decision complete: no reply to this message. Later requests are independent." },
         ]);
         return decision;
       }
       failure = validation.failure;
       warn(`chime decision unusable: ${failure}`);
-      if (attempt === 0) warn("retrying unusable chime decision once with the shared tool schemas");
+      // Yield even for an immediately resolved client so activity can cancel retries.
+      await timers.setImmediate();
     }
-    return null;
   } finally {
     if (timer !== undefined) clearInterval(timer);
   }
+}
+
+/** Recognize explicitly marked leading thinking without guessing whether prose is a chat answer. */
+function separateDecisionReasoning(res: ChatResult): ChatResult {
+  let content = res.content;
+  const reasoning: string[] = res.reasoning ? [res.reasoning] : [];
+  let found = false;
+  while (true) {
+    const block = /^\s*(?:<(think|analysis)>([\s\S]*?)<\/\1>|<\|channel>thought\b([\s\S]*?)<channel\|>)/.exec(content);
+    if (!block) break;
+    found = true;
+    const thought = (block[2] ?? block[3]).trim();
+    if (thought) reasoning.push(thought);
+    content = content.slice(block[0].length);
+  }
+  return found ? { ...res, content, reasoning: reasoning.join("\n\n") } : res;
 }
 
 /** Validate a decision with actionable feedback that never quotes model text or reasoning. */
@@ -224,5 +248,5 @@ export function formatChimeNo(reason: string): string {
 export async function executeReplyChime(args: Record<string, unknown>): Promise<string> {
   const decision = parseChimeArgs(JSON.stringify(args));
   if (!decision) throw new Error("invalid chime decision arguments");
-  return JSON.stringify({ ...decision, instruction: "The reply phase is already underway. Continue answering the conversation; do not repeat the chime decision." });
+  return JSON.stringify({ ...decision, instruction: "Reply already underway. Continue answering; do not repeat the decision." });
 }
