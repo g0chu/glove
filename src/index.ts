@@ -599,7 +599,8 @@ async function main(): Promise<void> {
                 window !== null
                   ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
                   : compactionBudget;
-              context.setMeasuredTokens(null); // it described the overfilled context
+              // emergencyShrink forgets the measurement (it described the
+              // overfilled context) — and reads it first for its gap adjustment.
               context.emergencyShrink(
                 turn.id,
                 target,
@@ -714,7 +715,8 @@ async function main(): Promise<void> {
               window !== null
                 ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
                 : compactionBudget;
-            context.setMeasuredTokens(null); // it described the overfilled context
+            // emergencyShrink forgets the measurement (it described the
+            // overfilled context) — and reads it first for its gap adjustment.
             context.emergencyShrink(
               turn.id,
               target,

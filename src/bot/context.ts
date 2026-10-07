@@ -1,15 +1,20 @@
 import { snapshotReactions, fetchReactionImage, reactionImageUrl, type ReactionMessage } from "./reactions.js";
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
-import { attachmentIdentity, InterruptedError } from "../llm/client.js";
+import { attachmentIdentity, InterruptedError, isInterruptedError } from "../llm/client.js";
 import {
   compareDiscordIds,
   channelIdentityPrompt,
   COMPACTION_SYSTEM_PROMPT,
+  contextWindowFromOverflowError,
+  isContextOverflowError,
   speakerLabel,
   type ChannelContext,
+  type CompactionResult,
+  type ContextEntry,
   type SeedEntry,
 } from "../llm/context.js";
+import { COMPACT_OUTPUT_RESERVE_TOKENS } from "../llm/metrics.js";
 import { errMsg, log } from "../log.js";
 import { fetchMessageFiles, type FileFetch } from "./files.js";
 import {
@@ -191,7 +196,7 @@ export async function buildChannelContext(
   const estimate = context.estimateTokens(opts.systemPrompt, opts.maxMessages, fileCost);
   const size = measured !== null ? measured : estimate;
   if (size > opts.maxTokens) {
-    const res = await context.compact(opts.keepMessages, async (older) => {
+    const summarize = async (older: ContextEntry[]): Promise<string> => {
       // Render exactly as a reply: keep roles, reasoning, tool pairs and attachments.
       const boundary = prefixEndIndex(context, opts, older.length);
       const active = await contextToMessages(context, opts);
@@ -203,8 +208,38 @@ export async function buildChannelContext(
         role: "system",
         content: `${instruction}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`,
       }]);
-    }, mentionId);
-    context.setMeasuredTokens(null);
+    };
+    let res: CompactionResult;
+    try {
+      res = await context.compact(opts.keepMessages, summarize, mentionId);
+    } catch (err) {
+      if (isInterruptedError(err)) throw err;
+      // The summarizer's full-context request overfilled the model's context
+      // (the channel outgrew the window since the last measurement): the
+      // summary cannot be written while the context is this large, so shrink
+      // hard (the mention protected, the running summary a last resort) and
+      // retry the compaction once; a second overflow falls through to the
+      // trim below.
+      if (!isContextOverflowError(err)) throw err;
+      const window = contextWindowFromOverflowError(err);
+      // The estimate must fit the smaller of the compaction budget and the
+      // window minus the completion headroom (the budget alone may sit at or
+      // above the window).
+      const target =
+        window !== null
+          ? Math.min(opts.maxTokens, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
+          : opts.maxTokens;
+      context.emergencyShrink(mentionId, target, opts.systemPrompt, opts.maxMessages, fileCost);
+      log.warn(
+        `channel context compaction overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the summary once`,
+      );
+      try {
+        res = await context.compact(opts.keepMessages, summarize, mentionId);
+      } catch (err2) {
+        if (isInterruptedError(err2)) throw err2;
+        res = { ok: false, reason: "summarizer" };
+      }
+    }
     if (res.ok) {
       log.info(
         `channel context filled the budget (${measured !== null ? `measured ${measured}` : `estimated ${estimate}`} tokens > ${opts.maxTokens}); compacted to a summary + ${context.length} recent message(s)`,
@@ -213,8 +248,11 @@ export async function buildChannelContext(
       log.warn(
         `context compaction did not apply (${res.reason}); trimming the oldest messages to fit the budget`,
       );
+      // The trim reads the measurement first (its gap adjustment), then
+      // forgets it — it then describes the pre-compaction context.
       context.emergencyTrim(mentionId, opts.maxTokens, opts.systemPrompt, opts.maxMessages, fileCost);
     }
+    context.setMeasuredTokens(null);
   }
   if (!context.has(mentionId)) return null;
   return contextToMessages(context, opts);

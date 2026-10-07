@@ -56,7 +56,7 @@ import { ChannelActivity } from "../src/bot/quiet.js";
 import { chimeReplyChat } from "../src/bot/chime-reply.js";
 import { executeReplyChime, chimeTools, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
 import { InterruptedError, isInterruptedError, ModelConnectionError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
-import { LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "../src/llm/metrics.js";
+import { COMPACT_OUTPUT_RESERVE_TOKENS, LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { recordTurn } from "../src/bot/turn-record.js";
 import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
@@ -2277,6 +2277,70 @@ const ok = (name: string): void => {
   assert.equal(mCalls2, 0, "measured under the budget: the estimate does not trigger");
   assert.equal(mstore2.getSummary(), null);
   ok("compaction: the endpoint's measured tokens drive the trigger (both directions)");
+
+  // The char estimate undercounts the wire prompt (the tool schemas sent with
+  // every request, the server's template tokens, the tokenizer's own counts):
+  // when the measured size is known and above the estimate, the emergency
+  // trim targets the budget minus that gap — otherwise the trim is a no-op
+  // and every later request still overfills the model's context.
+  const gapStore = new ChannelContext();
+  for (let i = 0; i < 6; i++) gapStore.pushUser("U", "x".repeat(200), `g${String(i)}`, i, []);
+  gapStore.pushUser("Alice", "the mention", "gm", 99, []);
+  await buildChannelContext(noFetch, gapStore, "gm", { ...cOpts, maxTokens: Number.MAX_SAFE_INTEGER }); // caches the estimate's parameters without compacting
+  gapStore.setMeasuredTokens(100000); // the endpoint counts far more than the estimate
+  const gapOpts = { ...cOpts, maxTokens: 90000, keepMessages: 2, summarize: async (): Promise<string> => { throw new Error("llm down"); } };
+  await buildChannelContext(noFetch, gapStore, "gm", gapOpts);
+  assert.ok(gapStore.has("gm"), "the mention survived the gap-aware trim");
+  assert.ok(!gapStore.has("g0"), "the gap-aware trim dropped the oldest entry (a plain estimate would not have triggered one)");
+  assert.equal(gapStore.getSummary(), null, "no summary when the summarizer failed");
+  ok("compaction: the emergency trim accounts for the measured-over-estimate gap");
+
+  // A context-overflow rejection of the summarizer's full-context request is
+  // recovered like a turn's overflow: shrink hard (mention protected, the
+  // running summary a last resort), retry the summary once; a second
+  // overflow falls through to the trim.
+  const ovStore = new ChannelContext();
+  for (let i = 0; i < 10; i++) ovStore.pushUser("U", "y".repeat(200), `o${String(i)}`, i, []);
+  ovStore.pushUser("Alice", "the mention", "om", 99, []);
+  await buildChannelContext(noFetch, ovStore, "om", { ...cOpts, maxTokens: Number.MAX_SAFE_INTEGER }); // caches the estimate's parameters without compacting
+  const ovEstimate = ovStore.estimateTokens(cOpts.systemPrompt, cOpts.maxMessages, undefined);
+  ovStore.setMeasuredTokens(ovEstimate + 100); // the endpoint counts a bit more than the estimate
+  let ovCalls = 0;
+  const ovBudget = ovEstimate - 50; // over the budget (measured) but the window minus headroom holds the estimate
+  const ovOpts = {
+    ...cOpts,
+    maxTokens: ovBudget,
+    keepMessages: 2,
+    summarize: async (): Promise<string> => {
+      ovCalls += 1;
+      if (ovCalls === 1) {
+        throw new Error(`HTTP 400 {"error":{"message":"request (${ovEstimate + 100} tokens) exceeds the available context size (${ovBudget + COMPACT_OUTPUT_RESERVE_TOKENS} tokens)"}}`);
+      }
+      return "overflow summary";
+    },
+  };
+  await buildChannelContext(noFetch, ovStore, "om", ovOpts);
+  assert.equal(ovCalls, 2, "the summary is retried once after the overflow");
+  assert.equal(ovStore.getSummary(), "overflow summary");
+  assert.ok(ovStore.has("om"), "the mention survived the shrink");
+  assert.ok(!ovStore.has("o0"), "the shrink dropped the oldest entry before the retry");
+  assert.ok(ovStore.length > 1, "the retry still had entries to fold");
+  assert.equal(ovStore.getMeasuredTokens(), null, "the attempt forgets the measurement");
+  ok("compaction: a summarizer overflow is recovered by a shrink and one retry");
+
+  // The measured size grows with what is appended after the measured request
+  // (a turn's record, a committed message, a chime exchange): the trigger
+  // must see what the next request will carry, not just the last prompt the
+  // endpoint counted.
+  const growStore = new ChannelContext();
+  growStore.pushUser("A", "hello", "a1", 1, []);
+  await buildChannelContext(noFetch, growStore, "a1", { ...cOpts, maxTokens: Number.MAX_SAFE_INTEGER }); // caches the estimate's parameters without compacting
+  growStore.setMeasuredTokens(1000);
+  growStore.pushUser("B", "z".repeat(800), "a2", 2, []);
+  const grown = growStore.getMeasuredTokens();
+  assert.ok(grown !== null && grown > 1000, "the measured size grew with the appended message");
+  assert.ok(grown < 1000 + 300, "the growth is the estimate's delta, not more");
+  ok("compaction: the measured size tracks entries appended after the measured request");
 
   // Overflow recovery: the endpoint's rejection of an overfilled request
   // (llama.cpp's exact shape, as the LLM client surfaces it — HTTP 400 +

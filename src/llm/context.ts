@@ -174,9 +174,18 @@ export class ChannelContext {
    * The model endpoint's own count of the latest valid request
    * (prompt tokens, from the usage/timings the endpoint reports) — the
    * measured context size the compaction trigger prefers over the char
-   * estimate. Null when never measured (or after a reset).
+   * estimate. Null when never measured (or after a reset). Entries appended
+   * after the measured request (a turn's record, a committed message, a
+   * chime exchange) grow it by their estimated size, so it approximates
+   * what the NEXT request will carry, not just the last one sent.
    */
   private measuredTokens: number | null = null;
+  /**
+   * The last estimateTokens call (its parameters and value), so appends can
+   * grow the measured size by the same estimate's delta without the caller
+   * repeating the parameters.
+   */
+  private lastEstimate: { systemPrompt: string; window: number; fileMaxBytes?: number; value: number } | null = null;
   private measurementEpoch = 0;
   /**
    * The time of the latest !clear, or null (never cleared): the restart
@@ -225,6 +234,7 @@ export class ChannelContext {
     const entry: ContextEntry = { role: "user", content, ids: [id], name, ts, attachments: [...attachments] };
     if (bot) entry.bot = true;
     this.entries.push(entry);
+    this.growMeasuredByAppendedEntries();
     this.changed();
     return entry;
   }
@@ -247,6 +257,7 @@ export class ChannelContext {
     if (extra?.toolCalls) entry.toolCalls = [...extra.toolCalls];
     if (extra?.modelContent !== undefined) entry.modelContent = extra.modelContent;
     this.entries.push(entry);
+    this.growMeasuredByAppendedEntries();
     this.changed();
     return entry;
   }
@@ -255,6 +266,7 @@ export class ChannelContext {
   pushTool(name: string, toolCallId: string, content: string): ContextEntry {
     const entry: ContextEntry = { role: "tool", content, ids: [], ts: Date.now(), attachments: [], name, toolCallId };
     this.entries.push(entry);
+    this.growMeasuredByAppendedEntries();
     this.changed();
     return entry;
   }
@@ -308,6 +320,7 @@ export class ChannelContext {
       };
     });
     this.entries.splice(Math.min(position, this.entries.length), 0, ...entries);
+    this.growMeasuredByAppendedEntries();
     this.changed();
   }
 
@@ -455,6 +468,23 @@ export class ChannelContext {
   invalidateMeasurement(): void {
     this.measurementEpoch++;
     this.measuredTokens = null;
+  }
+
+  /**
+   * Grow the measured size by the estimated size of everything appended
+   * since the measured request was sent (a turn's record, a committed
+   * message, a chime exchange): the endpoint's count describes the earlier
+   * prompt, and the compaction trigger must see what the next request will
+   * carry, or a single turn's record can push the next prompt past the
+   * window's completion headroom without tripping it. A no-op until the
+   * first estimate (the cached parameters) and when unmeasured.
+   */
+  private growMeasuredByAppendedEntries(): void {
+    if (this.measuredTokens === null || this.lastEstimate === null) return;
+    const { systemPrompt, window, fileMaxBytes } = this.lastEstimate;
+    const before = this.lastEstimate.value;
+    const value = this.estimateTokens(systemPrompt, window, fileMaxBytes);
+    this.measuredTokens = Math.max(0, this.measuredTokens + (value - before));
   }
 
   clear(): void {
@@ -632,6 +662,7 @@ export class ChannelContext {
         }
       }
     }
+    this.lastEstimate = { systemPrompt, window, fileMaxBytes, value: t };
     return t;
   }
 
@@ -639,7 +670,10 @@ export class ChannelContext {
    * Compact: fold everything older than the newest `keep` entries (plus any
    * existing summary) into one new summary via `summarize`. The newest
    * entries stay verbatim; `protectedId` (the turn's mention) is never
-   * folded away, no matter how old it is.
+   * folded away, no matter how old it is. A context-overflow rejection of
+   * the summarizer call is re-thrown (the caller shrinks the context and
+   * retries — the summary cannot be written while the context this large);
+   * other summarizer failures return `{ ok: false, reason: "summarizer" }`.
    */
   async compact(
     keep: number,
@@ -672,7 +706,9 @@ export class ChannelContext {
     try {
       text = (await summarize(older)).trim();
     } catch (err) {
-      if (isInterruptedError(err)) throw err;
+      // A context-overflow rejection is recoverable — the caller shrinks the
+      // context and retries the summary; anything else is a broken summarizer.
+      if (isInterruptedError(err) || isContextOverflowError(err)) throw err;
       return { ok: false, reason: this.revision === revision ? "summarizer" : "changed" };
     }
     // Never apply a snapshot over a clear, edit, deletion, or newer arrival.
@@ -686,19 +722,22 @@ export class ChannelContext {
   }
 
   /**
-   * Last-resort shrink when a compaction could not apply: drop the oldest
-   * entries (never the protected one — the turn's mention) until the
-   * estimate fits the budget.
+   * The char estimate undercounts the wire prompt (the tool schemas sent
+   * with every request, the server's chat-template tokens, the tokenizer's
+   * own counts): when the endpoint's measured size is known, shrink to the
+   * target minus that gap — otherwise the shrink can be a no-op on a context
+   * that still overfills the window, and every later request fills it again.
    */
-  emergencyTrim(
-    protectedId: string,
-    maxTokens: number,
-    systemPrompt: string,
-    window: number,
-    fileMaxBytes?: number,
-  ): void {
+  private shrinkTarget(targetTokens: number, systemPrompt: string, window: number, fileMaxBytes?: number): number {
+    const measured = this.measuredTokens;
+    if (measured === null) return targetTokens;
+    return Math.max(0, targetTokens - Math.max(0, measured - this.estimateTokens(systemPrompt, window, fileMaxBytes)));
+  }
+
+  /** Drop the oldest entries (never the protected one) until the estimate fits the given target. */
+  private trimTo(protectedId: string, targetTokens: number, systemPrompt: string, window: number, fileMaxBytes?: number): void {
     this.invalidateMeasurement();
-    while (this.estimateTokens(systemPrompt, window, fileMaxBytes) > maxTokens) {
+    while (this.estimateTokens(systemPrompt, window, fileMaxBytes) > targetTokens) {
       const i = this.entries.findIndex((e) => !e.ids.includes(protectedId));
       if (i === -1) break; // only the protected entry is left
       // Drop a tool-call group whole (never the calls without their results
@@ -709,12 +748,28 @@ export class ChannelContext {
   }
 
   /**
+   * Last-resort shrink when a compaction could not apply: drop the oldest
+   * entries (never the protected one — the turn's mention) until the
+   * estimate fits the budget (gap-adjusted — see shrinkTarget).
+   */
+  emergencyTrim(
+    protectedId: string,
+    maxTokens: number,
+    systemPrompt: string,
+    window: number,
+    fileMaxBytes?: number,
+  ): void {
+    this.trimTo(protectedId, this.shrinkTarget(maxTokens, systemPrompt, window, fileMaxBytes), systemPrompt, window, fileMaxBytes);
+  }
+
+  /**
    * Last-resort shrink when a request overfilled the model's context and the
    * endpoint rejected it: drop the oldest entries (never the protected one —
-   * the turn's mention) until the estimate fits `targetTokens`, and, if the
-   * remaining entries still do not fit, drop the running summary too (it is
-   * derived data — the only thing left besides the mention). After this, the
-   * next request fits the window again (unless the mention alone does not).
+   * the turn's mention) until the estimate fits `targetTokens` (gap-adjusted
+   * — see shrinkTarget), and, if the remaining entries still do not fit, drop
+   * the running summary too (it is derived data — the only thing left besides
+   * the mention). After this, the next request fits the window again (unless
+   * the mention alone does not).
    */
   emergencyShrink(
     protectedId: string,
@@ -723,8 +778,9 @@ export class ChannelContext {
     window: number,
     fileMaxBytes?: number,
   ): void {
-    this.emergencyTrim(protectedId, targetTokens, systemPrompt, window, fileMaxBytes);
-    if (this.estimateTokens(systemPrompt, window, fileMaxBytes) > targetTokens && this.summary !== null) {
+    const target = this.shrinkTarget(targetTokens, systemPrompt, window, fileMaxBytes);
+    this.trimTo(protectedId, target, systemPrompt, window, fileMaxBytes);
+    if (this.estimateTokens(systemPrompt, window, fileMaxBytes) > target && this.summary !== null) {
       this.summary = null;
       this.changed();
     }
