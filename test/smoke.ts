@@ -3233,12 +3233,13 @@ const ok = (name: string): void => {
   await ticks(2);
   assert.equal(i1.sent.length, 1, "one activity message (the thinking + the live partial text)");
   assert.equal(i1.deleted.length, 0);
-  await wi1.interrupt();
+  const partial1 = await wi1.interrupt();
   assert.equal(i1.deleted.length, 0, "the partial text is stripped in place, not deleted");
   assert.match(i1.messages[0].content, /^🤔 \*thinking it through \(\d+s\)\*$/, "the thinking line completes in place, the partial text is gone");
-  assert.equal(await wi1.interrupt(), undefined, "a second interrupt is a no-op");
+  assert.deepEqual(partial1, { text: "partial", reasoning: "thinking it through" }, "interrupt() returns the partial generation for the retry to carry over");
+  assert.equal(await wi1.interrupt(), null, "a second interrupt is a no-op");
   assert.equal(await wi1.finish("late"), null, "the interrupted writer posts nothing more");
-  ok("writer: interrupt() strips the partial reply in place, keeps the thinking line, and finishes");
+  ok("writer: interrupt() strips the partial reply in place, keeps the thinking line, and returns the partial generation");
 
   // Interrupted before any reply content streamed: the live thinking
   // message completes into its terminal line and nothing else is withdrawn.
@@ -3252,9 +3253,10 @@ const ok = (name: string): void => {
   wi2.reason("still thinking");
   await ticks(2);
   assert.equal(i2.sent.length, 1);
-  await wi2.interrupt();
+  const partial2 = await wi2.interrupt();
   assert.ok(i2.messages[0].content.startsWith("🤔 *still thinking"), "the thinking line completes in place");
   assert.equal(i2.deleted.length, 0, "no partial reply to withdraw");
+  assert.deepEqual(partial2, { text: "", reasoning: "still thinking" }, "a reasoning-only interruption carries the partial thinking");
   // A writer that never started: interrupt() is a harmless no-op.
   const i3 = makeChannel();
   const wi3 = new ResponseWriter({
@@ -3262,7 +3264,7 @@ const ok = (name: string): void => {
     typingIntervalMs: 3_600_000,
     throttleMs: 2000,
   });
-  await wi3.interrupt();
+  assert.equal(await wi3.interrupt(), null, "an interrupt with no generation carries nothing");
   assert.equal(i3.sent.length, 0, "nothing posted, nothing withdrawn");
   ok("writer: interrupt() before the reply starts keeps the thinking line and posts nothing");
 

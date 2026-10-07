@@ -409,8 +409,13 @@ disabled, so retained YES/NO instructions cannot become rules for later messages
 
 Typing, new messages, edits and deletions from other users or bots immediately
 interrupt the active model request during prompt processing, reasoning or reply
-text. Partial replies are withdrawn. The bot waits for the channel to settle,
-then rebuilds the prompt with updated context. Unstarted tools are skipped;
+text. Partial replies are withdrawn from the channel, and the interrupted
+partial generation — the reply text and thinking the model had streamed — is
+carried into the retry's prompt as an assistant message plus a meta
+continuation instruction (the partial was never delivered, the conversation is
+the channel's current state, and the new reply is posted fresh), so the model
+continues from its own interrupted answer instead of losing it. The bot waits
+for the channel to settle, then rebuilds the prompt with updated context. Unstarted tools are skipped;
 running tools finish and their results are retained before continuing, without
 replaying completed rounds or resetting the turn's tool budget.
 

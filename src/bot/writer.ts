@@ -354,6 +354,18 @@ export interface WriterOptions {
   throttleMs: number;
 }
 
+/**
+ * The partial generation of an interrupted round: the reply text the model
+ * streamed before the interruption (raw model text, trimmed) and, when the
+ * endpoint streamed any, its partial thinking (a tail — the preview buffer
+ * caps its length). The caller carries it into the retried attempt (see
+ * index.ts) so the model continues from its own interrupted answer.
+ */
+export interface PartialGeneration {
+  text: string;
+  reasoning?: string;
+}
+
 /** What the writer actually posted to the channel (for history tracking). */
 export interface PostedReply {
   /**
@@ -710,16 +722,24 @@ export class ResponseWriter {
    * live message(s) deleted). When interrupted during prompt processing,
    * this is normally a no-op beyond stopping typing. During reasoning or
    * reply generation, it removes the live text while preserving thinking
-   * lines. The caller then waits for the channel to go quiet and
-   * either discards the turn (a newer turn supersedes it) or retries it
-   * with a fresh writer, so the partial text never lingers as a broken
-   * reply. A no-op when the writer never started or already finished.
+   * lines. Resolves with the round's partial generation (the streamed text
+   * and partial thinking) so the caller can carry it into the retried
+   * attempt, or null when the round generated nothing to carry — the turn
+   * then waits for the channel to go quiet and either discards it (a newer
+   * turn supersedes it) or retries it with a fresh writer, so the partial
+   * text never lingers as a broken reply. A no-op when the writer never
+   * started or already finished (resolves with null).
    */
-  async interrupt(): Promise<void> {
-    if (this.finished) return;
+  async interrupt(): Promise<PartialGeneration | null> {
+    if (this.finished) return null;
     this.finished = true;
     this.stopTyping();
     await this.chain.catch(() => {});
+    // Captured before the withdrawal below: the retried attempt continues
+    // from the model's own partial generation over the updated conversation
+    // (index.ts appends it with a meta continuation instruction).
+    const text = this.buffer.trim();
+    const reasoning = this.reasoningBuffer.trim();
     if (this.reasoningBuffer.length > 0 && !this.thinkingSettled) {
       this.thinkingSettled = true;
       await this.settleThinkingLine(this.thinkingDoneLine());
@@ -733,6 +753,9 @@ export class ResponseWriter {
       // delete them.
       await this.clearTextSlices();
     }
+    return text.length > 0 || reasoning.length > 0
+      ? { text, ...(reasoning.length > 0 ? { reasoning } : {}) }
+      : null;
   }
 
   /**

@@ -5,14 +5,14 @@ import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, refreshChannelIdentity, prefixEndIndex, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
 import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
-import { chimeReplyChat, replyPhaseInstruction } from "./bot/chime-reply.js";
+import { chimeReplyChat, interruptionContinuationInstruction, replyPhaseInstruction } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { MessageObservations } from "./bot/observations.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
 import { fetchFreshMessages } from "./bot/refresh.js";
 import { ChannelActivity } from "./bot/quiet.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMention } from "./bot/router.js";
-import { ResponseWriter, SAFE_MENTIONS, type PostedReply } from "./bot/writer.js";
+import { ResponseWriter, SAFE_MENTIONS, type PartialGeneration, type PostedReply } from "./bot/writer.js";
 import { LlmClient, InterruptedError, isInterruptedError, type ChatMessage } from "./llm/client.js";
 import { ChatPersistence } from "./llm/persist.js";
 import { ConversationArchive } from "./llm/archive.js";
@@ -307,8 +307,13 @@ async function main(): Promise<void> {
    *
    * The turn runs in attempts. Messages, edits, deletions and typing from
    * other users/bots cancel prompt processing, reasoning and reply text.
-   * The partial reply is withdrawn. Completed tool rounds are checkpointed
-   * under a durable attempt identity, then the turn waits for stillness.
+   * The partial reply is withdrawn from the channel, and the attempt's
+   * partial generation (the text and thinking it streamed) is carried into
+   * the retried attempt's prompt as an assistant message plus a meta
+   * continuation instruction (the partial was never delivered; the
+   * conversation above it is the channel's current state). Completed tool
+   * rounds are checkpointed under a durable attempt identity, then the
+   * turn waits for stillness.
    * A newer queued mention supersedes an older mention; a newer committed
    * user entry supersedes a chime. Otherwise a fresh attempt sees updated
    * context and completed tool results without replaying earlier rounds.
@@ -364,6 +369,12 @@ async function main(): Promise<void> {
     const tokens = new TurnTokens();
     let retainedToolRounds = 0;
     const activeExchangeIds = new Set<string>();
+    // The partial generation of the last interrupted attempt (its streamed
+    // reply text and partial thinking): carried into the next attempt's
+    // reply prompt as an assistant message plus a meta continuation
+    // instruction, so the model continues from its own interrupted answer
+    // over the updated conversation instead of losing what it had said.
+    let carriedPartial: PartialGeneration | null = null;
 
     try {
       for (let attempt = 0; ; attempt++) {
@@ -659,10 +670,26 @@ async function main(): Promise<void> {
             // intact in history, while the current phase never becomes stale history.
             const triggerEnd = prefixEndIndex(context, ctxOpts, turn.id);
             if (triggerEnd === null) throw new InterruptedError();
+            // The partial generation of an earlier, interrupted attempt of
+            // this turn, when this attempt is the retry: the model's own
+            // partial answer (its partial thinking travels with it as
+            // reasoning_content) plus a meta instruction that keeps the
+            // retry locked in with reality — the partial was withdrawn and
+            // never delivered, the conversation above it is the channel's
+            // current state, and the reply now generated is posted fresh
+            // and must stand on its own.
+            const carried: ChatMessage[] = carriedPartial === null ? [] : [
+              {
+                role: "assistant",
+                content: carriedPartial.text,
+                ...(carriedPartial.reasoning !== undefined ? { reasoningContent: carriedPartial.reasoning } : {}),
+              },
+              { role: "system", content: interruptionContinuationInstruction() },
+            ];
             // Historical decisions can survive disabling chime between restarts.
             // Always identify the current reply phase so an old NO cannot suppress it.
             const replyMessages: ChatMessage[] = [
-              ...msgs, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) },
+              ...msgs, ...carried, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) },
             ];
             return runToolTurn(replyMessages, {
               chat: (m, callbacks, t, signal) => replyChat(m, callbacks, t, signal,
@@ -758,13 +785,16 @@ async function main(): Promise<void> {
               recordTurn(`${turnId}:attempt:${attempt}`, context, rounds, roundSettled, null);
               retainedToolRounds += rounds.length;
             }
-            // Withdraw partial reply text and wait for every pending message
-            // to stabilize before deciding whether a newer turn supersedes
-            // this one or it should continue over freshly built context.
+            // Withdraw the partial reply text (capturing the attempt's
+            // partial generation, carried into the retry's prompt) and wait
+            // for every pending message to stabilize before deciding whether
+            // a newer turn supersedes this one or it should continue over
+            // freshly built context.
+            const carried = await writer.interrupt();
+            carriedPartial = carried;
             log.info(
-              `turn in ${channelId}: interrupted by channel activity (attempt ${attempt + 1}); waiting for the channel to go quiet (${cfg.discord.messageStableMs}ms)`,
+              `turn in ${channelId}: interrupted by channel activity (attempt ${attempt + 1})${carried ? " — the partial generation is carried into the retry" : ""}; waiting for the channel to go quiet (${cfg.discord.messageStableMs}ms)`,
             );
-            await writer.interrupt();
             await channelActivity.waitForQuiet(channelId, cfg.discord.messageStableMs);
             if (!context.has(turn.id)) {
               log.info(

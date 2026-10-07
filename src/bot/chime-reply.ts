@@ -17,6 +17,17 @@ export function replyPhaseInstruction(triggerId: string, messageIndex: number, d
 }
 
 /**
+ * Transient continuation instruction appended after the partial generation
+ * of an interrupted reply attempt (see index.ts): it keeps the retried
+ * attempt locked in with reality — the partial was withdrawn and never
+ * delivered, the conversation above is the channel's current state, and the
+ * reply now generated is posted fresh as a standalone message.
+ */
+export function interruptionContinuationInstruction(): string {
+  return "Your previous reply attempt was interrupted by activity in this channel (a new message, an edit or a typing indicator) and withdrawn: the preceding assistant message is the partial generation you had produced when it stopped — it was never delivered as a final answer, and no reply for this turn has been posted yet. The conversation above reflects the channel's current state, including everything that arrived or changed since. Continue from the partial generation over the updated conversation: the newer messages may change what you were answering, and the reply you now generate is posted as a fresh standalone message, so make it stand on its own (repeat or rephrase the partial text where it helps). Do not treat the partial text as a delivered answer.";
+}
+
+/**
  * Advertise the shared schemas; chime calls use the registered reply handler
  * and remain in the executable loop and its history. Wrap an archived/token-counted
  * chat so every compatibility request is recorded and measured separately.

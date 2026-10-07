@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { Client, ChannelType, Collection, type Message, type GuildTextBasedChannel } from "discord.js";
-import { InterruptedError, LlmClient, type ChatMessage, type ChatResult } from "../src/llm/client.js";
+import { InterruptedError, LlmClient, type ChatMessage, type ChatResult, type StreamCallbacks } from "../src/llm/client.js";
 import { CHIME_SYSTEM_PROMPT } from "../src/bot/chime.js";
 
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
@@ -41,14 +41,14 @@ Client.prototype.login = async function (): Promise<string> {
 };
 Client.prototype.destroy = async function (): Promise<void> {};
 const requests: ChatMessage[][] = [];
-let duringChat: ((signal?: AbortSignal) => Promise<ChatResult>) | undefined;
+let duringChat: ((signal?: AbortSignal, callbacks?: StreamCallbacks) => Promise<ChatResult>) | undefined;
 let chimeRespond = false;
 LlmClient.prototype.chat = async function (messages, _callbacks, _tools, signal, options): Promise<ChatResult> {
   requests.push(structuredClone(process.env.FLOW_MODE === "gemma" ? gemmaMessages(messages, options?.reasoningFromIndex) : messages));
   if (signal?.aborted) throw new InterruptedError();
   const hook = duringChat;
   duringChat = undefined;
-  if (hook) return hook(signal);
+  if (hook) return hook(signal, _callbacks);
   if (messages.at(-1)?.role === "system" && messages.at(-1)?.content === CHIME_SYSTEM_PROMPT) {
     assert.equal(options?.maxTokens, undefined, "chime decisions use the endpoint output limit");
     return { content: "", reasoning: "decision reasoning", toolCalls: [{ id: `decision-${requests.length}`, name: "chime",
@@ -365,8 +365,12 @@ async function run(): Promise<void> {
   assert(prompt().includes("newer gateway result"));
   assert(!prompt().includes("final streamed result"));
 
-  // An edit during generation aborts the attempt; its retry sees updated history.
-  duringChat = async (signal) => {
+  // An edit during generation aborts the attempt; its retry sees updated
+  // history and carries the interrupted partial generation over, with a
+  // meta instruction keeping the model locked in with reality.
+  duringChat = async (signal, callbacks) => {
+    callbacks?.onDelta?.("partial answer before the edit");
+    callbacks?.onReasoning?.("partial thinking before the edit");
     streamed = edit(streamed, "edited during generation");
     assert(signal?.aborted);
     throw new InterruptedError();
@@ -377,7 +381,16 @@ async function run(): Promise<void> {
   await advance(200);
   assert.equal(requests.length, 4);
   assert(prompt().includes("edited during generation"));
+  const retryPrompt = requests.at(-1)!;
+  const partialIndex = retryPrompt.findIndex((m) => m.role === "assistant" && String(m.content).includes("partial answer before the edit"));
+  assert(partialIndex !== -1, "the partial generation is carried into the retry");
+  assert.equal(retryPrompt[partialIndex].reasoningContent, "partial thinking before the edit", "the partial thinking travels with the carried partial");
+  const metaIndex = retryPrompt.findIndex((m) => m.role === "system" && String(m.content).includes("interrupted by activity"));
+  const phaseIndex = retryPrompt.findIndex((m) => m.role === "system" && String(m.content).includes("Reply to Discord message 500"));
+  assert.equal(metaIndex, partialIndex + 1, "the meta continuation instruction follows the carried partial");
+  assert(metaIndex < phaseIndex, "the continuation instruction precedes the reply phase instruction");
   assert(!entries().some((e) => e.content === "answer 3"));
+  assert(!entries().some((e) => String(e.content).includes("partial answer before the edit")), "the carried partial stays out of the persisted context");
 
   // A partial update holds the earlier gate until complete REST data returns.
   oneHook = () => new Promise<void>((resolve) => { release = resolve; });
