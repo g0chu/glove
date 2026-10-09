@@ -1249,21 +1249,13 @@ async function main(): Promise<void> {
   client.on("messageReactionRemoveEmoji", (reaction) => reactionChanged(reaction.message, "reaction.removeEmoji"));
   client.on("messageReactionRemoveAll", (message) => reactionChanged(message, "reaction.removeAll"));
 
-  // A typing indicator is a change in the channel too: someone is about to
-  // say something, so a running turn's prompt is stale before it is sent —
-  // interrupt it. The turn then waits for the channel to go quiet, which
-  // keeps resetting while the typing goes on (the bot's own typing never
-  // counts: the gateway does not report it, and it is filtered anyway).
-  client.on("typingStart", (typing) => {
-    const botId = client.user?.id;
-    if (!botId) return;
-    const user = typing.user;
-    if (!user || user.id === botId) return;
-    const channel = typing.channel;
-    if (channel.type !== ChannelType.GuildText) return; // text channels only, DMs never
-    if (cfg.discord.guildId !== "" && channel.guild?.id !== cfg.discord.guildId) return;
-    channelActivity.noteTyping(channel.id);
-  });
+  // Typing indicators are deliberately NOT activity: they do not change the
+  // channel's content, and treating them as such held the stillness wait
+  // (and aborted in-flight requests) for as long as anyone kept composing —
+  // Discord typing indicators last minutes, so a mention could wait for
+  // minutes before the first model request even went out. The message that
+  // is typed interrupts the turn through its own event once it arrives
+  // (messageCreate notes activity).
 
   // Deletions: drop the still-pending message (it never committed, so there
   // is nothing to remove from the context) and, wherever an entry is in the

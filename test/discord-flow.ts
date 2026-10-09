@@ -196,11 +196,11 @@ async function run(): Promise<void> {
     await advance(100);
     create("200", "newest ambient message", "other-bot");
     await advance(100);
+    // Typing is not activity: it must not hold the stillness wait — the
+    // decision goes out over the settled conversation without a typing hold.
     client.emit("typingStart", { channel, user: { id: "human" } } as never);
-    await advance(9999);
-    assert.equal(requests.length, 0);
-    await advance(1);
-    assert.equal(requests.length, 1, "only the newest ambient trigger decides after stillness");
+    await advance(999);
+    assert.equal(requests.length, 1, "only the newest ambient trigger decides after stillness — typing did not hold the wait");
     assert(prompt().includes("first ambient message"));
     assert.equal(requests[0][0].role, "system");
     assert(String(requests[0][1].content).includes('channels["channel"]'));
@@ -272,19 +272,19 @@ async function run(): Promise<void> {
     assert(!entries().some((e) => e.content.startsWith("Reply to Discord message")));
     duringChat = async () => {
       duringChat = async (signal) => {
-        client.emit("typingStart", { channel, user: { id: "human" } } as never);
+        // A content change (an edit — no new user entry, so the turn is not
+        // superseded) interrupts the in-flight reply.
+        edit(history.get("200")!, "edited while the reply was in flight");
         assert(signal?.aborted);
         throw new InterruptedError();
       };
       return { content: "", toolCalls: [{ id: "retry-yes", name: "chime", arguments: '{"respond":true,"reason":"continue"}' }] };
     };
-    create("700", "ambient reply interrupted by typing");
+    create("700", "ambient reply interrupted by an edit");
     await advance(200);
     assert.equal(requests.length, 11);
     await advance(9999);
-    assert.equal(requests.length, 11, "no retry while the typing indicator is active");
-    await advance(1);
-    assert.equal(requests.length, 13, "typing interruption retries the YES turn over retained history");
+    assert.equal(requests.length, 13, "an interruption retries the YES turn over retained history");
     const retriedYes = requests.at(-1)!;
     assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")));
     assert(String(retriedYes.at(-1)?.content).includes("Reply to Discord message 700"));
@@ -310,7 +310,7 @@ async function run(): Promise<void> {
       const beforeInterrupt = requests.length;
       duringChat = async () => {
         duringChat = async signal => {
-          client.emit("typingStart", { channel, user: { id: "human" } } as never);
+          edit(history.get("200")!, "edited during the tool round");
           assert(signal?.aborted);
           duringChat = async () => {
             assert(requests.at(-1)!.some(message => message.reasoningContent === "retained tool reasoning"),
@@ -463,16 +463,16 @@ async function run(): Promise<void> {
   assert.equal(requests.length, 8);
   assert(!entries().some((e) => e.ids.includes(doomed.id)));
 
-  // Typing extends the quiet window; a newer mention covers the older one once.
+  // Typing does not extend the quiet window: a composing user cannot hold a
+  // queued mention. The burst answers over the full prompt promptly (the
+  // newer mention covers the older one once).
   create("1400", "<@bot> older queued question");
   await advance(100);
   create("1500", "<@bot> newest queued question");
   await advance(100);
   client.emit("typingStart", { channel, user: { id: "human" } } as never);
-  await advance(9999);
-  assert.equal(requests.length, 8);
-  await advance(1);
-  assert.equal(requests.length, 9, "a burst of mentions produces one answer over the full prompt");
+  await advance(999);
+  assert.equal(requests.length, 9, "a burst of mentions produces one answer over the full prompt — typing did not hold the wait");
   assert(prompt().includes("older queued question"));
   assert(prompt().includes("newest queued question"));
 

@@ -943,32 +943,25 @@ const ok = (name: string): void => {
   }
   ok("quiet: activity while waiting restarts the window");
 
-  // Typing remains active beyond the message stability window, including
-  // when ordinary activity follows it; renewed typing extends the deadline.
+  // Regression pin: typing indicators used to be activity (held the wait
+  // for ten seconds per event, renewed typing extended it — so a channel
+  // with a composing user never went quiet and a mention could wait for
+  // minutes before its first model request). The stillness wait is now held
+  // ONLY by content changes: the channel is quiet exactly when it has been
+  // unchanged for the stability window, nothing else can extend the wait,
+  // and the tracker has no notion of typing at all.
   {
     const clock = makeClock();
     const a = new ChannelActivity({ now: clock.now, sleep: clock.sleep });
-    let fired = 0;
-    a.watch("c1", () => fired++);
-    a.noteTyping("c1");
-    a.note("c1");
+    a.note("c1"); // a content change at t=1000
     const p = a.waitForQuiet("c1", 2000);
-    assert.equal(clock.now(), 11000, "typing holds the channel for ten seconds");
-    a.noteTyping("c1");
-    await clock.wake();
-    assert.equal(clock.now(), 21000, "renewed typing extends the wait");
     await clock.wake();
     await p;
-    assert.equal(fired, 3, "typing interrupts existing attempts like other activity");
-    a.noteTyping("c2");
-    a.clearChannel("c2");
-    await a.waitForQuiet("c2", 0);
-    a.noteTyping("c3");
-    a.clear();
-    await a.waitForQuiet("c3", 0);
-    assert.equal(clock.now(), 21000, "clearing forgets typing deadlines");
+    assert.equal(clock.now(), 3000, "quiet exactly at the stability window (1000 + 2000) — no other hold");
+    a.note("c2");
+    await a.waitForQuiet("c2", 0); // zero window: quiet immediately once the change is noted
   }
-  ok("quiet: typing waits for indicator expiry and renewed typing extends it");
+  ok("quiet: the stillness wait is held only by content changes (typing is not activity)");
 
   // A watcher fires on every change for its channel (a running turn uses it
   // to abort the in-flight model request); the unsubscribe stops it.

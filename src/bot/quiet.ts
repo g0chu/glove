@@ -1,14 +1,18 @@
 /**
  * Per-channel chat activity for the prompt-interruption feature: a channel
- * is active while it changes — a new message, an edit, or a typing
- * indicator (the bot's own posts and typing never count, see index.ts,
- * which notes only trackable events). A turn's in-flight model request is
- * aborted on any activity in the channel it is answering (the attempt
- * watches the tracker); after the interruption the turn waits for the
- * channel to go quiet — no activity for the stability window (
- * DISCORD_MESSAGE_STABLE_MS) — and is then either discarded (a newer turn
- * supersedes it — the newer turn responds to the newest information) or
- * retried with the updated context (see index.ts).
+ * is active while its content changes — a new message, an edit, or a
+ * deletion (the bot's own posts never count, see index.ts, which notes only
+ * trackable events). Typing indicators are NOT activity: they do not change
+ * the conversation's content, and holding the stillness wait or aborting an
+ * in-flight request on them would stall a turn for as long as anyone keeps
+ * composing (Discord typing lasts minutes); the message that is typed
+ * interrupts the turn through its own event once it arrives. A turn's
+ * in-flight model request is aborted on any activity in the channel it is
+ * answering (the attempt watches the tracker); after the interruption the
+ * turn waits for the channel to go quiet — no activity for the stability
+ * window (DISCORD_MESSAGE_STABLE_MS) — and is then either discarded (a newer
+ * turn supersedes it — the newer turn responds to the newest information)
+ * or retried with the updated context (see index.ts).
  */
 export interface ActivityOptions {
   /** Test-only: inject the sleeper (production uses setTimeout). */
@@ -26,7 +30,6 @@ export interface ActivityOptions {
  */
 export class ChannelActivity {
   private readonly lastActivity = new Map<string, number>();
-  private readonly typingUntil = new Map<string, number>();
   private readonly watchers = new Map<string, Set<(mention: boolean) => void>>();
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
@@ -36,7 +39,7 @@ export class ChannelActivity {
     this.now = opts.now ?? Date.now;
   }
 
-  /** Record a change in a channel (a new message, an edit, a typing indicator). */
+  /** Record a change in a channel (a new message, an edit, or a deletion). */
   note(channelId: string, mention = false): void {
     this.lastActivity.set(channelId, this.now());
     const ws = this.watchers.get(channelId);
@@ -44,12 +47,6 @@ export class ChannelActivity {
       // Iterate over a copy: a watcher may unsubscribe itself while firing.
       for (const w of [...ws]) w(mention);
     }
-  }
-
-  /** Record typing, which Discord displays for ten seconds after each event. */
-  noteTyping(channelId: string): void {
-    this.typingUntil.set(channelId, this.now() + 10_000);
-    this.note(channelId);
   }
 
   /**
@@ -74,8 +71,7 @@ export class ChannelActivity {
 
   /**
    * Wait for the channel to go quiet: resolve once there has been no
-   * activity for `quietMs` after the most recent one and all typing indicators
-   * have expired (activity while
+   * activity for `quietMs` after the most recent one (activity while
    * waiting restarts the window). A channel with no recorded activity is
    * already quiet.
    */
@@ -83,8 +79,7 @@ export class ChannelActivity {
     for (;;) {
       const last = this.lastActivity.get(channelId);
       if (last === undefined) return; // nothing seen: already quiet
-      const deadline = Math.max(last + quietMs, this.typingUntil.get(channelId) ?? 0);
-      const waitMs = deadline - this.now();
+      const waitMs = last + quietMs - this.now();
       if (waitMs > 0) await this.sleep(waitMs);
       if (this.lastActivity.get(channelId) === last) return; // quiet for the window
     }
@@ -93,14 +88,12 @@ export class ChannelActivity {
   /** Forget a channel (it was deleted): its state and watchers are gone. */
   clearChannel(channelId: string): void {
     this.lastActivity.delete(channelId);
-    this.typingUntil.delete(channelId);
     this.watchers.delete(channelId);
   }
 
   /** Forget everything (shutdown). */
   clear(): void {
     this.lastActivity.clear();
-    this.typingUntil.clear();
     this.watchers.clear();
   }
 }
