@@ -77,6 +77,9 @@ export class ConversationArchive {
   private recovered = false;
   private layout: ArchiveLayout | undefined;
   readonly recoveredTail: string | null;
+  /** Resolves once the background rebuild of the readable views (after an
+   * unclean previous stop) finishes; undefined when no rebuild is pending. */
+  viewsReady: Promise<void> | undefined;
 
   constructor(readonly directory: string, private readonly onFailure?: (error: Error) => void, private readonly fastRecovery = false) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -93,8 +96,22 @@ export class ConversationArchive {
       this.recoveredTail = this.recover(offset);
       for (const [url, blob] of this.attachments) this.attachmentIdentities.set(attachmentIdentity(url), blob);
       this.recovered = true;
-      this.layout = new ArchiveLayout(directory);
-      this.layout.restore(this);
+      const layout = new ArchiveLayout(directory);
+      const reason = layout.rebuildReason(this);
+      if (reason === "dirty") {
+        // The views lag the journal head (an unclean previous stop). Rebuild
+        // them in the background: the verified journal stays authoritative
+        // (records append to it meanwhile and the replay picks them up), and
+        // the bot can serve turns while the views catch up.
+        this.layout = undefined;
+        this.viewsReady = this.rebuildViewsInBackground(layout);
+      } else {
+        // "stale" (missing or corrupt state) rebuilds synchronously inside
+        // restore — the views must be usable as soon as the constructor
+        // returns; "dirty" is the only background case.
+        this.layout = layout;
+        layout.restore(this);
+      }
       if (this.fastRecovery) this.saveIndex();
     } catch (err) {
       this.layout = undefined;
@@ -102,6 +119,24 @@ export class ConversationArchive {
       this.close();
       throw err;
     }
+  }
+
+  private rebuildViewsInBackground(layout: ArchiveLayout): Promise<void> {
+    return (async () => {
+      // Let the constructor return (the bot logs in) before the replay.
+      await new Promise((resolve) => { setImmediate(resolve); });
+      if (this.fd < 0 || this.failure) return; // closed before the rebuild started
+      try {
+        layout.restore(this);
+      } catch (err) {
+        // A corrupt referenced payload must not leave the bot serving on a
+        // half-rebuilt view: the synchronous path failed startup the same
+        // way (fail() calls onFailure, which stops the process in production).
+        this.fail(err);
+      }
+      if (this.fd < 0 || this.failure) return; // closed mid-rebuild; the views may be stale
+      this.layout = layout;
+    })();
   }
 
   private claim(): void {

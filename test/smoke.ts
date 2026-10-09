@@ -6,7 +6,7 @@ import { browseWiki } from "../src/tools/wiki.js";
 import { snapshotReactions, reactionImageUrl, fetchReactionImage } from "../src/bot/reactions.js";
 import { createDiscordClient } from "../src/bot/client.js";
 import { GatewayIntentBits, Partials } from "discord.js";
-import { fetchFreshMessages } from "../src/bot/refresh.js";
+import { fetchFreshMessages, RECONCILE_CONCURRENCY } from "../src/bot/refresh.js";
 /**
  * Smoke tests: config parsing, the stability gate (a message commits once
  * it has been unchanged for the window), code-fence-aware chunk splitting,
@@ -168,6 +168,48 @@ const ok = (name: string): void => {
     assert.equal([...archive.records()].filter(r => r.type === "model.progress").length, 2, "successful completion supersedes its unflushed batch");
     ok("archive: parsed output batches retain Unicode, reasoning and tool fragments, flush on failure, stop timers and omit raw capture files");
   } finally { mock.timers.reset(); archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-archive-bg-"));
+  try {
+    const first = new ConversationArchive(dir);
+    // A fresh archive has no state file ("stale"): its views rebuild
+    // synchronously, and only an unclean stop ("dirty") goes to the background.
+    assert.equal(first.viewsReady, undefined, "a fresh archive rebuilds its views synchronously");
+    first.record("discord.message", { channelId: "c1", messageId: "m1" },
+      { message: { content: "hello" }, channel: { id: "c1", guildId: "g", name: "Crash" } });
+    first.close(); // clean close: the views are current at the journal head
+    // A crash after the clean close: the journal grows without a layout
+    // finish. The child exits without close(), leaving its lock behind.
+    const crashScript = `import { ConversationArchive } from ${JSON.stringify(import.meta.resolve("../src/llm/archive.js"))};
+const archive = new ConversationArchive(process.argv[2]);
+archive.record("discord.message", { channelId: "c1", messageId: "m2" }, { message: { content: "crashed" } });
+process.exit(0);
+`;
+    fs.writeFileSync(path.join(dir, "crash.ts"), crashScript, { mode: 0o600 });
+    const crashed = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), path.join(dir, "crash.ts"), dir],
+      { encoding: "utf8", timeout: 20_000, env: { PATH: process.env.PATH, HOME: process.env.HOME, TMPDIR: process.env.TMPDIR } });
+    assert.equal(crashed.status, 0, `crash child failed: ${crashed.stdout}\n${crashed.stderr}`);
+    // The next start rebuilds the lagging views in the background instead of
+    // blocking the boot.
+    const second = new ConversationArchive(dir);
+    try {
+      assert.notEqual(second.viewsReady, undefined, "a lagging layout rebuilds in the background");
+      await second.viewsReady;
+      const channelDirs = fs.readdirSync(path.join(dir, "channels"));
+      assert.equal(channelDirs.length, 1, "the rebuild restored the channel view");
+      const eventsDir = path.join(dir, "channels", channelDirs[0], "events");
+      const events = fs.readdirSync(eventsDir).flatMap((f) => fs.readFileSync(path.join(eventsDir, f), "utf8"));
+      assert.ok(events.some((event) => event.includes("crashed")), "the background rebuild replayed the post-crash record");
+      second.close();
+      const third = new ConversationArchive(dir);
+      try {
+        assert.equal(third.viewsReady, undefined, "a clean archive starts without a rebuild");
+      } finally { third.close(); }
+    } finally { second.close(); }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  ok("archive: an unclean stop rebuilds the readable views in the background");
 }
 
 {
@@ -851,6 +893,33 @@ const ok = (name: string): void => {
   assert.equal(older.messages[0].content, "old message edited offline");
   assert.deepEqual(older.deleted, ["2"]);
   ok("refresh: retained edits and deletions outside the latest 100 IDs are reconciled");
+}
+
+{
+  const requested: string[] = [];
+  const fresh = await fetchFreshMessages(["1", "2", "3"], async () => [], async (id) => {
+    requested.push(id);
+    return { id };
+  }, undefined, null, (id) => id !== "1");
+  assert.deepEqual(requested, ["1"], "only the unsettled ID is fetched");
+  assert.deepEqual(fresh.deleted, []);
+  assert.equal(fresh.messages.length, 1);
+  ok("refresh: caller-settled IDs skip the individual reconcile fetch");
+}
+
+{
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const ids = Array.from({ length: 64 }, (_, i) => String(i + 1));
+  await fetchFreshMessages(ids, async () => [], async (id) => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await tick();
+    inFlight -= 1;
+    return { id };
+  });
+  assert.equal(maxInFlight, RECONCILE_CONCURRENCY, "the reconcile pool is bounded");
+  ok("refresh: individual reconcile fetches are bounded in flight");
 }
 
 // ----------------------------------------------------------------- quiet --

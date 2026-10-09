@@ -74,42 +74,61 @@ export class ArchiveLayout {
       { mode: 0o600 });
   }
 
-  /** Repair views after a crash or upgrade, then mark the live session dirty. */
-  restore(archive: ConversationArchive): void {
-    let clean = false;
+  /**
+   * Why the readable views must be rebuilt from the verified journal, or
+   * null when they are current: "dirty" — a valid state file says the views
+   * lag the journal head (an unclean previous stop; the journal is
+   * authoritative, so the views may catch up in the background); "stale" —
+   * the state is missing, corrupt or older than the verified head (the views
+   * must be rebuilt before use).
+   */
+  rebuildReason(archive: ConversationArchive): "dirty" | "stale" | null {
+    let state: { version?: number; channels?: unknown; clean?: boolean } | null = null;
     try {
-      const state = JSON.parse(fs.readFileSync(this.stateFile(), "utf8"));
-      const head = archive.head();
+      const parsed = JSON.parse(fs.readFileSync(this.stateFile(), "utf8"));
+      if (parsed === null || typeof parsed !== "object") throw new Error("invalid state");
+      state = parsed as { version?: number; channels?: unknown; clean?: boolean };
       if (state.version === 2 && Array.isArray(state.channels)) {
         for (const [id, folder] of state.channels) {
           if (typeof id !== "string" || typeof folder !== "string" || !/^[\p{L}\p{N}_-]+$/u.test(folder)) throw new Error("invalid channel folder");
           this.channelFolders.set(id, folder);
         }
       }
-      clean = state.version === 2 && Array.isArray(state.channels) && state.clean === true && state.seq === head.seq && state.hash === head.hash &&
-        fs.existsSync(path.join(this.directory, "channels"));
-    } catch { this.channelFolders.clear(); /* old archive or interrupted view write */ }
-    if (!clean) {
-      const stage = path.join(this.directory, `layout-rebuild-${randomUUID()}`);
-      fs.mkdirSync(stage, { mode: 0o700 });
-      const layout = new ArchiveLayout(stage, false, this.channelFolders);
-      fs.mkdirSync(path.join(stage, "channels"), { mode: 0o700 });
-      for (const record of archive.records()) layout.append(archive, record, true);
-      // Restore only the latest context per channel instead of expanding every
-      // growing historical checkpoint during a rebuild.
-      for (const [id, context] of archive.restoreContexts()) {
-        writeJson(path.join(layout.channelDirectory(id), "context.json"), context);
-      }
-      layout.finish(archive);
-      const channels = path.join(this.directory, "channels");
-      const old = `${channels}.old-${randomUUID()}`;
-      if (fs.existsSync(channels)) fs.renameSync(channels, old);
-      fs.renameSync(path.join(stage, "channels"), channels);
-      this.channelFolders.clear();
-      for (const [id, folder] of layout.channelFolders) this.channelFolders.set(id, folder);
-      fs.rmSync(stage, { recursive: true });
-      if (fs.existsSync(old)) fs.rmSync(old, { recursive: true });
+    } catch { this.channelFolders.clear(); state = null; /* old archive or interrupted view write */ }
+    const head = archive.head();
+    const valid = state !== null && state.version === 2 && Array.isArray(state.channels);
+    if (valid && (state as { clean?: boolean; seq?: number; hash?: string }).clean === true &&
+        (state as { seq?: number }).seq === head.seq && (state as { hash?: string }).hash === head.hash &&
+        fs.existsSync(path.join(this.directory, "channels"))) return null;
+    return valid ? "dirty" : "stale";
+  }
+
+  /** Replay the verified journal into a fresh staged tree and swap it in. */
+  rebuild(archive: ConversationArchive): void {
+    const stage = path.join(this.directory, `layout-rebuild-${randomUUID()}`);
+    fs.mkdirSync(stage, { mode: 0o700 });
+    const layout = new ArchiveLayout(stage, false, this.channelFolders);
+    fs.mkdirSync(path.join(stage, "channels"), { mode: 0o700 });
+    for (const record of archive.records()) layout.append(archive, record, true);
+    // Restore only the latest context per channel instead of expanding every
+    // growing historical checkpoint during a rebuild.
+    for (const [id, context] of archive.restoreContexts()) {
+      writeJson(path.join(layout.channelDirectory(id), "context.json"), context);
     }
+    layout.finish(archive);
+    const channels = path.join(this.directory, "channels");
+    const old = `${channels}.old-${randomUUID()}`;
+    if (fs.existsSync(channels)) fs.renameSync(channels, old);
+    fs.renameSync(path.join(stage, "channels"), channels);
+    this.channelFolders.clear();
+    for (const [id, folder] of layout.channelFolders) this.channelFolders.set(id, folder);
+    fs.rmSync(stage, { recursive: true });
+    if (fs.existsSync(old)) fs.rmSync(old, { recursive: true });
+  }
+
+  /** Repair views after a crash or upgrade (rebuilding when needed), then mark the live session dirty. */
+  restore(archive: ConversationArchive): void {
+    if (this.rebuildReason(archive) !== null) this.rebuild(archive);
     for (const record of archive.incomplete().turns) {
       if (!record.scope.channelId || !record.scope.turnId) continue;
       const data = archive.readData<{ chime?: boolean }>(record);

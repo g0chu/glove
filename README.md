@@ -109,9 +109,10 @@ without the affected tensor/MTP combination.
   `MODEL_SYSTEM_PROMPT` is prepended to every request.
   On restart, all available messages since the last completed REST snapshot
   are merged in Discord order. Before every model attempt, REST refresh fills
-  missed gateway gaps and reconciles every retained message's current content,
-  attachments, reactions and deletion state. These requests are sequential;
-  longer retained conversations take more time to reconcile. Partial gateway
+  missed gateway gaps and reconciles retained messages whose current state
+  this process has not already observed — each verified ID is not re-fetched
+  (a gateway reconnection re-verifies them all), and the fetches run with
+  bounded concurrency, paced by Discord's rate limiter. Partial gateway
   updates are fetched completely before replacing stored content.
 - **Streaming:** by default the answer is built up live: typing indicator
   while generating, message created on the first chunk, edits throttled to
@@ -440,10 +441,11 @@ Before each mention or chime attempt, the bot waits for `DISCORD_MESSAGE_STABLE_
 without messages, edits, or deletions from other users/bots. Typing indicators
 are not activity — they do not change the channel's content, and the message that
 is typed interrupts the attempt through its own event once it arrives. It then fetches
-fresh Discord history, paginating new-message gaps and reconciling the latest 100
-tracked user messages for edits and confirmed deletions. Activity during the fetch
-discards that snapshot; discovered changes restart the quiet wait before rebuilding
-the prompt. Refresh failures stop the attempt rather than answer from stale history.
+fresh Discord history, paginating new-message gaps and reconciling the tracked
+messages the pre-turn catch-up has not already verified for edits and confirmed
+deletions. Activity during the fetch discards that snapshot; discovered changes
+restart the quiet wait before rebuilding the prompt. Refresh failures stop the
+attempt rather than answer from stale history.
 The bot’s own activity is excluded. Channel activity cancels generation as well
 as prompt processing.
 

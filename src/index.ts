@@ -9,7 +9,7 @@ import { chimeReplyChat, interruptionContinuationInstruction, replyPhaseInstruct
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { MessageObservations } from "./bot/observations.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
-import { fetchFreshMessages } from "./bot/refresh.js";
+import { fetchFreshMessages, reconcileMessageIds } from "./bot/refresh.js";
 import { ChannelActivity } from "./bot/quiet.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMention } from "./bot/router.js";
 import { ResponseWriter, SAFE_MENTIONS, type PartialGeneration, type PostedReply } from "./bot/writer.js";
@@ -154,9 +154,16 @@ async function main(): Promise<void> {
   // the observed cursor; a crash during catch-up must not skip the gap.
   for (const [channelId, after] of catchupBoundaries) archive.record("catchup.started", { channelId }, { after });
   const liveMessageIds = new Set<string>();
+  // IDs whose current state this process has observed since the last gateway
+  // (re)connection — a gateway event or a REST verification. Only settled IDs
+  // may skip the pre-turn REST reconcile; a gateway disconnect un-settles
+  // them all, so events missed while disconnected surface as edits (synced)
+  // or 10008s (deleted) on the next reconcile.
+  const settledIds = new Set<string>();
   const messageObservations = new MessageObservations();
   const noteLiveMessage = (id: string): void => {
     liveMessageIds.add(id);
+    settledIds.add(id);
     messageObservations.note(id);
   };
   const deletedChannelIds = new Set<string>();
@@ -197,33 +204,52 @@ async function main(): Promise<void> {
         (message) => {
           archiveMessage(message, "catchup");
           observations.set(message.id, message);
+          settledIds.add(message.id);
         });
       // Reconcile every retained backing ID, including bot reply chunks.
       // Page observations already cover some IDs; absence is not deletion.
-      const deleted: string[] = [];
-      for (const id of new Set(retainedIds)) {
-        if (stopping || deletedChannelIds.has(channel.id)) throw new InterruptedError();
-        if (!id || liveMessageIds.has(id)) continue;
-        try {
-          const message = observations.get(id) ?? await channel.messages.fetch({ message: id, force: true, cache: false });
-          if (liveMessageIds.has(id)) continue;
-          archiveMessage(message, "reconcile");
-          observations.set(id, message);
-        } catch (err) {
-          if ((err as { code?: unknown }).code === 10008 && !liveMessageIds.has(id)) {
-            deleted.push(id);
-          } else throw err;
-        }
+      // Settled IDs (observed this process since the last gateway reconnect)
+      // are not re-fetched; the fetches run with bounded concurrency so a
+      // fresh start over a large retained context paces at Discord's bucket
+      // instead of serially.
+      const liveBeforeReconcile = new Set(liveMessageIds);
+      const { fetched: reconciled, deleted } = await reconcileMessageIds(
+        retainedIds, observations,
+        async (id) => observations.get(id) ?? await channel.messages.fetch({ message: id, force: true, cache: false }),
+        {
+          aborted: () => stopping || deletedChannelIds.has(channel.id),
+          skip: (id) => settledIds.has(id),
+        },
+      );
+      const reconciledIds = new Set(reconciled.keys());
+      for (const [id, message] of reconciled) {
+        // A gateway event that landed during the fetch owns the ID (its
+        // state is newer); the commit path archives and syncs it. A stale
+        // live ID (last seen before a gateway reconnect) settles here: this
+        // REST snapshot is the newest observation for it.
+        if (liveMessageIds.has(id) && !liveBeforeReconcile.has(id)) continue;
+        settledIds.add(id);
+        archiveMessage(message, "reconcile");
+        observations.set(id, message);
       }
       if (stopping || deletedChannelIds.has(channel.id) || !client.user) throw new InterruptedError();
       for (const id of deleted) {
-        if (liveMessageIds.has(id)) continue;
+        // A gateway delete that landed during the fetch already recorded it.
+        if (liveMessageIds.has(id) && !liveBeforeReconcile.has(id)) continue;
         archive.record("discord.deleted", { channelId: channel.id, messageId: id }, { source: "reconcile" });
         context.removeById(id);
       }
       const fetched = [...observations.values()].sort((a, b) => compareDiscordIds(a.id, b.id));
       for (const message of fetched) {
-        if (!liveMessageIds.has(message.id) && context.has(message.id)) {
+        // A page observation for a live ID may predate a racing gateway
+        // event (the gateway already synced it, and a stale-live page
+        // message is picked up by the attempt's sync). A reconcile
+        // observation that was not raced by a gateway event is this
+        // process's newest REST snapshot for the ID and syncs even when the
+        // ID is stale-live.
+        const staleReconciled = reconciledIds.has(message.id) &&
+          (!liveMessageIds.has(message.id) || liveBeforeReconcile.has(message.id));
+        if ((staleReconciled || !liveMessageIds.has(message.id)) && context.has(message.id)) {
           syncMessageUpdate(context, message, client.user.id, client.user.username);
         }
       }
@@ -243,9 +269,19 @@ async function main(): Promise<void> {
       // seedFrom checkpoints synchronously; finish only after history is durable.
       archive.record("catchup.finished", { channelId: channel.id }, { through });
       refreshCursors.set(channel.id, through);
+      // Keep the in-process boundary in step with the durable cursor: the
+      // next catch-up covers only the new gap instead of re-paginating (and
+      // re-archiving) everything since the last restart.
+      catchupBoundaries.set(channel.id, through);
     })();
     catchups.set(channel.id, task);
-    void task.catch(() => { catchups.delete(channel.id); });
+    // Drop the task on settle, not only on failure: a stale resolved task
+    // would make later turns skip their catch-up (the retained-ID reconcile,
+    // the boundary advance and the gap merge run once per turn).
+    void task.then(
+      () => { catchups.delete(channel.id); },
+      () => { catchups.delete(channel.id); },
+    );
     return task;
   };
   // The llama-server's own metric endpoint (GET /slots): the model side's
@@ -475,9 +511,12 @@ async function main(): Promise<void> {
           const trackedIds = context.snapshot().flatMap((e) => e.ids);
           const after = refreshCursors.get(channelId) ?? null;
           archive.record("catchup.started", { channelId }, { after });
+          // Settled IDs were just observed by the catch-up (or via the
+          // gateway this process) — the page alone is the fresh part.
           const fresh = await fetchFreshMessages(trackedIds,
             async (before) => [...(await textChannel.messages.fetch({ limit: 100, before, cache: false })).values()],
-            (id) => textChannel.messages.fetch({ message: id, force: true, cache: false }), attemptController.signal, after);
+            (id) => textChannel.messages.fetch({ message: id, force: true, cache: false }), attemptController.signal, after,
+            (id) => settledIds.has(id));
           if (stopping || deletedChannelIds.has(channelId)) return;
           // A gateway event wins over every observation in an in-flight snapshot.
           if (attemptController.signal.aborted) throw new InterruptedError();
@@ -492,17 +531,25 @@ async function main(): Promise<void> {
           let deferred = false;
           for (const message of fresh.messages) {
             if (!context.has(message.id) && !isTrackable(message, refreshBot.id, cfg.discord.guildId)) continue;
-            archiveMessage(message, "refresh");
+            settledIds.add(message.id);
             if (context.has(message.id)) {
-              if (syncMessageUpdate(context, message, refreshBot.id, refreshBot.username)) channelActivity.note(channelId);
-            } else if (gate.isPending(message.id)) {
-              gate.observe(message);
-              deferred = true;
-            } else if ((after === null || compareDiscordIds(message.id, after) > 0) &&
-                !gate.isPending(message.id) && !archive.wasTracked(channelId, message.id) &&
-                (context.getClearedAt() === null || message.createdTimestamp > context.getClearedAt()!)) {
-              gate.arrive(message);
-              channelActivity.note(channelId, !message.author.bot && isMentionOf(message, refreshBot.id));
+              // Only a changed observation is new to the archive: the page
+              // re-fetches the channel's newest messages on every attempt.
+              if (syncMessageUpdate(context, message, refreshBot.id, refreshBot.username)) {
+                archiveMessage(message, "refresh");
+                channelActivity.note(channelId);
+              }
+            } else {
+              archiveMessage(message, "refresh");
+              if (gate.isPending(message.id)) {
+                gate.observe(message);
+                deferred = true;
+              } else if ((after === null || compareDiscordIds(message.id, after) > 0) &&
+                  !archive.wasTracked(channelId, message.id) &&
+                  (context.getClearedAt() === null || message.createdTimestamp > context.getClearedAt()!)) {
+                gate.arrive(message);
+                channelActivity.note(channelId, !message.author.bot && isMentionOf(message, refreshBot.id));
+              }
             }
           }
           if (deferred) channelActivity.note(channelId);
@@ -1170,6 +1217,7 @@ async function main(): Promise<void> {
         message.channel.messages.fetch({ message: message.id, force: true, cache: false }))
         .then((fresh) => {
           if (!fresh || stopping || deletedChannelIds.has(channelId)) return;
+          settledIds.add(fresh.id);
           archiveMessage(fresh, "update.refresh");
           // This fetch is from the guild text channel checked above.
           if (gate.isPending(fresh.id)) gate.arrive(fresh as GateMessage);
@@ -1222,6 +1270,7 @@ async function main(): Promise<void> {
       if (!fresh || stopping || !client.user || deletedChannelIds.has(channelId)) return;
       const context = contexts.get(channelId);
       if (context.getClearedAt() !== clearedAt) return;
+      settledIds.add(fresh.id);
       archiveMessage(fresh, source);
       // A reaction event may supersede an in-flight partial-update fetch.
       // Its complete observation must also restore text/attachments or resume
@@ -1256,6 +1305,12 @@ async function main(): Promise<void> {
   // minutes before the first model request even went out. The message that
   // is typed interrupts the turn through its own event once it arrives
   // (messageCreate notes activity).
+
+  // A gateway disconnect (emitted when the socket drops, before resume or
+  // re-identify): events missed while disconnected are not resent, so every
+  // retained ID is unsettled until the next REST reconcile re-verifies it
+  // (a missed edit syncs, a missed delete 10008s).
+  client.on("shardReconnecting", () => { settledIds.clear(); });
 
   // Deletions: drop the still-pending message (it never committed, so there
   // is nothing to remove from the context) and, wherever an entry is in the

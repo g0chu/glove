@@ -440,14 +440,15 @@ async function run(): Promise<void> {
   assert(prompt().includes("final text recovered by reaction"));
   assert(!prompt().includes("stale reaction placeholder"));
 
-  // REST finds committed edits and deletes even when gateway events were missed.
+  // A gateway reconnect can miss edits and deletes; the missed IDs were
+  // never settled this process, so the pre-turn REST reconcile recovers
+  // both before the first attempt answers.
+  client.emit("shardReconnecting", 0);
   history.set("1000", { ...reactionFresh, content: "edit recovered by pre-turn REST", editedTimestamp: now } as FakeMessage);
   history.delete("900");
   create("1200", "<@bot> reconcile missed events");
   await advance(200);
-  assert.equal(requests.length, 7, "changed REST history requires a fresh quiet attempt");
-  await advance(200);
-  assert.equal(requests.length, 8);
+  assert.equal(requests.length, 8, "missed edits and deletes are recovered before the first attempt");
   assert(prompt().includes("edit recovered by pre-turn REST"));
   assert(!prompt().includes("fresh conversation"));
 
@@ -490,13 +491,13 @@ async function run(): Promise<void> {
   assert(prompt().includes("newest queued question"));
   assert(entries().some((e) => e.content === "uninterrupted reply"));
 
-  // More than a page of missed gateway arrivals must be stabilized before answering.
+  // More than a page of missed gateway arrivals is paginated by the
+  // catch-up and merged like an offline gap, so the first attempt already
+  // answers over the whole gap.
   for (let id = 1800; id <= 1920; id++) history.set(String(id), makeMessage(String(id), `online missed gap ${id}`));
   create("2000", "<@bot> include the whole missed gap");
   await advance(200);
-  assert.equal(requests.length, 10, "discovered arrivals must pass the stability gate before generation");
-  await advance(200);
-  assert.equal(requests.length, 11);
+  assert.equal(requests.length, 11, "a multi-page gap is merged before the first attempt");
   for (let id = 1800; id <= 1920; id++) assert(prompt().includes(`online missed gap ${id}`));
 
   // A REST permission failure cannot cause an answer from incomplete history.

@@ -122,9 +122,12 @@ durable journal intact and only affect startup speed.
 
 Clean warm startup does not reread every historical payload. Content is hash-verified when
 read, including restored working contexts and attachments. Readable views rebuild
-on first upgrade or after an unclean session; this reads historical payloads and
-can take longer for a large archive. Removing `_system/layout.json` while stopped also
-forces a view rebuild. To check all recorded
+on first upgrade or after an unclean session: after an unclean stop the rebuild runs
+in the background (the verified journal stays authoritative, the bot serves turns while
+the views catch up, and a stop before the rebuild finishes leaves the views stale — the
+next start rebuilds them again), while a missing or corrupt `_system/layout.json`
+(removing it while stopped, or an upgrade) rebuilds synchronously. Rebuilding reads
+historical payloads and can take longer for a large archive. To check all recorded
 payloads and response/attachment bytes for disk corruption, stop the bot and run
 `npm run archive -- inspect`; CLI commands always use exhaustive recovery.
 The index can be removed while stopped to force a full startup verification.
@@ -174,9 +177,10 @@ only after context checkpoints, and pending arrivals keep the cursor behind
 their uncommitted IDs. Legacy archives reconcile once from their oldest tracked
 ID to repair earlier gaps. Retired IDs and clear watermarks prevent resurrection.
 Network/permission failures leave catch-up pending for retry; incomplete startup
-catch-up skips the turn. Fetches are sequential and respect Discord rate limits;
-long retained conversations require more REST requests than the former 100-ID
-reconciliation window.
+catch-up skips the turn. Direct fetches run with bounded concurrency (16 in flight)
+and are paced by Discord's rate limiter; each retained ID is verified once per
+process and re-verified after a gateway reconnection, so long retained conversations
+cost one reconciliation pass at startup instead of one per turn.
 
 ## Inspect and export
 
