@@ -724,14 +724,24 @@ export class ChannelContext {
   /**
    * The char estimate undercounts the wire prompt (the tool schemas sent
    * with every request, the server's chat-template tokens, the tokenizer's
-   * own counts): when the endpoint's measured size is known, shrink to the
-   * target minus that gap — otherwise the shrink can be a no-op on a context
-   * that still overfills the window, and every later request fills it again.
+   * own counts, rendered images at a flat cost): when the endpoint's measured
+   * size is known, shrink to the target minus that gap; when the measurement
+   * is unknown but the overflowing request reported its own size (the
+   * endpoint's count of this very prompt, `requestTokens`), shrink to the
+   * target minus that gap instead — otherwise the shrink can be a no-op on a
+   * context that still overfills the window, and every later request fills
+   * it again.
    */
-  private shrinkTarget(targetTokens: number, systemPrompt: string, window: number, fileMaxBytes?: number): number {
-    const measured = this.measuredTokens;
-    if (measured === null) return targetTokens;
-    return Math.max(0, targetTokens - Math.max(0, measured - this.estimateTokens(systemPrompt, window, fileMaxBytes)));
+  private shrinkTarget(
+    targetTokens: number,
+    systemPrompt: string,
+    window: number,
+    fileMaxBytes?: number,
+    requestTokens?: number | null,
+  ): number {
+    const reference = this.measuredTokens ?? requestTokens ?? null;
+    if (reference === null) return targetTokens;
+    return Math.max(0, targetTokens - Math.max(0, reference - this.estimateTokens(systemPrompt, window, fileMaxBytes)));
   }
 
   /** Drop the oldest entries (never the protected one) until the estimate fits the given target. */
@@ -750,7 +760,9 @@ export class ChannelContext {
   /**
    * Last-resort shrink when a compaction could not apply: drop the oldest
    * entries (never the protected one — the turn's mention) until the
-   * estimate fits the budget (gap-adjusted — see shrinkTarget).
+   * estimate fits the budget (gap-adjusted — see shrinkTarget; the
+   * overflowing request's own reported size is the gap when the measurement
+   * is unknown).
    */
   emergencyTrim(
     protectedId: string,
@@ -758,18 +770,20 @@ export class ChannelContext {
     systemPrompt: string,
     window: number,
     fileMaxBytes?: number,
+    requestTokens?: number | null,
   ): void {
-    this.trimTo(protectedId, this.shrinkTarget(maxTokens, systemPrompt, window, fileMaxBytes), systemPrompt, window, fileMaxBytes);
+    this.trimTo(protectedId, this.shrinkTarget(maxTokens, systemPrompt, window, fileMaxBytes, requestTokens), systemPrompt, window, fileMaxBytes);
   }
 
   /**
    * Last-resort shrink when a request overfilled the model's context and the
    * endpoint rejected it: drop the oldest entries (never the protected one —
    * the turn's mention) until the estimate fits `targetTokens` (gap-adjusted
-   * — see shrinkTarget), and, if the remaining entries still do not fit, drop
-   * the running summary too (it is derived data — the only thing left besides
-   * the mention). After this, the next request fits the window again (unless
-   * the mention alone does not).
+   * — see shrinkTarget; the overflowing request's own reported size is the
+   * gap when the measurement is unknown), and, if the remaining entries still
+   * do not fit, drop the running summary too (it is derived data — the only
+   * thing left besides the mention). After this, the next request fits the
+   * window again (unless the mention alone does not).
    */
   emergencyShrink(
     protectedId: string,
@@ -777,8 +791,9 @@ export class ChannelContext {
     systemPrompt: string,
     window: number,
     fileMaxBytes?: number,
+    requestTokens?: number | null,
   ): void {
-    const target = this.shrinkTarget(targetTokens, systemPrompt, window, fileMaxBytes);
+    const target = this.shrinkTarget(targetTokens, systemPrompt, window, fileMaxBytes, requestTokens);
     this.trimTo(protectedId, target, systemPrompt, window, fileMaxBytes);
     if (this.estimateTokens(systemPrompt, window, fileMaxBytes) > target && this.summary !== null) {
       this.summary = null;
@@ -813,6 +828,23 @@ export function isContextOverflowError(err: unknown): boolean {
 export function contextWindowFromOverflowError(err: unknown): number | null {
   const msg = err instanceof Error ? err.message : String(err);
   const m = /context size \((\d+) tokens\)/.exec(msg);
+  return m !== null ? Number(m[1]) : null;
+}
+
+/**
+ * The prompt size (tokens) of the rejected request, when the overflow error
+ * reports it — the endpoint's own count of the overfilled prompt. llama.cpp
+ * carries it in the message ("request (133536 tokens) exceeds the available
+ * context size (128000 tokens) …") and its JSON body reports
+ * `n_prompt_tokens` alongside; null when the error is not shaped that way.
+ * The gap between this count and the char estimate is exactly what the
+ * estimate undercounts (the tool schemas, the template tokens, the
+ * tokenizer's own counts) — the shrink's gap source when the endpoint's
+ * measured size is unknown.
+ */
+export function requestTokensFromOverflowError(err: unknown): number | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = /request \((\d+) tokens\)/.exec(msg) ?? /"n_prompt_tokens"\s*:\s*(\d+)/.exec(msg);
   return m !== null ? Number(m[1]) : null;
 }
 

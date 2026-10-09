@@ -8,6 +8,7 @@ import {
   COMPACTION_SYSTEM_PROMPT,
   contextWindowFromOverflowError,
   isContextOverflowError,
+  requestTokensFromOverflowError,
   speakerLabel,
   type ChannelContext,
   type CompactionResult,
@@ -150,6 +151,108 @@ export function refreshChannelIdentity(context: ChannelContext, channel: GuildTe
  * verbatim. Returns null when the mention is no longer in the context
  * (deleted while queued): the turn should be skipped.
  */
+/** What a compaction attempt did to the context. */
+export interface CompactionOutcome {
+  /** A model-written summary replaced the folded entries. */
+  compacted: boolean;
+  /** A concurrent change won the race (the context moved mid-summary); nothing was applied. */
+  changed: boolean;
+}
+
+/**
+ * Compact a channel context now — the model route: fold everything older
+ * than the newest `opts.keepMessages` entries (plus any existing summary)
+ * into one model-written summary via one chat call over the full active
+ * context, the reply's ordered tool definitions and a trailing system
+ * instruction; `mentionId` (the turn's mention) is never folded away. When
+ * the summary cannot be written — nothing to fold, a broken or empty
+ * summarizer, or the summarizer's own full-context request overfills the
+ * window (the context is then shrunk hard — the mention protected, the
+ * running summary a last resort — and the summary retried once) — the
+ * fail-safe applies instead: the oldest entries are dropped whole-group
+ * until the estimate fits `targetTokens` (default: the compaction budget),
+ * gap-adjusted (the measured-over-estimate gap, or the overflowing
+ * request's own reported token count when the measurement is unknown). The
+ * measurement is always forgotten afterwards (it described the
+ * pre-compaction context). An interruption of the summarizer call is
+ * re-thrown (the caller waits for stillness and retries the turn).
+ */
+export async function compactChannelContext(
+  context: ChannelContext,
+  opts: ContextOptions,
+  mentionId: string,
+  targetTokens: number = opts.maxTokens,
+): Promise<CompactionOutcome> {
+  // File contents add a per-attachment cost to the estimate (their size,
+  // capped at the download limit); undefined = the feature is off.
+  const fileCost = opts.enableFileContents ? opts.fileContentsMaxBytes : undefined;
+  const summarize = async (older: ContextEntry[]): Promise<string> => {
+    // Render exactly as a reply: keep roles, reasoning, tool pairs and attachments.
+    const boundary = prefixEndIndex(context, opts, older.length);
+    const active = await contextToMessages(context, opts);
+    const custom = opts.compactionPrompt?.trim();
+    const instruction = custom
+      ? `Custom summary guidance (subject to the phase rules below):\n${custom}\n\n${COMPACTION_SYSTEM_PROMPT}`
+      : COMPACTION_SYSTEM_PROMPT;
+    return opts.summarize([...active, {
+      role: "system",
+      content: `${instruction}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`,
+    }]);
+  };
+  let res: CompactionResult;
+  // The second overflow's own reported request size (the trim's gap source
+  // below when the measurement is unknown).
+  let secondOverflowTokens: number | null = null;
+  try {
+    res = await context.compact(opts.keepMessages, summarize, mentionId);
+  } catch (err) {
+    if (isInterruptedError(err)) throw err;
+    // The summarizer's full-context request overfilled the model's context
+    // (the channel outgrew the window since the last measurement): the
+    // summary cannot be written while the context is this large, so shrink
+    // hard (the mention protected, the running summary a last resort) and
+    // retry the compaction once; a second overflow falls through to the
+    // trim below.
+    if (!isContextOverflowError(err)) throw err;
+    const window = contextWindowFromOverflowError(err);
+    // The endpoint's own count of the overfilled prompt, read from the
+    // error: the gap source for the shrink when the measurement is unknown
+    // (the char estimate undercounts the wire prompt, so a plain estimate
+    // fit would be a no-op on a context that still overfills the window).
+    const firstOverflowTokens = requestTokensFromOverflowError(err);
+    // The estimate must fit the smaller of the target and the window minus
+    // the completion headroom (the target alone may sit at or above the
+    // window).
+    const target =
+      window !== null
+        ? Math.min(targetTokens, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
+        : targetTokens;
+    context.emergencyShrink(mentionId, target, opts.systemPrompt, opts.maxMessages, fileCost, firstOverflowTokens);
+    log.warn(
+      `channel context compaction overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the summary once`,
+    );
+    try {
+      res = await context.compact(opts.keepMessages, summarize, mentionId);
+    } catch (err2) {
+      if (isInterruptedError(err2)) throw err2;
+      secondOverflowTokens = isContextOverflowError(err2) ? requestTokensFromOverflowError(err2) : null;
+      res = { ok: false, reason: "summarizer" };
+    }
+  }
+  if (!res.ok && res.reason !== "changed") {
+    log.warn(
+      `context compaction did not apply (${res.reason}); trimming the oldest messages to fit the target`,
+    );
+    // The trim reads the measurement first (its gap adjustment; the
+    // second overflow's own reported size when the measurement is
+    // unknown), then forgets it — it then describes the pre-compaction
+    // context.
+    context.emergencyTrim(mentionId, targetTokens, opts.systemPrompt, opts.maxMessages, fileCost, secondOverflowTokens);
+  }
+  context.setMeasuredTokens(null);
+  return { compacted: res.ok, changed: !res.ok && res.reason === "changed" };
+}
+
 export async function buildChannelContext(
   channel: GuildTextBasedChannel,
   context: ChannelContext,
@@ -196,63 +299,12 @@ export async function buildChannelContext(
   const estimate = context.estimateTokens(opts.systemPrompt, opts.maxMessages, fileCost);
   const size = measured !== null ? measured : estimate;
   if (size > opts.maxTokens) {
-    const summarize = async (older: ContextEntry[]): Promise<string> => {
-      // Render exactly as a reply: keep roles, reasoning, tool pairs and attachments.
-      const boundary = prefixEndIndex(context, opts, older.length);
-      const active = await contextToMessages(context, opts);
-      const custom = opts.compactionPrompt?.trim();
-      const instruction = custom
-        ? `Custom summary guidance (subject to the phase rules below):\n${custom}\n\n${COMPACTION_SYSTEM_PROMPT}`
-        : COMPACTION_SYSTEM_PROMPT;
-      return opts.summarize([...active, {
-        role: "system",
-        content: `${instruction}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`,
-      }]);
-    };
-    let res: CompactionResult;
-    try {
-      res = await context.compact(opts.keepMessages, summarize, mentionId);
-    } catch (err) {
-      if (isInterruptedError(err)) throw err;
-      // The summarizer's full-context request overfilled the model's context
-      // (the channel outgrew the window since the last measurement): the
-      // summary cannot be written while the context is this large, so shrink
-      // hard (the mention protected, the running summary a last resort) and
-      // retry the compaction once; a second overflow falls through to the
-      // trim below.
-      if (!isContextOverflowError(err)) throw err;
-      const window = contextWindowFromOverflowError(err);
-      // The estimate must fit the smaller of the compaction budget and the
-      // window minus the completion headroom (the budget alone may sit at or
-      // above the window).
-      const target =
-        window !== null
-          ? Math.min(opts.maxTokens, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
-          : opts.maxTokens;
-      context.emergencyShrink(mentionId, target, opts.systemPrompt, opts.maxMessages, fileCost);
-      log.warn(
-        `channel context compaction overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the summary once`,
-      );
-      try {
-        res = await context.compact(opts.keepMessages, summarize, mentionId);
-      } catch (err2) {
-        if (isInterruptedError(err2)) throw err2;
-        res = { ok: false, reason: "summarizer" };
-      }
-    }
-    if (res.ok) {
+    const outcome = await compactChannelContext(context, opts, mentionId);
+    if (outcome.compacted) {
       log.info(
         `channel context filled the budget (${measured !== null ? `measured ${measured}` : `estimated ${estimate}`} tokens > ${opts.maxTokens}); compacted to a summary + ${context.length} recent message(s)`,
       );
-    } else if (res.reason !== "changed") {
-      log.warn(
-        `context compaction did not apply (${res.reason}); trimming the oldest messages to fit the budget`,
-      );
-      // The trim reads the measurement first (its gap adjustment), then
-      // forgets it — it then describes the pre-compaction context.
-      context.emergencyTrim(mentionId, opts.maxTokens, opts.systemPrompt, opts.maxMessages, fileCost);
     }
-    context.setMeasuredTokens(null);
   }
   if (!context.has(mentionId)) return null;
   return contextToMessages(context, opts);

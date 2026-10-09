@@ -50,9 +50,12 @@ export interface ToolTurnDeps {
   /**
    * Passed to every model call: channel activity cancels prompt processing,
    * reasoning and reply text. Running tools finish with their own deadlines.
-   * After an executed round, interruption/overflow becomes an ordinary error
-   * so callers cannot blindly replay the turn. The bot checkpoints completed
-   * rounds on activity, then rebuilds from that history for a fresh attempt.
+   * After an executed round, an interruption becomes an ordinary error so the
+   * loop is never retried blindly — the bot checkpoints the completed rounds,
+   * waits for stillness and rebuilds from updated context. An overflow after
+   * an executed round is re-thrown as-is: the caller shrinks the channel
+   * context and retries the model call with the executed rounds carried in
+   * the prompt (the retry is a model call — no tool is replayed).
    */
   signal?: AbortSignal;
   /** Skip tools that have not started after channel activity. */
@@ -112,11 +115,16 @@ export async function runToolTurn(messages: ChatMessage[], deps: ToolTurnDeps): 
       checkMention();
       res = await deps.chat(messages, undefined, tools.length > 0 ? tools : undefined, deps.signal);
     } catch (err) {
-      // Retrying from scratch loses executed operations and may repeat side
-      // effects. Use the ordinary error path, which records completed rounds.
-      if (toolRounds > 0 && (isInterruptedError(err) || isContextOverflowError(err))) {
-        throw new Error("stopped after tools executed because the model could not continue; completed tool results were retained and automatic retry was skipped");
+      // An interruption after executed rounds is converted to an ordinary
+      // error: the turn runner retains the completed rounds and rebuilds
+      // from updated context, so the loop itself is never retried blindly.
+      if (toolRounds > 0 && isInterruptedError(err)) {
+        throw new Error("stopped after tools executed because channel activity arrived; completed tool results were retained");
       }
+      // An overflow (before or after executed rounds) is re-thrown as-is:
+      // the turn runner shrinks the channel context and retries the model
+      // call once, carrying the executed rounds in the prompt so no tool is
+      // replayed. A second overflow is the ordinary error path.
       throw err;
     }
     checkMention();

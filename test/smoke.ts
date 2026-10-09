@@ -35,7 +35,7 @@ import type { AddressInfo } from "node:net";
 import { ChannelType, type GuildTextBasedChannel, type Message } from "discord.js";
 import { parseConfig } from "../src/config.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMentionText } from "../src/bot/router.js";
-import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError, type ContextEntry } from "../src/llm/context.js";
+import { ChannelContext, ChannelContextStore, COMPACTION_SYSTEM_PROMPT, contextWindowFromOverflowError, estimateTokens, isContextOverflowError, requestTokensFromOverflowError, type ContextEntry } from "../src/llm/context.js";
 import { ChatPersistence } from "../src/llm/persist.js";
 import { ConversationArchive, type ArchiveRecord } from "../src/llm/archive.js";
 import { archiveChat } from "../src/llm/archived-chat.js";
@@ -64,7 +64,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, refreshChannelIdentity, contextToMessages, mergeDiscordHistory, prefixEndIndex, syncMessageUpdate, type ContextOptions, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, compactChannelContext, refreshChannelIdentity, contextToMessages, mergeDiscordHistory, prefixEndIndex, syncMessageUpdate, type ContextOptions, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn, type ToolRound } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -173,10 +173,19 @@ const ok = (name: string): void => {
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "glove-discord-flow-"));
   try {
+    // The flow must not inherit the developer's live .env (dotenv has already
+    // loaded it into this process): start from a minimal environment and set
+    // only what the entrypoint needs, so a machine with a configured bot
+    // still gets hermetic flow tests.
+    const cleanEnv: NodeJS.ProcessEnv = {};
+    for (const key of ["PATH", "HOME", "TMPDIR", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE"]) {
+      const value = process.env[key];
+      if (value !== undefined) cleanEnv[key] = value;
+    }
     const runFlow = (mode: string) => spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"),
       path.resolve("test/discord-flow.ts")], {
       cwd: dir, encoding: "utf8", timeout: 30_000,
-      env: { ...process.env, DISCORD_TOKEN: "fake-token", DISCORD_GUILD_ID: "guild",
+      env: { ...cleanEnv, DISCORD_TOKEN: "fake-token", DISCORD_GUILD_ID: "guild",
         MODEL_API_URL: "http://localhost:1/v1/chat/completions", DISCORD_MESSAGE_STABLE_MS: "200",
         CHATS_FILE: path.join(dir, "chats.json"), CHATS_ARCHIVE_DIR: path.join(dir, "archive"),
         ARCHIVE_ATTACHMENTS_ENABLED: "false", MODEL_METRICS_ENABLED: "false",
@@ -2329,6 +2338,142 @@ const ok = (name: string): void => {
   assert.equal(ovStore.getMeasuredTokens(), null, "the attempt forgets the measurement");
   ok("compaction: a summarizer overflow is recovered by a shrink and one retry");
 
+  // The measurement is unknown (an edit invalidated it and no request has
+  // succeeded since) and the estimate undercounts the wire prompt (the tool
+  // schemas, the template tokens, the tokenizer's own counts, rendered
+  // images at a flat cost): the overflow error's own request count is the
+  // gap source — without it the shrink would target the estimate (already
+  // within a few hundred tokens of the budget), cut almost nothing, and the
+  // retry would overflow again.
+  const gapErrStore = new ChannelContext();
+  for (let i = 0; i < 24; i++) gapErrStore.pushUser("U", "y".repeat(2000), `ge${String(i)}`, i, []);
+  gapErrStore.pushUser("Alice", "the mention", "gem", 99, []);
+  await buildChannelContext(noFetch, gapErrStore, "gem", { ...cOpts, maxTokens: Number.MAX_SAFE_INTEGER }); // caches the estimate's parameters without compacting
+  assert.equal(gapErrStore.getMeasuredTokens(), null, "the measurement is unknown");
+  const gapErrEstimate = gapErrStore.estimateTokens(cOpts.systemPrompt, cOpts.maxMessages, undefined);
+  const gapErrBudget = gapErrEstimate - 50; // over the budget (the estimate triggers) but a plain fit holds the estimate
+  const gapErrWindow = gapErrBudget + COMPACT_OUTPUT_RESERVE_TOKENS; // the window the budget was derived from
+  const gapErrGap = 4200; // the wire carries more than the estimate — the error is the only source
+  let gapErrCalls = 0;
+  const gapErrOpts = {
+    ...cOpts,
+    maxTokens: gapErrBudget,
+    keepMessages: 2,
+    summarize: async (): Promise<string> => {
+      gapErrCalls += 1;
+      // The endpoint's view of the summary request: the estimate plus the
+      // wire gap (schemas, template, tokenizer, images at their real cost).
+      const wire = gapErrStore.estimateTokens(cOpts.systemPrompt, cOpts.maxMessages, undefined) + gapErrGap;
+      if (wire > gapErrWindow) {
+        throw new Error(`HTTP 400 {"error":{"message":"request (${wire} tokens) exceeds the available context size (${gapErrWindow} tokens)"}}`);
+      }
+      return "error-gap summary";
+    },
+  };
+  await buildChannelContext(noFetch, gapErrStore, "gem", gapErrOpts);
+  assert.equal(gapErrCalls, 2, "the summary is retried once after the overflow");
+  assert.equal(gapErrStore.getSummary(), "error-gap summary", "the retry fits and the summary applied");
+  assert.ok(gapErrStore.has("gem"), "the mention survived the error-gap shrink");
+  assert.ok(!gapErrStore.has("ge0"), "the error-gap shrink dropped the oldest entry");
+  assert.equal(gapErrStore.length, 2, "the shrink cut what the endpoint counted, leaving only the keep window");
+  ok("compaction: a summarizer overflow without a measurement shrinks by the error's own request count");
+
+  // emergencyTrim (the second-overflow fallback) takes the same gap source:
+  // the overflowing request's reported size, when the measurement is
+  // unknown — a plain estimate fit would be a no-op on the overfilled
+  // context.
+  const trimErr = new ChannelContext();
+  for (let i = 0; i < 12; i++) trimErr.pushUser("U", "z".repeat(2000), `te${String(i)}`, i, []);
+  trimErr.pushUser("Alice", "the mention", "tem", 99, []);
+  const trimEstimate = trimErr.estimateTokens(cOpts.systemPrompt, cOpts.maxMessages, undefined);
+  trimErr.emergencyTrim("tem", trimEstimate - 50, cOpts.systemPrompt, cOpts.maxMessages, undefined, trimEstimate + 4200);
+  assert.ok(trimErr.has("tem"), "the protected mention survives the error-gap trim");
+  assert.ok(!trimErr.has("te0"), "the error-gap trim dropped the oldest entries");
+  assert.equal(trimErr.length, 4, "the trim cut what the endpoint counted (a plain fit would have cut one)");
+
+  // compactChannelContext is the model compaction route (the budget trigger
+  // and the overflow recovery in index.ts both go through it): fold the
+  // older entries into a model-written summary, dropping the oldest is the
+  // fail-safe only.
+  const ccStore = new ChannelContext();
+  for (let i = 0; i < 10; i++) ccStore.pushUser("U", "c".repeat(200), `c${String(i)}`, i, []);
+  ccStore.pushUser("Alice", "the mention", "cm", 99, []);
+  ccStore.setMeasuredTokens(123456);
+  let ccCalls = 0;
+  const ccRes = await compactChannelContext(ccStore, { ...cOpts, keepMessages: 3, summarize: async () => { ccCalls += 1; return "the earlier talk"; } }, "cm");
+  assert.equal(ccCalls, 1, "one summarizer call");
+  assert.deepEqual(ccRes, { compacted: true, changed: false });
+  assert.equal(ccStore.getSummary(), "the earlier talk", "the model's summary applied");
+  assert.ok(ccStore.has("cm"), "the mention survived compaction");
+  assert.ok(!ccStore.has("c0"), "the oldest entry folded into the summary");
+  assert.ok(ccStore.has("c8"), "the keep window stays verbatim");
+  assert.equal(ccStore.length, 3, "only the newest keep entries remain");
+  assert.equal(ccStore.getMeasuredTokens(), null, "the attempt forgets the measurement");
+  ok("compaction: the model route folds the older entries into a summary");
+
+  // The fail-safe: a broken summarizer drops the oldest entries whole-group
+  // until the estimate fits the target (no summary), the mention protected.
+  const ccFail = new ChannelContext();
+  for (let i = 0; i < 10; i++) ccFail.pushUser("U", "f".repeat(2000), `f${String(i)}`, i, []);
+  ccFail.pushUser("Alice", "the mention", "fm", 99, []);
+  await buildChannelContext(noFetch, ccFail, "fm", { ...cOpts, maxTokens: Number.MAX_SAFE_INTEGER }); // caches the estimate's parameters without compacting
+  const ccFailEstimate = ccFail.estimateTokens(cOpts.systemPrompt, cOpts.maxMessages, undefined);
+  let ccFailCalls = 0;
+  const ccFailRes = await compactChannelContext(ccFail, { ...cOpts, keepMessages: 3, maxTokens: ccFailEstimate - 100, summarize: async () => { ccFailCalls += 1; throw new Error("summarizer down"); } }, "fm");
+  assert.equal(ccFailCalls, 1, "the summarizer was tried once");
+  assert.deepEqual(ccFailRes, { compacted: false, changed: false });
+  assert.equal(ccFail.getSummary(), null, "no summary when the summarizer failed");
+  assert.ok(ccFail.has("fm"), "the mention survived the fail-safe trim");
+  assert.ok(!ccFail.has("f0"), "the fail-safe dropped the oldest entry");
+  ok("compaction: a broken summarizer falls back to dropping the oldest entries");
+
+  // The fail-safe without a summarizer call: nothing to fold (the context is
+  // already at or under the keep window) trims instead.
+  const ccSmall = new ChannelContext();
+  ccSmall.pushUser("U", "s".repeat(2000), "s0", 0, []);
+  ccSmall.pushUser("U", "s".repeat(2000), "s1", 1, []);
+  ccSmall.pushUser("Alice", "the mention", "sm", 99, []);
+  await buildChannelContext(noFetch, ccSmall, "sm", { ...cOpts, maxTokens: Number.MAX_SAFE_INTEGER }); // caches the estimate's parameters without compacting
+  const ccSmallEstimate = ccSmall.estimateTokens(cOpts.systemPrompt, cOpts.maxMessages, undefined);
+  let ccSmallCalls = 0;
+  const ccSmallRes = await compactChannelContext(ccSmall, { ...cOpts, keepMessages: 10, maxTokens: ccSmallEstimate - 100, summarize: async () => { ccSmallCalls += 1; return "no"; } }, "sm");
+  assert.equal(ccSmallCalls, 0, "nothing to fold — the summarizer is not called");
+  assert.deepEqual(ccSmallRes, { compacted: false, changed: false });
+  assert.ok(ccSmall.has("sm"), "the mention survived the trim");
+  assert.ok(!ccSmall.has("s0"), "the trim dropped the oldest entry");
+  assert.equal(ccSmall.length, 2, "only the newest entry and the mention remain");
+  ok("compaction: nothing-to-fold falls back to the trim without a summarizer call");
+
+  // The summarizer's own full-context request overfills the window (the
+  // measurement is unknown — an overflow recovery invalidates it): the
+  // context is shrunk hard first, gap-adjusted by the error's own request
+  // count, and the summary is retried once.
+  const ccOv = new ChannelContext();
+  for (let i = 0; i < 10; i++) ccOv.pushUser("U", "o".repeat(2000), `co${String(i)}`, i, []);
+  ccOv.pushUser("Alice", "the mention", "com", 99, []);
+  await buildChannelContext(noFetch, ccOv, "com", { ...cOpts, maxTokens: Number.MAX_SAFE_INTEGER }); // caches the estimate's parameters without compacting
+  const ccOvEstimate = ccOv.estimateTokens(cOpts.systemPrompt, cOpts.maxMessages, undefined);
+  const ccOvWindow = ccOvEstimate + 5000; // a window the full context overfills
+  const ccOvTarget = ccOvEstimate - 100;
+  let ccOvCalls = 0;
+  const ccOvRes = await compactChannelContext(ccOv, {
+    ...cOpts, keepMessages: 2, maxTokens: ccOvTarget,
+    summarize: async (): Promise<string> => {
+      ccOvCalls += 1;
+      if (ccOvCalls === 1) {
+        throw new Error(`HTTP 400 {"error":{"message":"request (${ccOvEstimate + 1000} tokens) exceeds the available context size (${ccOvWindow} tokens)"}}`);
+      }
+      return "overflow-route summary";
+    },
+  }, "com", ccOvTarget);
+  assert.equal(ccOvCalls, 2, "the summary is retried once after the overflow");
+  assert.deepEqual(ccOvRes, { compacted: true, changed: false });
+  assert.equal(ccOv.getSummary(), "overflow-route summary");
+  assert.ok(ccOv.has("com"), "the mention survived the shrink");
+  assert.ok(!ccOv.has("co0"), "the shrink dropped the oldest entry before the retry");
+  assert.equal(ccOv.length, 2, "the retry folded the rest, leaving the keep window");
+  ok("compaction: a summarizer overflow shrinks first and retries the summary once");
+
   // The measured size grows with what is appended after the measured request
   // (a turn's record, a committed message, a chime exchange): the trigger
   // must see what the next request will carry, not just the last prompt the
@@ -2352,6 +2497,9 @@ const ok = (name: string): void => {
   );
   assert.ok(isContextOverflowError(overflowErr), "llama.cpp's rejection matches");
   assert.equal(contextWindowFromOverflowError(overflowErr), 160000, "the window comes from the error");
+  assert.equal(requestTokensFromOverflowError(overflowErr), 310413, "the request size comes from the error");
+  assert.equal(requestTokensFromOverflowError(new Error('{"n_prompt_tokens":51000,"n_ctx":48000}')), 51000, "the JSON body's counter is the fallback");
+  assert.equal(requestTokensFromOverflowError(new Error("context window overflow")), null, "no numbers -> null");
   assert.ok(isContextOverflowError(new Error("context window overflow: n_tokens (99) > n_ctx (8)")));
   assert.ok(isContextOverflowError(new Error("This model's maximum context length is 4096 tokens.")));
   assert.ok(!isContextOverflowError(new Error("model request timed out after 600s")), "a timeout is not an overflow");
@@ -6431,33 +6579,54 @@ const ok = (name: string): void => {
   for (const failure of [new InterruptedError(), new Error("request (9000 tokens) exceeds the available context size (8000 tokens)")]) {
     let executions = 0;
     let requests = 0;
-    const context = new ChannelContext();
     const registry = new ToolRegistry().register({ name: "write", description: "", parameters: {} }, async () => {
       executions++;
       return "operation completed";
     });
-    const rounds: Parameters<ChannelContext["appendTurn"]>[0] = [];
+    const rounds: ToolRound[] = [];
     const run = () => runToolTurn([{ role: "user", content: "do it" }], {
       registry, maxRounds: 3,
       chat: async () => {
         if (++requests === 1) return { content: "writing", toolCalls: [{ id: "write1", name: "write", arguments: "{}" }] };
         throw failure;
       },
-      onRoundComplete: (round) => { rounds.push({ ...round, ids: [] }); },
+      onRoundComplete: (round) => { rounds.push(round); },
     });
-    // Same classification as the turn runner: retry only interruption/overflow;
-    // all other failures record completed rounds through the ordinary error path.
-    try { await run(); assert.fail("expected continuation failure"); } catch (err) {
-      if (isInterruptedError(err) || isContextOverflowError(err)) await run();
-      else context.appendTurn(rounds, { content: String(err), ids: [] });
-    }
-    assert.equal(executions, 1);
+    // After an executed round: an interruption is an ordinary error (the turn
+    // runner retains the round and rebuilds from updated context); an overflow
+    // is re-thrown as-is (the runner shrinks the context and retries the model
+    // call with the executed round carried in the prompt).
+    let caught: unknown;
+    try { await run(); assert.fail("expected continuation failure"); } catch (err) { caught = err; }
+    assert.equal(executions, 1, "the tool executed once");
     assert.equal(requests, 2);
-    assert.equal(context.snapshot().filter(e => e.role === "tool")[0]?.content, "operation completed");
-    assert.match(context.snapshot().at(-1)!.content, /automatic retry was skipped/);
+    assert.equal(rounds.length, 1, "the executed round was reported");
+    assert.equal(rounds[0]!.results[0]!.content, "operation completed");
+    if (isContextOverflowError(failure)) {
+      assert.ok(isContextOverflowError(caught), "overflow after execution re-throws for the runner's shrink-and-carry retry");
+      // The overflow retry carries the executed round in the prompt and
+      // continues the turn: the model sees its own result, and the tool is
+      // not replayed.
+      let retryRequests = 0;
+      const carried: ChatMessage[] = [
+        { role: "assistant", content: rounds[0]!.content, toolCalls: rounds[0]!.calls },
+        ...rounds[0]!.results,
+      ];
+      const outcome = await runToolTurn([{ role: "user", content: "do it" }, ...carried], {
+        registry, maxRounds: Math.max(0, 3 - 1),
+        chat: async () => { retryRequests++; return { content: "done", toolCalls: [] }; },
+      });
+      assert.equal(outcome.content, "done", "the turn continues from the carried round");
+      assert.equal(outcome.toolRounds, 0);
+      assert.equal(retryRequests, 1);
+      assert.equal(executions, 1, "the retry did not replay the executed tool");
+    } else {
+      assert.ok(caught instanceof Error && !isInterruptedError(caught), "interruption after execution is an ordinary error");
+    }
+    // Pre-tool failures remain retryable as-is.
     await assert.rejects(runToolTurn([], { registry, maxRounds: 3, chat: async () => { throw failure; } }), err => err === failure);
   }
-  ok("loop: interruption and overflow after execution retain results without replay; pre-tool failures remain retryable");
+  ok("loop: interruption after execution is an ordinary error; overflow after execution re-throws and the retry carries the round");
 }
 {
   mock.timers.enable({ apis: ["setTimeout"] });

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { ChannelType, type GuildTextBasedChannel, type Message, type PartialMessage } from "discord.js";
 import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
-import { buildChannelContext, refreshChannelIdentity, prefixEndIndex, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
+import { buildChannelContext, compactChannelContext, refreshChannelIdentity, prefixEndIndex, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
 import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
 import { chimeReplyChat, interruptionContinuationInstruction, replyPhaseInstruction } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
@@ -29,6 +29,7 @@ import {
   ChannelContextStore,
   contextWindowFromOverflowError,
   isContextOverflowError,
+  requestTokensFromOverflowError,
   ChannelContext,
 } from "./llm/context.js";
 import { COMPACT_OUTPUT_RESERVE_TOKENS, LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "./llm/metrics.js";
@@ -620,31 +621,27 @@ async function main(): Promise<void> {
               if (!isContextOverflowError(err)) throw err; // defensive: decideChime re-throws overflows only
               // The transcript did not fit the model's context (the channel
               // outgrew the window since the last measurement): the endpoint
-              // rejected it before generating. A decision over a shrunk
-              // context still decides over the newest message, so shrink
-              // hard (the trigger protected — it sits at the end, never
-              // among the oldest), rebuild the transcript, and retry the
-              // decision once; a second overflow falls through to the
-              // silent path below.
+              // rejected it before generating. A decision over a compacted
+              // context (the older entries folded into a model-written
+              // summary — the trigger protected, never folded; dropping the
+              // oldest entries is the fail-safe) still decides over the
+              // newest message, so compact, rebuild the transcript, and
+              // retry the decision once; a second overflow falls through to
+              // the silent path below.
               const window = contextWindowFromOverflowError(err);
-              // The estimate must fit the smaller of the compaction budget
+              // The context must fit the smaller of the compaction budget
               // and the window minus the completion headroom (the budget
               // alone may sit at or above the window).
               const target =
                 window !== null
                   ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
                   : compactionBudget;
-              // emergencyShrink forgets the measurement (it described the
-              // overfilled context) — and reads it first for its gap adjustment.
-              context.emergencyShrink(
-                turn.id,
-                target,
-                systemPrompt,
-                cfg.model.contextMaxMessages,
-                cfg.model.enableFileContents ? cfg.model.fileContentsMaxBytes : undefined,
-              );
+              // compactChannelContext forgets the measurement (it described
+              // the overfilled context) and drops the oldest entries when
+              // the summary cannot be written.
+              const compacted = await compactChannelContext(context, ctxOpts, turn.id, target);
               log.warn(
-                `chime decision in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the decision once`,
+                `chime decision in ${channelId} overfilled the model's context (${errMsg(err)}); ${compacted.compacted ? `compacted it to a summary + ${context.length} recent message(s)` : "compaction could not apply"}; retrying the decision once`,
               );
               const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
               if (rebuilt === null) {
@@ -668,7 +665,7 @@ async function main(): Promise<void> {
                 decision = await decisionOver(messages);
               } catch (err2) {
                 if (isInterruptedError(err2)) throw err2;
-                log.warn(`chime decision in ${channelId} still overfilled after the shrink (${errMsg(err2)}); staying silent`);
+                log.warn(`chime decision in ${channelId} still overfilled after compaction (${errMsg(err2)}); staying silent`);
                 decision = null;
               }
             }
@@ -688,12 +685,23 @@ async function main(): Promise<void> {
           }
           if (!context.has(turn.id)) return;
           writer.start();
-          const runModel = (msgs: Parameters<typeof runToolTurn>[0]): Promise<ToolTurnOutcome> => {
+          const runModel = (msgs: Parameters<typeof runToolTurn>[0], carriedRounds: ToolRound[] = []): Promise<ToolTurnOutcome> => {
             // Scope every reply attempt explicitly, including overflow rebuilds.
             // Keep this instruction transient: completed decision exchanges stay
             // intact in history, while the current phase never becomes stale history.
             const triggerEnd = prefixEndIndex(context, ctxOpts, turn.id);
             if (triggerEnd === null) throw new InterruptedError();
+            // The completed rounds of this attempt, when this call is the
+            // overflow retry: their conversation (text, reasoning, calls and
+            // results) stays in the prompt, so the retry neither loses them
+            // nor makes the model re-request the tools it already ran, and
+            // the round budget accounts for them.
+            const carriedCount = carriedRounds.length;
+            const carriedRoundMessages: ChatMessage[] = carriedRounds.flatMap((round) => {
+              const assistant: ChatMessage = { role: "assistant", content: round.content, toolCalls: round.calls };
+              if (round.reasoning !== undefined) assistant.reasoningContent = round.reasoning;
+              return [assistant, ...round.results];
+            });
             // The partial generation of an earlier, interrupted attempt of
             // this turn, when this attempt is the retry: the model's own
             // partial answer (its partial thinking travels with it as
@@ -714,17 +722,18 @@ async function main(): Promise<void> {
             // Always identify the current reply phase so an old NO cannot suppress it.
             const replyMessages: ChatMessage[] = [
               ...msgs, ...carried, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) },
+              ...carriedRoundMessages,
             ];
             return runToolTurn(replyMessages, {
               chat: (m, callbacks, t, signal) => replyChat(m, callbacks, t, signal,
                 { reasoningFromIndex: reasoningStart(msgs) }),
               registry: tools.registry,
-              maxRounds: Math.max(0, cfg.tools.maxRounds - retainedToolRounds),
+              maxRounds: Math.max(0, cfg.tools.maxRounds - retainedToolRounds - carriedCount),
               signal: attemptController.signal,
               interruptSignal: attemptController.signal,
               observeTools: (round) => {
                 if (stopping) throw new Error("bot is shutting down");
-                return archiveTools(archive, { ...scope, round });
+                return archiveTools(archive, { ...scope, round: round + carriedCount });
               },
               onToolRound: async () => {
                 roundSettled.push(await writer.discard());
@@ -749,44 +758,96 @@ async function main(): Promise<void> {
           try {
             outcome = await runModel(messages);
           } catch (err) {
-            // The request did not fit the model's context: the endpoint rejected
-            // it before generating. A summarizer run on the overfilled context
-            // would not fit either, so the only way to make room is dropping
-            // entries — shrink hard (the mention protected, the running summary
-            // as a last resort), rebuild the turn, and retry once. A second
-            // overflow (e.g. the mention alone is too big) falls through to the
-            // error path below.
+            // The request did not fit the model's context: the endpoint
+            // rejected it before generating. Main route: compact the context
+            // — fold the older entries into a model-written summary (the
+            // mention protected, never folded). The summary call fits
+            // whenever only the turn's live prompt overfilled the window
+            // (the stored context alone is below it), and the rebuilt
+            // context leaves room for the carried rounds. Dropping the
+            // oldest entries without a summary is the fail-safe: applied
+            // inside compactChannelContext when compaction cannot apply,
+            // and below when the compacted retry overfills anyway. A second
+            // overflow (e.g. the mention alone is too big) is a clear error
+            // on the path below.
             if (!isContextOverflowError(err)) throw err;
             const window = contextWindowFromOverflowError(err);
-            // The estimate must fit the smaller of the compaction budget and the
-            // window minus the completion headroom — the budget alone may sit
-            // at or above the window (a manual value, or the fallback before the
-            // automatic budget was derived).
+            // The context must fit the smaller of the compaction budget and
+            // the window minus the completion headroom — the budget alone may
+            // sit at or above the window (a manual value, or the fallback
+            // before the automatic budget was derived).
             const target =
               window !== null
                 ? Math.min(compactionBudget, Math.max(window - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
                 : compactionBudget;
-            // emergencyShrink forgets the measurement (it described the
-            // overfilled context) — and reads it first for its gap adjustment.
-            context.emergencyShrink(
-              turn.id,
-              target,
-              systemPrompt,
-              cfg.model.contextMaxMessages,
-              cfg.model.enableFileContents ? cfg.model.fileContentsMaxBytes : undefined,
-            );
+            if (rounds.length > 0) {
+              // Tools have executed: the channel's measurement is the last
+              // completed mid-turn call, whose prompt already carried the
+              // earlier rounds — letting it feed the gap adjustment would
+              // leave the newest round unaccounted for and the retry would
+              // overflow again. Forget it, so the compaction's fail-safe
+              // falls back to the error's own request count (the endpoint's
+              // count of this very overfilled prompt: the base plus every
+              // executed round).
+              context.invalidateMeasurement();
+            }
+            // compactChannelContext forgets the measurement (it described the
+            // overfilled context) and drops the oldest entries when the
+            // summary cannot be written.
+            const compacted = await compactChannelContext(context, ctxOpts, turn.id, target);
             log.warn(
-              `turn in ${channelId} overfilled the model's context (${errMsg(err)}); dropped the oldest messages to fit ~${target} tokens and retrying the turn once`,
+              `turn in ${channelId} overfilled the model's context (${errMsg(err)}); ${compacted.compacted ? `compacted it to a summary + ${context.length} recent message(s)` : "compaction could not apply"}; retrying once${rounds.length > 0 ? ` with the ${rounds.length} completed tool round(s) carried in the prompt` : ""}`
             );
-            // No tools executed: runToolTurn converts continuation failures
-            // after execution into ordinary errors to prevent replay.
             const rebuilt = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
             if (rebuilt === null) {
               log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
               return;
             }
             coveredIds = context.snapshot().filter((entry) => entry.role === "user").flatMap((entry) => entry.ids);
-            outcome = await runModel(rebuilt);
+            try {
+              // The executed rounds (when any) stay in the retry's prompt, so
+              // the model sees its own results and does not re-run the tools.
+              outcome = await runModel(rebuilt, rounds);
+            } catch (err2) {
+              if (!isContextOverflowError(err2)) throw err2;
+              // Fail-safe: the compacted (or trimmed) context still
+              // overfilled the window — drop the oldest entries without a
+              // summary (the mention protected, the summary a last resort),
+              // gap-adjusted by the retry's own reported size, and retry
+              // once more.
+              const window2 = contextWindowFromOverflowError(err2);
+              const target2 =
+                window2 !== null
+                  ? Math.min(compactionBudget, Math.max(window2 - COMPACT_OUTPUT_RESERVE_TOKENS, 128))
+                  : compactionBudget;
+              context.emergencyShrink(
+                turn.id,
+                target2,
+                systemPrompt,
+                cfg.model.contextMaxMessages,
+                cfg.model.enableFileContents ? cfg.model.fileContentsMaxBytes : undefined,
+                requestTokensFromOverflowError(err2),
+              );
+              log.warn(
+                `turn in ${channelId} still overfilled the model's context after compaction (${errMsg(err2)}); dropped the oldest messages to fit ~${target2} tokens and retrying once`,
+              );
+              const shrunk = await buildChannelContext(textChannel, context, turn.id, ctxOpts);
+              if (shrunk === null) {
+                log.info(`trigger ${turn.id} in ${channelId} left the channel context; skipping turn`);
+                return;
+              }
+              coveredIds = context.snapshot().filter((entry) => entry.role === "user").flatMap((entry) => entry.ids);
+              try {
+                outcome = await runModel(shrunk, rounds);
+              } catch (err3) {
+                if (isContextOverflowError(err3)) {
+                  throw new Error(
+                    `the turn still overfilled the model's context after the shrink (${errMsg(err3)})${rounds.length > 0 ? "; the completed tool results were retained" : ""}`,
+                  );
+                }
+                throw err3;
+              }
+            }
           }
           if (outcome.toolRounds > 0) {
             log.info(`turn in ${channelId} used ${outcome.toolRounds} tool round(s)`);
