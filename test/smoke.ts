@@ -47,7 +47,7 @@ import { archiveTools } from "../src/tools/archive.js";
 import { archiveAttachments } from "../src/bot/attachment-store.js";
 import { captureArchiveAttachments, ArchiveAttachmentCapture } from "../src/bot/archive-capture.js";
 import { WorkspaceAttachmentCapture, captureWorkspaceAttachments, safeWorkspaceName, uniqueDestination } from "../src/bot/workspace-capture.js";
-import { exportArchive, archiveName, archiveTurnFolder, attachmentViewPath } from "../src/llm/archive-layout.js";
+import { ArchiveLayout, exportArchive, archiveName, archiveTurnFolder, attachmentViewPath } from "../src/llm/archive-layout.js";
 import { archiveChannelName, archiveJournalPath, archiveSystemDirectory } from "../src/llm/archive-paths.js";
 import { migrateArchive } from "../src/llm/archive-migration.js";
 import { captureCatchup, coveredDiscordCursor } from "../src/bot/catchup.js";
@@ -1120,17 +1120,17 @@ process.exit(0);
   ok("chime: unrelated tools, reasoning and text beside broken arguments never decide");
 
   // Repairs preserve both the schema prefix and tool choice.
-  for (const first of ["empty", "invalid", "multiple", "unrelated", "mixed"] as const) {
+  for (const first of ["empty", "invalid", "multiple", "unrelated", "broken"] as const) {
     const requests: Array<{ messages: ChatMessage[]; tools?: ToolSpec[]; choice?: string; maxTokens?: number }> = [];
     const recovered = await decideChime(async (messages, tools, signal, options) => {
       requests.push({ messages, tools, choice: options?.toolChoice, maxTokens: options?.maxTokens });
       if (requests.length === 1) {
-        if (first === "mixed") return { content: "You should ship it today.", reasoning: "I can answer this question.", toolCalls: [{ id: "mixed", name: "chime", arguments: '{"respond":true,"reason":"question"}' }] };
         if (first === "unrelated") return { content: "", toolCalls: [{ id: "unrelated", name: "file_read", arguments: "{}" }] };
         if (first === "multiple") return { content: "", toolCalls: [
-          { id: "1", name: "chime", arguments: '{"respond":true}' },
-          { id: "2", name: "chime", arguments: '{"respond":false}' },
+          { id: "1", name: "file_read", arguments: "{}" },
+          { id: "2", name: "web_search", arguments: "{}" },
         ] };
+        if (first === "broken") return { content: "NO chatter", toolCalls: [{ id: "broken", name: "chime", arguments: "broken" }] };
         return { content: first === "empty" ? "" : "maybe", toolCalls: [] };
       }
       return { content: "", toolCalls: [{ id: "fixed", name: "chime", arguments: '{"respond":false,"reason":"chatter"}' }] };
@@ -1150,7 +1150,7 @@ process.exit(0);
       invalid: "plain text was returned",
       multiple: "multiple tool calls were returned",
       unrelated: "a different tool was called",
-      mixed: "chat text accompanied a tool call",
+      broken: "chime arguments were invalid",
     }[first];
     assert.ok(repair.includes(expectedFailure), "repair explains the actual validation failure");
     assert.ok(!repair.includes("You should ship it today."), "repair does not feed a rejected chat answer back to the model");
@@ -1194,7 +1194,7 @@ process.exit(0);
     }, transcript), err => err === failure);
     assert.equal(attempts, 2, "repair propagates interruption/overflow to the turn runner");
   }
-  ok("chime: validated decisions retry until valid, reject conflicts, preserve the prefix and propagate cancellation/overflow");
+  ok("chime: validated decisions retry until a chime call succeeds, preserve the prefix and propagate cancellation/overflow");
 
   const connectionError = (code: string): ModelConnectionError => new ModelConnectionError("http://localhost:8080/v1/chat/completions",
     new TypeError("fetch failed", { cause: Object.assign(new Error("socket error"), { code, address: "127.0.0.1", port: 8080 }) }));
@@ -1325,16 +1325,31 @@ process.exit(0);
   await decideChime(spying, transcript, undefined, undefined, undefined, "  ");
   assert.equal(sent.at(-1)!.content, CHIME_SYSTEM_PROMPT);
 
-  // Mixed answers must never become a retained decision, even with valid arguments.
-  for (const respond of [true, false]) {
-    let calls = 0;
-    let accepted = 0;
-    assert.equal(await decideChime(eventuallyUnavailable(async () => {
-      calls++;
-      return { content: "Here is my answer to the chat.", toolCalls: [{ id: "mixed", name: "chime", arguments: JSON.stringify({ respond, reason: "relevant" }) }] };
-    }), transcript, undefined, undefined, undefined, undefined, chimeTools([]), () => { accepted++; }), null);
-    assert.equal(calls, 3, "mixed answers keep retrying until the endpoint fails");
-    assert.equal(accepted, 0, "mixed answers cannot enter shared history");
+  // A successful chime call decides even when chat text or other calls
+  // accompany it: no repair, and the retained exchange keeps only the
+  // deciding call (the others were never executed — a history carrying them
+  // without results would be invalid).
+  for (const [content, calls, expected] of [
+    ["Here is my answer to the chat.", [{ id: "mixed", name: "chime", arguments: '{"respond":true,"reason":"relevant"}' }], { respond: true, reason: "relevant" }],
+    ["Here is my answer to the chat.", [{ id: "mixed", name: "chime", arguments: '{"respond":false,"reason":"relevant"}' }], { respond: false, reason: "relevant" }],
+    ["", [{ id: "1", name: "chime", arguments: '{"respond":true}' }, { id: "2", name: "chime", arguments: '{"respond":false}' }], { respond: true, reason: "" }],
+    ["text", [{ id: "other", name: "file_read", arguments: "{}" }, { id: "late", name: "chime", arguments: '{"respond":false,"reason":"quiet"}' }], { respond: false, reason: "quiet" }],
+  ]) {
+    let attempts = 0;
+    let accepted: ChatMessage[] = [];
+    assert.deepEqual(await decideChime(async () => {
+      attempts++;
+      return { content, toolCalls: [...calls] };
+    }, transcript, undefined, undefined, undefined, undefined,
+      chimeTools([{ name: "file_read", description: "read", parameters: {} }]), (exchange) => { accepted = exchange; }), expected);
+    assert.equal(attempts, 1, "a successful chime call never repairs");
+    assert.equal(accepted.length, 4, "the accepted exchange is retained in shared history");
+    const deciding = calls.find((call) => call.name === "chime")!;
+    assert.equal(accepted[1].content, content, "the model's chat text is retained with the decision");
+    assert.deepEqual(accepted[1].toolCalls, [deciding], "the exchange keeps only the deciding call");
+    assert.equal(accepted[2].role, "tool");
+    assert.equal(accepted[2].toolCallId, deciding.id, "the result pairs with the deciding call");
+    assert.equal(accepted[2].name, "chime");
   }
   let whitespaceExchange: ChatMessage[] = [];
   assert.deepEqual(await decideChime(async () => ({ content: " \n", reasoning: "Consider whether joining is helpful.",
@@ -1357,11 +1372,11 @@ process.exit(0);
   }
   for (const content of ["<|channel>thought\nUnfinished thinking", "<|channel>thought\nThinking.<channel|>Here is my answer.", "<think>Unfinished thinking", "<think>Thinking.</think>Here is my answer.", "Unmarked thinking beside a call."]) {
     let calls = 0;
-    assert.equal(await decideChime(eventuallyUnavailable(async () => {
+    assert.deepEqual(await decideChime(async () => {
       calls++;
       return { content, toolCalls: [{ id: "bad", name: "chime", arguments: '{"respond":true}' }] };
-    }), transcript), null);
-    assert.equal(calls, 3, "unclosed thinking or remaining response text keeps retrying");
+    }, transcript), { respond: true, reason: "" }, "a successful chime call decides despite remaining text");
+    assert.equal(calls, 1, "unclosed thinking or remaining response text never repairs a successful call");
   }
   assert.deepEqual(await decideChime(async () => ({ content: "<|channel>thought\n<channel|>",
     toolCalls: [{ id: "empty-thought", name: "chime", arguments: '{"respond":false}' }] }), transcript),
@@ -1376,7 +1391,7 @@ process.exit(0);
   }, transcript, undefined, undefined, undefined, undefined, chimeTools([]), value => { thinkingExchange = value; }),
   { respond: false, reason: "" });
   assert.ok(!JSON.stringify(thinkingExchange).includes("Rejected thinking"));
-  ok("chime: mandatory phase rules accompany custom guidance; mixed chat answers repair without entering history");
+  ok("chime: mandatory phase rules accompany custom guidance; a successful chime call decides despite mixed answers");
 
   // The NO line posted to the channel: a UI line with the reason, truncated.
   assert.equal(formatChimeNo("just chatter"), "🔕 *chime: no — just chatter*");
@@ -8223,6 +8238,41 @@ process.exit(0);
     assert(Buffer.byteLength(archiveChannelName("a".repeat(300), "漢".repeat(60))) < 255);
     ok("archive layout: readable unique channel/file names, internal storage, dated turns across restart, rebuild and export");
   } finally { archive.close(); fs.rmSync(parent, { recursive: true, force: true }); }
+}
+
+// --------------------------------------------- bounded turn snapshots --
+{
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "glove-big-turn-"));
+  const base = path.join(parent, "turn");
+  fs.mkdirSync(base, { recursive: true });
+  // A long turn re-archives its full model request in every attempt, so its
+  // turn events file can outgrow V8's maximum string length — the snapshot
+  // must stream the file and stay bounded instead of crashing the process.
+  const limit = 536_870_920; // V8's maximum string length in characters
+  const file = path.join(base, "events.jsonl");
+  const fd = fs.openSync(file, "w");
+  let written = 0;
+  let seq = 0;
+  while (written < limit + 2_000_000) {
+    const line = `{"seq":${seq++},"time":"2026-10-10T05:14:27.956Z","type":"model.progress","scope":{"channelId":"c","turnId":"t","requestId":"r"},"payload":{"data":"${"x".repeat(2_000_000)}"}}\n`;
+    fs.writeSync(fd, line);
+    written += Buffer.byteLength(line);
+  }
+  fs.closeSync(fd);
+  try {
+    const layout = new ArchiveLayout(parent);
+    (layout as unknown as { snapshotTurn(base: string, id: string, channelId: string, status: string): void })
+      .snapshotTurn(base, "t", "c", "finished");
+    const snap = JSON.parse(fs.readFileSync(path.join(base, "turn.json"), "utf8")) as {
+      status: string; events: { type: string }[]; eventCount: number; truncated: boolean;
+    };
+    assert.equal(snap.status, "finished", "the status is scanned from every line, embedded or not");
+    assert.equal(snap.eventCount, seq);
+    assert.equal(snap.truncated, true);
+    assert.ok(snap.events.length > 0 && snap.events.length < seq, "embedded events stay within the budget");
+    assert.ok(snap.events.every((event) => event.type === "model.progress"));
+  } finally { fs.rmSync(parent, { recursive: true, force: true }); }
+  ok("archive layout: a turn whose events file outgrows V8's string limit snapshots bounded instead of crashing");
 }
 
 // ------------------------------------------------ readable archive upgrade --

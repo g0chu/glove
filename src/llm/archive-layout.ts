@@ -24,6 +24,22 @@ function writeJson(file: string, value: unknown): void {
   fs.renameSync(temp, file);
 }
 
+/**
+ * Cap on the raw bytes of events embedded in a turn.json snapshot. A turn
+ * that retries many times archives its full model request in every attempt,
+ * so its events.jsonl can outgrow V8's maximum string length (~512 MiB);
+ * the snapshot stays bounded and events.jsonl keeps the complete record.
+ */
+const TURN_SNAPSHOT_EMBED_BUDGET = 16 * 1024 * 1024;
+
+/**
+ * Cap on the compact size of a context written to context.json. Rendered
+ * attachments (base64 data) can grow the expanded view past V8's maximum
+ * string length; the checkpoint manifest is the fallback, and the journal
+ * checkpoint remains authoritative.
+ */
+const CONTEXT_VIEW_BUDGET = 128 * 1024 * 1024;
+
 /** Relative location of an original-format attachment in a readable folder. */
 export function attachmentViewPath(record: ArchiveRecord, data: { url: string; blob: string; name?: string; id?: string }, channelFolder = archiveChannelName(record.scope.channelId ?? "unassigned")): string {
   if (!record.scope.channelId) return `_system/attachments/${data.blob}/${archiveName(data.name ?? "attachment")}`;
@@ -109,11 +125,19 @@ export class ArchiveLayout {
     fs.mkdirSync(stage, { mode: 0o700 });
     const layout = new ArchiveLayout(stage, false, this.channelFolders);
     fs.mkdirSync(path.join(stage, "channels"), { mode: 0o700 });
-    for (const record of archive.records()) layout.append(archive, record, true);
     // Restore only the latest context per channel instead of expanding every
     // growing historical checkpoint during a rebuild.
-    for (const [id, context] of archive.restoreContexts()) {
-      writeJson(path.join(layout.channelDirectory(id), "context.json"), context);
+    const lastContext = new Map<string, ArchiveRecord | null>();
+    for (const record of archive.records()) {
+      layout.append(archive, record, true);
+      if (record.scope.channelId && (record.type === "context.checkpoint" || record.type === "channel.deleted")) {
+        lastContext.set(record.scope.channelId, record.type === "channel.deleted" ? null : record);
+      }
+    }
+    for (const [id, record] of lastContext) {
+      const file = path.join(layout.channelDirectory(id), "context.json");
+      if (record === null) writeJson(file, null);
+      else layout.writeContextView(archive, record, file);
     }
     layout.finish(archive);
     const channels = path.join(this.directory, "channels");
@@ -144,7 +168,10 @@ export class ArchiveLayout {
     const channelId = record.scope.channelId;
     if (!channelId) return;
     // Live records already have a serialized snapshot; disk/rebuild reads still verify it.
-    const data = capturedPayload === undefined ? archive.readData<any>(record, !rebuilding) : capturedPayload as any;
+    // A checkpoint's event line carries its small manifest, and its context view is
+    // written separately — skip the full entry expansion here either way.
+    const data = capturedPayload === undefined && !(record.type === "context.checkpoint" && record.payload !== undefined)
+      ? archive.readData<any>(record, !rebuilding) : capturedPayload as any;
     const channel = this.channelDirectory(channelId, record.type === "discord.message" ? data.channel?.name : undefined);
     fs.mkdirSync(channel, { recursive: true, mode: 0o700 });
     const attachmentPath = record.type === "attachment.saved" ? attachmentViewPath(record, data, this.channelFolders.get(channelId)) : undefined;
@@ -161,7 +188,7 @@ export class ArchiveLayout {
     if (record.type === "discord.message" && data.channel) {
       writeJson(metadata, { id: channelId, guildId: data.channel.guildId ?? null, name: data.channel.name ?? null });
     }
-    if (record.type === "context.checkpoint" && !rebuilding) writeJson(path.join(channel, "context.json"), data);
+    if (record.type === "context.checkpoint" && !rebuilding) this.writeContextView(archive, record, path.join(channel, "context.json"));
     if (record.type === "channel.deleted") writeJson(path.join(channel, "context.json"), null);
     if (record.type === "attachment.saved") {
       const bytes = archive.readBlob(data.blob);
@@ -206,9 +233,83 @@ export class ArchiveLayout {
     writeJson(this.stateFile(), { version: 2, clean: true, channels: [...this.channelFolders], ...archive.head() });
   }
 
+  /**
+   * Write the current context view to context.json: the full expanded
+   * entries while the rendered context (base64 image data included) stays
+   * under the budget; beyond it the checkpoint manifest plus a note — V8
+   * cannot stringify more than ~512 MiB, and the journal checkpoint remains
+   * authoritative either way.
+   */
+  writeContextView(archive: ConversationArchive, record: ArchiveRecord, file: string): void {
+    const manifest = archive.readData<{ archiveFormat?: string; metadata?: Record<string, unknown>; entries?: unknown }>(record, false);
+    if (manifest?.archiveFormat !== "context-v1" || !Array.isArray(manifest.entries)) {
+      // Legacy inline context: its size is bounded by its own journal line.
+      writeJson(file, manifest);
+      return;
+    }
+    const hashes = manifest.entries as string[];
+    let bytes = JSON.stringify(manifest.metadata ?? {}).length;
+    for (const hash of hashes) bytes += fs.statSync(archive.blobFile(hash)).size;
+    if (bytes > CONTEXT_VIEW_BUDGET) {
+      writeJson(file, {
+        ...manifest,
+        note: `context view truncated: ${bytes} bytes of entries exceed the readable view limit; the journal checkpoint is authoritative`,
+      });
+      return;
+    }
+    writeJson(file, { ...manifest, entries: hashes.map((hash) => archive.readData({ data: hash })) });
+  }
+
+  /**
+   * Snapshot a turn's folder: the status comes from every event line (the
+   * type sits in the line's first bytes), while the embedded events stop at
+   * the budget — a turn's events.jsonl can outgrow V8's maximum string
+   * length, so it is streamed, never read whole.
+   */
   private snapshotTurn(base: string, id: string, channelId: string, status: string): void {
-    const rows = fs.readFileSync(path.join(base, "events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
-    writeJson(path.join(base, "turn.json"), { id, channelId, status: status === "finished" && rows.some(row => row.type === "turn.failed") ? "failed" : status, events: rows });
+    const events: unknown[] = [];
+    let total = 0;
+    let embedded = 0;
+    let truncated = false;
+    let failed = false;
+    const fd = fs.openSync(path.join(base, "events.jsonl"), "r");
+    try {
+      const chunk = Buffer.alloc(64 * 1024);
+      const decoder = new TextDecoder();
+      let pending = "";
+      for (;;) {
+        const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (n === 0) break;
+        pending += decoder.decode(chunk.subarray(0, n), { stream: true });
+        let nl: number;
+        while ((nl = pending.indexOf("\n")) >= 0) {
+          const line = pending.slice(0, nl);
+          pending = pending.slice(nl + 1);
+          if (!line) continue;
+          total++;
+          if (/^\{"seq":\d+,"time":"[^"]*","type":"turn\.failed"/.test(line.slice(0, 128))) failed = true;
+          if (embedded + line.length <= TURN_SNAPSHOT_EMBED_BUDGET) {
+            events.push(JSON.parse(line));
+            embedded += line.length;
+          } else {
+            truncated = true;
+          }
+        }
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    const snapshot: Record<string, unknown> = {
+      id, channelId,
+      status: status === "finished" && failed ? "failed" : status,
+      events,
+    };
+    if (truncated) {
+      snapshot.eventCount = total;
+      snapshot.truncated = true;
+      snapshot.note = "events truncated for size; events.jsonl holds the complete turn";
+    }
+    writeJson(path.join(base, "turn.json"), snapshot);
   }
 }
 

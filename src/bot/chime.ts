@@ -1,5 +1,5 @@
 import timers from "node:timers/promises";
-import type { ChatMessage, ChatResult, ChatRequestOptions, ToolSpec } from "../llm/client.js";
+import type { ChatMessage, ChatResult, ChatRequestOptions, ToolCall, ToolSpec } from "../llm/client.js";
 import { InterruptedError, isInterruptedError, ModelConnectionError } from "../llm/client.js";
 import { isContextOverflowError } from "../llm/context.js";
 import { errMsg, log, truncate } from "../log.js";
@@ -52,7 +52,10 @@ export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[], signal?: A
 /**
  * One chime decision: a validated tool call over the shared context in which the
  * model reports its answer as a call of the chime tool (respond + reason).
- * Plain-text decisions and chat text accompanying a decision call are rejected.
+ * A chime call with usable arguments is the decision — even when chat text or
+ * other calls accompany it (the retained exchange keeps only the deciding
+ * call); only answers without a successful chime call (plain text, reasoning
+ * alone, unrelated tools, broken arguments, empty) get the repair retry.
  * Custom guidance supplements the mandatory phase instructions. Unusable answers retry until valid
  * with the same schemas/choice and one replaceable validation reminder, preserving
  * the shared prompt prefix without accumulating rejected responses or instructions.
@@ -140,8 +143,11 @@ export async function decideChime(
         const decision = validation.decision;
         onAccepted?.([
           ...requestMessages.slice(transcript.length),
-          { role: "assistant", content: res.content, reasoningContent: res.reasoning, toolCalls: res.toolCalls },
-          { role: "tool", name: CHIME_TOOL_NAME, toolCallId: res.toolCalls[0].id, content: JSON.stringify(decision) },
+          // Only the deciding call is retained: any other calls in the answer
+          // were never executed, and a history carrying them without results
+          // would be invalid.
+          { role: "assistant", content: res.content, reasoningContent: res.reasoning, toolCalls: [validation.call] },
+          { role: "tool", name: CHIME_TOOL_NAME, toolCallId: validation.call.id, content: JSON.stringify(decision) },
           { role: "system", content: decision.respond
             ? "Decision complete: a separate request may now reply to this message."
             : "Decision complete: no reply to this message. Later requests are independent." },
@@ -174,31 +180,32 @@ function separateDecisionReasoning(res: ChatResult): ChatResult {
   return found ? { ...res, content, reasoning: reasoning.join("\n\n") } : res;
 }
 
-/** Validate a decision with actionable feedback that never quotes model text or reasoning. */
-function validateDecision(res: ChatResult): { ok: true; decision: ChimeDecision } | { ok: false; failure: string } {
-  if (res.toolCalls.length > 0 && res.content.trim().length > 0) {
-    return { ok: false, failure: "chat text accompanied a tool call; expected only one chime call" };
-  }
-  if (res.toolCalls.length > 1) {
-    return { ok: false, failure: "multiple tool calls were returned; expected exactly one chime call" };
-  }
-  const call = res.toolCalls.find((c) => c.name === CHIME_TOOL_NAME);
-  if (call !== undefined) {
+/**
+ * Validate a decision with actionable feedback that never quotes model text or
+ * reasoning. A chime call with usable arguments is the decision even when chat
+ * text or other calls accompany it (no repair); the failure messages cover
+ * only answers without a successful chime call.
+ */
+function validateDecision(res: ChatResult): { ok: true; decision: ChimeDecision; call: ToolCall } | { ok: false; failure: string } {
+  for (const call of res.toolCalls) {
+    if (call.name !== CHIME_TOOL_NAME) continue;
     const decision = parseChimeArgs(call.arguments);
-    if (decision !== null) return { ok: true, decision };
+    if (decision !== null) return { ok: true, decision, call };
   }
 
   // Keep failures silent in Discord, but make the local log actionable.
   // Reasoning is not a decision and must never be mined for a YES/NO.
-  const failure = call !== undefined
+  const failure = res.toolCalls.some((c) => c.name === CHIME_TOOL_NAME)
     ? "chime arguments were invalid; expected a JSON object with boolean respond and string reason"
-    : res.toolCalls.length > 0
-      ? "a different tool was called; only chime is allowed in the decision phase"
-      : res.content.trim().length > 0
-        ? "plain text was returned instead of a chime tool call"
-        : res.reasoning?.trim()
-          ? "reasoning was returned without a chime tool call; reasoning alone is not a decision"
-          : "the response was empty; a chime tool call is required";
+    : res.toolCalls.length > 1
+      ? "multiple tool calls were returned; expected exactly one chime call"
+      : res.toolCalls.length > 0
+        ? "a different tool was called; only chime is allowed in the decision phase"
+        : res.content.trim().length > 0
+          ? "plain text was returned instead of a chime tool call"
+          : res.reasoning?.trim()
+            ? "reasoning was returned without a chime tool call; reasoning alone is not a decision"
+            : "the response was empty; a chime tool call is required";
   return { ok: false, failure };
 }
 
