@@ -322,26 +322,20 @@ whole, preserving call/result pairing. Interrupted or unusable decisions are
 not retained. Unusable decisions retry with unchanged schemas and `tool_choice: "auto"`,
 keeping only the latest validation reminder.
 
-Each reply with chime enabled appends a fresh system instruction
-identifying its triggering Discord message and the message's index in that
-request, quoting a short snippet of the trigger text and ending with a
-`Now: 2026-10-10 14:32 UTC` anchor so the model knows the current time. A direct
-mention requires a reply immediately; a YES turn continues its accepted decision.
-The instruction scopes historical chime instructions and decisions to their
-original requests, so a previous NO does not silence a later mention. It also
-keeps internal planning out of reply text while allowing user-facing
-explanations. It is transient: it stays with the current tool loop, is rebuilt
-for interruption/overflow retries, and never becomes a persistent conversation
-entry. Decision history and the shared request prefix remain intact.
+A reply sends the shared context exactly as-is, with no trailing instruction:
+the trigger is simply the newest (timestamped) user message, and a completed
+YES decision stays in history with its `Decision complete` result, so the
+model sees exactly what it is answering. The request therefore matches the
+decision's shared prefix byte for byte, which the endpoint can reuse from the
+prompt cache.
 
 Built-in instructions keep each task separate: `[CHIME]` decisions return one
-tool call, reply instructions answer a specific message, and `[SUMMARY]`
-compaction summarizes a specified older portion. Output rules live
-in the trailing task instruction; the chime schema only describes the tool.
-These suffixes stay after the shared history, preserving the common prefix
-instead of inserting a changing task at the start. Prompt or schema edits
-invalidate previously cached prefixes once; subsequent requests use the same
-layout. Existing archived decision instructions remain unchanged.
+tool call, and `[SUMMARY]` compaction summarizes a specified older portion.
+Output rules live in the trailing task instruction; the chime schema only
+describes the tool. These suffixes stay after the shared history, preserving
+the common prefix instead of inserting a changing task at the start. Prompt or
+schema edits invalidate previously cached prefixes once; subsequent requests
+use the same layout. Existing archived decision instructions remain unchanged.
 
 Keep `MODEL_SYSTEM_PROMPT` focused on identity, subject guidance, tone, and resource
 locations. Avoid repeating phase rules there or requesting a written thinking
@@ -420,8 +414,8 @@ text are moved into reasoning before validation. Unmarked text
 or an unfinished block still retries. Summary requests
 always retain the fold boundary, output limit, and prohibition on answering the chat.
 Repairs identify the validation failure without repeating the rejected response.
-Every reply identifies its current trigger and phase, including after chime is
-disabled, so retained YES/NO instructions cannot become rules for later messages.
+Retained YES/NO decisions each end with their own completion note, so a
+previous decision stays scoped to its original message.
 
 
 ### Channel activity interruptions

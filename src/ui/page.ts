@@ -167,8 +167,8 @@ function promptMessages(detail, previous) {
     let common = 0;
     while (common < before.length && common < current.length && messageKey(before[common]) === messageKey(current[common])) common++;
     // Compare conversation entries without phase instructions, but render the
-    // original suffix so chime/reply instructions remain visible on every call,
-    // including identical retries that add no conversation entries.
+    // original suffix so chime/compaction instructions remain visible on every
+    // call, including identical retries that add no conversation entries.
     const start = common > 0 ? all.indexOf(current[common - 1]) + 1 : 0;
     return all.slice(start);
 }

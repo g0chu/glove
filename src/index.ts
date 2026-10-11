@@ -5,7 +5,7 @@ import { recordTurn } from "./bot/turn-record.js";
 import { createDiscordClient } from "./bot/client.js";
 import { buildChannelContext, compactChannelContext, refreshChannelIdentity, prefixEndIndex, mergeDiscordHistory, syncMessageUpdate, toMessageLike, toSeedEntry, type ContextOptions } from "./bot/context.js";
 import { CHIME_TOOL_SPEC, executeReplyChime, chimeTools, decideChime, formatChimeNo, type ChimeDecision } from "./bot/chime.js";
-import { chimeReplyChat, interruptionContinuationInstruction, replyPhaseInstruction } from "./bot/chime-reply.js";
+import { chimeReplyChat, interruptionContinuationInstruction } from "./bot/chime-reply.js";
 import { MessageGate, type GateMessage } from "./bot/gate.js";
 import { MessageObservations } from "./bot/observations.js";
 import { QueueStore, type TurnRequest } from "./bot/queue.js";
@@ -733,11 +733,10 @@ async function main(): Promise<void> {
           if (!context.has(turn.id)) return;
           writer.start();
           const runModel = (msgs: Parameters<typeof runToolTurn>[0], carriedRounds: ToolRound[] = []): Promise<ToolTurnOutcome> => {
-            // Scope every reply attempt explicitly, including overflow rebuilds.
-            // Keep this instruction transient: completed decision exchanges stay
-            // intact in history, while the current phase never becomes stale history.
-            const triggerEnd = prefixEndIndex(context, ctxOpts, turn.id);
-            if (triggerEnd === null) throw new InterruptedError();
+            // The reply request is the shared context itself: the trigger is
+            // the newest user message, and completed decision exchanges stay
+            // intact in history.
+            if (prefixEndIndex(context, ctxOpts, turn.id) === null) throw new InterruptedError();
             // The completed rounds of this attempt, when this call is the
             // overflow retry: their conversation (text, reasoning, calls and
             // results) stays in the prompt, so the retry neither loses them
@@ -765,18 +764,8 @@ async function main(): Promise<void> {
               },
               { role: "system", content: interruptionContinuationInstruction() },
             ];
-            // Historical decisions can survive disabling chime between restarts.
-            // Always identify the current reply phase so an old NO cannot suppress it.
-            // The trigger snippet lets the model see the ask without counting to
-            // the index (the full message is in the conversation above).
-            const triggerEntry = context.snapshot().find((e) => e.ids.includes(turn.id));
-            const triggerText = triggerEntry ? (triggerEntry.modelContent ?? triggerEntry.content).trim().replace(/\s+/g, " ") : "";
-            const triggerSnippet = triggerText.length > 0
-              ? `${triggerEntry?.name ? triggerEntry.name + ": " : ""}${triggerText.length > 60 ? triggerText.slice(0, 60) + "…" : triggerText}`
-              : undefined;
             const replyMessages: ChatMessage[] = [
-              ...msgs, ...carried, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime, triggerSnippet) },
-              ...carriedRoundMessages,
+              ...msgs, ...carried, ...carriedRoundMessages,
             ];
             return runToolTurn(replyMessages, {
               chat: (m, callbacks, t, signal) => replyChat(m, callbacks, t, signal,

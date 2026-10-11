@@ -143,12 +143,7 @@ async function run(): Promise<void> {
     assert.equal(requests.length, 1, "disabled chime makes only a reply call");
     const reply = requests[0];
     assert(reply.some((message) => String(message.content).includes("Decision complete: no reply to this message.")), "historical decisions remain intact");
-    const instruction = String(reply.at(-1)?.content);
-    assert(instruction.includes("Reply to Discord message 900"));
-    assert(instruction.includes("It mentions you and requires an answer."));
-    const triggerIndex = Number(instruction.match(/message index (\d+)/)![1]);
-    assert(String(reply[triggerIndex].content).includes("@Glove reply with chime disabled"));
-    assert(!entries().some((entry) => entry.content.startsWith("Reply to Discord message")), "phase instructions remain transient with chime disabled");
+    assert(reply.some((message) => String(message.content).includes("@Glove reply with chime disabled")), "the trigger is the reply request's newest message");
     process.emit("SIGTERM");
     return;
   }
@@ -220,13 +215,8 @@ async function run(): Promise<void> {
       assert(!noMention.some(message => message.reasoningContent), "old NO thoughts are omitted from a new mention");
       assert(entries().some(entry => entry.reasoning === "decision reasoning"), "stored decision thoughts survive wire filtering");
     }
-    assert.equal(noMention.at(-1)?.role, "system");
-    assert(String(noMention.at(-1)?.content).includes("Reply to Discord message 250"));
-    assert(String(noMention.at(-1)?.content).includes("It mentions you and requires an answer."));
-    assert(String(noMention.at(-1)?.content).includes("apply only to their original requests"));
-    const triggerIndex = Number(String(noMention.at(-1)?.content).match(/message index (\d+)/)![1]);
-    assert(String(noMention[triggerIndex].content).includes("@Glove answer after NO"));
-    assert(!entries().some((e) => e.content.startsWith("Reply to Discord message")), "reply instruction is transient");
+    assert.equal(noMention.at(-1)?.role, "user", "the reply request is the shared context; the trigger is its newest message");
+    assert(String(noMention.at(-1)?.content).includes("@Glove answer after NO"));
     duringChat = async (signal) => {
       const ambient = history.get("200")!;
       edit(ambient, "edited during chime decision");
@@ -261,15 +251,13 @@ async function run(): Promise<void> {
     create("500", "ambient before interrupted YES");
     await advance(200);
     assert.equal(requests.length, 8, "YES enters reply before being interrupted");
-    assert(String(requests.at(-1)?.at(-1)?.content).includes("Reply to Discord message 500"));
+    assert(requests.at(-1)!.some((m) => String(m.content).includes("ambient before interrupted YES")));
     await advance(200);
     assert.equal(requests.length, 9, "newer mention supersedes interrupted chime without a decision call");
     const afterYes = requests.at(-1)!;
     if (process.env.FLOW_MODE === "gemma") assert(!afterYes.some(message => message.reasoningContent), "superseding turn drops previous YES reasoning");
     assert(afterYes.some((m) => m.toolCalls?.some((call) => call.id === "interrupted-yes")), "completed YES stays in history");
-    assert(String(afterYes.at(-1)?.content).includes("Reply to Discord message 600"));
-    assert(String(afterYes.at(-1)?.content).includes("It mentions you and requires an answer."));
-    assert(!entries().some((e) => e.content.startsWith("Reply to Discord message")));
+    assert(String(afterYes.at(-1)?.content).includes("@Glove answer after interrupted YES"));
     duringChat = async () => {
       duringChat = async (signal) => {
         // A content change (an edit — no new user entry, so the turn is not
@@ -287,11 +275,7 @@ async function run(): Promise<void> {
     assert.equal(requests.length, 13, "an interruption retries the YES turn over retained history");
     const retriedYes = requests.at(-1)!;
     assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")));
-    assert(String(retriedYes.at(-1)?.content).includes("Reply to Discord message 700"));
-    assert(String(retriedYes.at(-1)?.content).includes("Its chime decision allows an answer."));
-    assert.equal(retriedYes.filter((m) => String(m.content).startsWith("Reply to Discord message")).length, 1,
-      "retry gets one fresh instruction, without accumulating earlier attempt instructions");
-    assert(!entries().some((e) => e.content.startsWith("Reply to Discord message")));
+    assert(retriedYes.some((m) => String(m.content).includes("ambient reply interrupted by an edit")));
     if (process.env.FLOW_MODE === "gemma") {
       const count = requests.length;
       duringChat = async () => {
@@ -386,9 +370,7 @@ async function run(): Promise<void> {
   assert(partialIndex !== -1, "the partial generation is carried into the retry");
   assert.equal(retryPrompt[partialIndex].reasoningContent, "partial thinking before the edit", "the partial thinking travels with the carried partial");
   const metaIndex = retryPrompt.findIndex((m) => m.role === "system" && String(m.content).includes("interrupted by activity"));
-  const phaseIndex = retryPrompt.findIndex((m) => m.role === "system" && String(m.content).includes("Reply to Discord message 500"));
   assert.equal(metaIndex, partialIndex + 1, "the meta continuation instruction follows the carried partial");
-  assert(metaIndex < phaseIndex, "the continuation instruction precedes the reply phase instruction");
   assert(!entries().some((e) => e.content === "answer 3"));
   assert(!entries().some((e) => String(e.content).includes("partial answer before the edit")), "the carried partial stays out of the persisted context");
 
