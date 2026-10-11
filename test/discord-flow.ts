@@ -204,8 +204,8 @@ async function run(): Promise<void> {
     assert(prompt().includes("first ambient message"));
     assert.equal(requests[0][0].role, "system");
     assert(String(requests[0][1].content).includes('channels["channel"]'));
-    assert(String(requests[0][1].content).includes('"name":"general"'));
-    assert(String(requests[0][1].content).includes('"guildName":"Test Server"'));
+    assert(String(requests[0][1].content).includes('name "general"'));
+    assert(String(requests[0][1].content).includes('guild "Test Server"'));
     const savedChannel = JSON.parse(fs.readFileSync(path.join(process.cwd(), "chats.json"), "utf8")).channels.channel.channel;
     assert.deepEqual(savedChannel, { id: "channel", name: "general", guildId: "guild", guildName: "Test Server" });
     assert(prompt().includes("other-bot (bot): newest ambient message"));

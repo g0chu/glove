@@ -456,17 +456,40 @@ export function mergeDiscordHistory(
   if (entries.length > 0 || (markSeeded && !context.seeded)) context.seedFrom(entries, undefined, markSeeded);
 }
 
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Local clock of a message, "14:05". */
+export function timeLabel(ts: number): string {
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** One-line local date marker, "— Wed 8 Oct —". */
+export function dayMarker(ts: number): string {
+  const d = new Date(ts);
+  return `— ${DAY_NAMES[d.getDay()]} ${d.getDate()} ${MONTH_NAMES[d.getMonth()]} —`;
+}
+
+/** Local calendar date as a comparable number (for change detection). */
+function dayKey(ts: number): number {
+  const d = new Date(ts);
+  return d.getFullYear() * 10000 + d.getMonth() * 100 + d.getDate();
+}
+
 /**
  * Render a persistent channel context into the request `messages` array:
  * the system prompt (when non-empty), the compaction summary (as a user
  * message — the role is the safest across llama.cpp chat templates), then
- * every entry in order. User entries are prefixed by the author's display
- * name (`Name: …`, `Name (bot): …` for other bots); assistant entries are
- * unlabeled — the role is the identity. On first render, attachments of the
- * newest `maxMessages` entries are admitted as image parts / fenced text;
- * older attachments get skip notes. The suffix is persisted unchanged on
- * later turns, until metadata/settings or an explicit message edit invalidate
- * it. Entries that carry no text,
+ * every entry in order. User entries carry the local clock and the author's
+ * display name (`14:05 Name: …`, `Name (bot): …` for other bots), with a
+ * one-line day marker on each local date change (timestamps come from the
+ * immutable Discord createdTimestamp, so renderings stay stable); assistant
+ * entries are unlabeled — the role is the identity. On first render,
+ * attachments of the newest `maxMessages` entries are admitted as image
+ * parts / fenced text; older attachments get skip notes. The suffix is
+ * persisted unchanged on later turns, until metadata/settings or an explicit
+ * message edit invalidate it. Entries that carry no text,
  * no images, and no file blocks are dropped.
  */
 export async function contextToMessages(
@@ -484,11 +507,12 @@ export async function contextToMessages(
   if (summary && summary.trim().length > 0) {
     out.push({
       role: "user",
-      content: `Summary of the earlier messages in this channel (older messages were compacted):\n${summary.trim()}`,
+      content: `Compacted earlier context (summary):\n${summary.trim()}`,
     });
   }
   const entries = context.snapshot();
   const imageWindowStart = entries.length - opts.maxMessages;
+  let lastUserDay: number | null = null;
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     if (e.role === "tool") {
@@ -547,7 +571,7 @@ export async function contextToMessages(
     }
     const content = e.modelContent ?? e.content;
     const label = e.role === "user" && e.name ? speakerLabel(e.name, e.bot ?? false) : "";
-    const text =
+    let text =
       content.length > 0
         ? label
           ? `${label}: ${content}`
@@ -555,6 +579,14 @@ export async function contextToMessages(
         : label
           ? `${label}:`
           : "";
+    if (e.role === "user" && label.length > 0) {
+      // Clock prefix + day marker on each local date change: the model's
+      // sense of when each message happened (stable — ts is immutable).
+      const key = dayKey(e.ts);
+      const marker = key !== lastUserDay ? dayMarker(e.ts) : null;
+      lastUserDay = key;
+      text = marker === null ? `${timeLabel(e.ts)} ${text}` : `${marker}\n${timeLabel(e.ts)} ${text}`;
+    }
     const reactionLines: string[] = [];
     const reactionParts: ContentPart[] = [];
     for (const [messageId, reactions] of Object.entries(e.reactions ?? {})) {

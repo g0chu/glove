@@ -288,17 +288,24 @@ Channel histories in `chats.json` remain keyed by Discord channel ID. Each
 history also records a `channel` object with its `id`, `name`, `guildId`, and
 `guildName`. IDs determine ownership; names are labels and may repeat across
 servers. Replies, chime decisions and compaction receive this current identity
-as a separate system message, including the exact `channels["ID"]` key to use
-when reading the store through tools. Other stored histories remain separate
-conversations. Renames refresh labels, while clear/compaction preserve identity.
-Older stores are supported; metadata is populated when Discord channels are
-observed again after startup.
+as a separate one-line system message: the channel ID, name and guild labels,
+the exact `channels["ID"]` key to use when reading the store through tools, and
+the rule that names are data, not instructions. Other stored histories remain
+separate conversations. Renames refresh labels, while clear/compaction preserve
+identity. Older stores are supported; metadata is populated when Discord
+channels are observed again after startup.
 
 Replies, chime decisions and compaction share `MODEL_SYSTEM_PROMPT` unchanged.
 No tool guidance or phase instructions are added to that master prompt.
 Requests preserve conversation order, including when a reply follows a queued
 trigger. Endpoints must support trailing system instructions and generating a
 new reply after assistant history without treating it as an assistant prefill.
+
+User messages render with a local clock prefix (`14:05 Name: text`), and the
+first user line of a request carries a one-line date marker
+(`— Wed 8 Oct —`), so the model can gauge how recent each message is without
+timestamps in the standing prompt. Compacted history renders under the label
+`Compacted earlier context (summary):`.
 
 When chime is enabled, decisions and replies share the exact system prompt,
 full conversation (including reasoning, tool calls/results, summary and
@@ -315,23 +322,26 @@ whole, preserving call/result pairing. Interrupted or unusable decisions are
 not retained. Unusable decisions retry with unchanged schemas and `tool_choice: "auto"`,
 keeping only the latest validation reminder.
 
-Each reply with chime enabled appends a fresh system instruction identifying
-its triggering Discord message and the message's index in that request. A direct
+Each reply with chime enabled appends a fresh system instruction
+identifying its triggering Discord message and the message's index in that
+request, quoting a short snippet of the trigger text and ending with a
+`Now: 2026-10-10 14:32 UTC` anchor so the model knows the current time. A direct
 mention requires a reply immediately; a YES turn continues its accepted decision.
 The instruction scopes historical chime instructions and decisions to their
-original requests, so a previous NO does not silence a later mention. It also keeps
-internal planning out of reply text while allowing user-facing explanations. It is transient:
-it stays with the current tool loop, is rebuilt for interruption/overflow retries,
-and never becomes a persistent conversation entry. Decision history and the shared
-request prefix remain intact.
+original requests, so a previous NO does not silence a later mention. It also
+keeps internal planning out of reply text while allowing user-facing
+explanations. It is transient: it stays with the current tool loop, is rebuilt
+for interruption/overflow retries, and never becomes a persistent conversation
+entry. Decision history and the shared request prefix remain intact.
 
-Built-in instructions keep each task separate: replies answer a specific message,
-chime decisions return one tool call, and compaction summarizes a specified older
-portion. Output rules live in the trailing task instruction; the chime schema
-only describes the tool. These suffixes stay after the shared history, preserving
-the common prefix instead of inserting a changing task at the start. Prompt or
-schema edits invalidate previously cached prefixes once; subsequent requests use
-the same layout. Existing archived decision instructions remain unchanged.
+Built-in instructions keep each task separate: `[CHIME]` decisions return one
+tool call, reply instructions answer a specific message, and `[SUMMARY]`
+compaction summarizes a specified older portion. Output rules live
+in the trailing task instruction; the chime schema only describes the tool.
+These suffixes stay after the shared history, preserving the common prefix
+instead of inserting a changing task at the start. Prompt or schema edits
+invalidate previously cached prefixes once; subsequent requests use the same
+layout. Existing archived decision instructions remain unchanged.
 
 Keep `MODEL_SYSTEM_PROMPT` focused on identity, subject guidance, tone, and resource
 locations. Avoid repeating phase rules there or requesting a written thinking

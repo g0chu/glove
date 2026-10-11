@@ -767,8 +767,15 @@ async function main(): Promise<void> {
             ];
             // Historical decisions can survive disabling chime between restarts.
             // Always identify the current reply phase so an old NO cannot suppress it.
+            // The trigger snippet lets the model see the ask without counting to
+            // the index (the full message is in the conversation above).
+            const triggerEntry = context.snapshot().find((e) => e.ids.includes(turn.id));
+            const triggerText = triggerEntry ? (triggerEntry.modelContent ?? triggerEntry.content).trim().replace(/\s+/g, " ") : "";
+            const triggerSnippet = triggerText.length > 0
+              ? `${triggerEntry?.name ? triggerEntry.name + ": " : ""}${triggerText.length > 60 ? triggerText.slice(0, 60) + "…" : triggerText}`
+              : undefined;
             const replyMessages: ChatMessage[] = [
-              ...msgs, ...carried, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime) },
+              ...msgs, ...carried, { role: "system", content: replyPhaseInstruction(turn.id, triggerEnd - 1, !turn.chime, triggerSnippet) },
               ...carriedRoundMessages,
             ];
             return runToolTurn(replyMessages, {

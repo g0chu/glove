@@ -64,7 +64,7 @@ import { ResponseWriter, splitForDiscord } from "../src/bot/writer.js";
 import { sanitizeForDiscord } from "../src/bot/format.js";
 import { fetchMessageImages, isDiscordCdnUrl, type ImageFetch, type MessageAttachmentLike } from "../src/bot/images.js";
 import { fetchMessageFiles, fenceFor, isProbablyText, type FileFetch } from "../src/bot/files.js";
-import { buildChannelContext, compactChannelContext, refreshChannelIdentity, contextToMessages, mergeDiscordHistory, prefixEndIndex, syncMessageUpdate, type ContextOptions, type MessageLike } from "../src/bot/context.js";
+import { buildChannelContext, compactChannelContext, refreshChannelIdentity, contextToMessages, dayMarker, mergeDiscordHistory, prefixEndIndex, syncMessageUpdate, timeLabel, type ContextOptions, type MessageLike } from "../src/bot/context.js";
 import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalString, argInt } from "../src/tools/executor.js";
 import { runToolTurn, type ToolRound } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
@@ -1911,7 +1911,7 @@ process.exit(0);
     imagesMaxBytes: 1024,
     enableFileContents: false,
     fileContentsMaxBytes: 1024,
-  }), [{ role: "user", content: "Carl (bot): beep" }]);
+  }), [{ role: "user", content: `${dayMarker(1)}\n${timeLabel(1)} Carl (bot): beep` }]);
   // Token estimate: ~4 chars/token + a fixed cost per image in the window.
   assert.equal(estimateTokens("12345678"), 2);
   const est = new ChannelContext();
@@ -1982,7 +1982,13 @@ process.exit(0);
   assert.equal(capStore.seeded, true, "the seed happened (not retried every turn)");
   assert.deepEqual(
     capRes!.map((x) => String(x.content)),
-    ["Alice: pre-startup", "Alice: burst one", "Alice: burst two", "Alice: burst three", "Alice: the mention"],
+    [
+      `${dayMarker(50)}\n${timeLabel(50)} Alice: pre-startup`,
+      `${timeLabel(55)} Alice: burst one`,
+      `${timeLabel(55)} Alice: burst two`,
+      `${timeLabel(55)} Alice: burst three`,
+      `${timeLabel(60)} Alice: the mention`,
+    ],
   );
   ok("compaction: a window over Discord's 100-fetch cap still seeds (capped, UI lines skipped, burst ordered by id)");
 
@@ -2018,7 +2024,7 @@ process.exit(0);
     });
     assert.deepEqual(
       nmRes!.map((x) => String(x.content)),
-      ["Alice: @Glove ping", "Bob: ping @Glove back"],
+      [`${dayMarker(1)}\n${timeLabel(1)} Alice: @Glove ping`, `${timeLabel(2)} Bob: ping @Glove back`],
       "the tracked entry keeps its content; the fetched mention becomes the bot's Discord name",
     );
     ok("seed: a mention of the bot is replaced by its Discord name (never stripped to nothing)");
@@ -2120,17 +2126,17 @@ process.exit(0);
     assert.equal(pmsgs.length, 5, "system + four entries");
     const pcut = prefixEndIndex(ptstore, popts, "ct-trig");
     assert.equal(pcut, 4, "system + the two older entries + the trigger");
-    assert.equal(String(pmsgs[pcut! - 1].content), "Bob: the trigger", "the cut ends at the trigger's message");
-    assert.equal(String(pmsgs[pcut!].content), "Carol: committed while the turn built", "the newer entry sits right after the cut");
+    assert.equal(String(pmsgs[pcut! - 1].content), `${timeLabel(3)} Bob: the trigger`, "the cut ends at the trigger's message");
+    assert.equal(String(pmsgs[pcut!].content), `${timeLabel(4)} Carol: committed while the turn built`, "the newer entry sits right after the cut");
     const ptranscript = pmsgs.slice(0, pcut!).slice(1); // the reply's system prompt is not part of it
-    assert.equal(ptranscript[ptranscript.length - 1].content, "Bob: the trigger", "the transcript ends with the trigger");
+    assert.equal(ptranscript[ptranscript.length - 1].content, `${timeLabel(3)} Bob: the trigger`, "the transcript ends with the trigger");
     // With a summary: it rides ahead of the cut prefix.
     await ptstore.compact(2, async () => "the summary", "ct-trig");
     const pmsgs2 = await contextToMessages(ptstore, popts);
     const pcut2 = prefixEndIndex(ptstore, popts, "ct-trig");
     assert.equal(pcut2, 3, "system + summary + the trigger (the older entries are folded)");
-    assert.equal(String(pmsgs2[pcut2! - 1].content), "Bob: the trigger");
-    assert.ok(String(pmsgs2[1].content).startsWith("Summary of the earlier messages"), "the summary stays ahead of the cut prefix");
+    assert.equal(String(pmsgs2[pcut2! - 1].content), `${dayMarker(3)}\n${timeLabel(3)} Bob: the trigger`);
+    assert.ok(String(pmsgs2[1].content).startsWith("Compacted earlier context"), "the summary stays ahead of the cut prefix");
     assert.equal(prefixEndIndex(ptstore, popts, "ct-missing"), null, "absent entry -> null (the caller falls back to the full transcript)");
     ok("chime transcript: prefixEndIndex cuts the transcript at the trigger (summary kept, newer entries excluded)");
   }
@@ -2159,7 +2165,7 @@ process.exit(0);
     };
     const expected = await contextToMessages(ordered, opts);
     assert.equal(expected[0].content, opts.systemPrompt);
-    assert.equal(expected[1].content, "Alice: trigger");
+    assert.equal(expected[1].content, `${dayMarker(1)}\n${timeLabel(1)} Alice: trigger`);
     assert.equal(expected[2].reasoningContent, "think");
     assert.equal(expected[3].role, "tool");
     await buildChannelContext(noFetch, ordered, "ordered-newest", opts);
@@ -2250,10 +2256,10 @@ process.exit(0);
   const cres = await buildChannelContext(noFetch, cstore, "m1", cOpts);
   assert.deepEqual(cres, [
     { role: "system", content: "sys" },
-    { role: "user", content: "Summary of the earlier messages in this channel (older messages were compacted):\nthey discussed the launch plan" },
-    { role: "user", content: "P7: old message 7" },
-    { role: "user", content: "P8: old message 8" },
-    { role: "user", content: "Alice: what was I saying?" },
+    { role: "user", content: "Compacted earlier context (summary):\nthey discussed the launch plan" },
+    { role: "user", content: `${dayMarker(1600)}\n${timeLabel(1600)} P7: old message 7` },
+    { role: "user", content: `${timeLabel(1700)} P8: old message 8` },
+    { role: "user", content: `${timeLabel(9000)} Alice: what was I saying?` },
   ]);
   assert.equal(cstore.getSummary(), "they discussed the launch plan");
   assert.equal(cstore.length, 3, "only the newest 3 entries survive");
@@ -2289,12 +2295,12 @@ process.exit(0);
   cstore.pushUser("Bob", "more talk", "m2", 10000, []);
   const cres2 = await buildChannelContext(noFetch, cstore, "m2", cOpts);
   assert.equal(seenTranscripts.length, 2, "second compaction runs");
-  assert.ok(seenTranscripts[1].includes("Summary of the earlier messages in this channel"), "previous summary folded in");
+  assert.ok(seenTranscripts[1].includes("Compacted earlier context"), "previous summary folded in");
   assert.ok(seenTranscripts[1].includes("they discussed the launch plan"));
   assert.ok(seenTranscripts[1].includes("P7: old message 7"), "now-old messages summarized");
   assert.deepEqual(
     cres2!.slice(2).map((x) => String(x.content)),
-    ["P8: old message 8", "Alice: what was I saying?", "Bob: more talk"],
+    [`${dayMarker(1700)}\n${timeLabel(1700)} P8: old message 8`, `${timeLabel(9000)} Alice: what was I saying?`, `${timeLabel(10000)} Bob: more talk`],
   );
   assert.equal(cstore.length, 3);
   ok("compaction: repeated compaction folds the running summary");
@@ -2323,7 +2329,7 @@ process.exit(0);
   assert.ok(fstore.has("fm"), "the mention survived the trim");
   assert.ok(!fstore.has("f0"), "the oldest message was trimmed");
   assert.equal(fstore.getSummary(), null, "no summary when the summarizer failed");
-  assert.ok(fres!.some((msg) => msg.content === "Alice: the mention"));
+  assert.ok(fres!.some((msg) => String(msg.content).includes("Alice: the mention")));
   // Nothing older than the keep window to fold: the trim applies directly.
   const tstore = new ChannelContext();
   tstore.pushUser("A", "a".repeat(400), "t1", 1, []);
@@ -2636,9 +2642,9 @@ process.exit(0);
   });
   const iPart = { type: "image_url", image_url: { url: `data:image/png;base64,${imgBytes.toString("base64")}` } };
   assert.deepEqual(ires, [
-    { role: "user", content: 'Alice: old image\n*[attachment "img.png" not sent: older than the image window]*' },
-    { role: "user", content: [{ type: "text", text: "Bob: recent one" }, iPart] },
-    { role: "user", content: [{ type: "text", text: "Carol: recent two" }, iPart] },
+    { role: "user", content: `${dayMarker(1)}\n${timeLabel(1)} Alice: old image\n*[attachment "img.png" not sent: older than the image window]*` },
+    { role: "user", content: [{ type: "text", text: `${timeLabel(2)} Bob: recent one` }, iPart] },
+    { role: "user", content: [{ type: "text", text: `${timeLabel(3)} Carol: recent two` }, iPart] },
   ]);
   const sstore = new ChannelContext();
   sstore.pushUser("A", "x", "s1", 1, []);
@@ -2653,8 +2659,8 @@ process.exit(0);
     fileContentsMaxBytes: 1024,
   });
   assert.deepEqual(sres, [
-    { role: "user", content: "Summary of the earlier messages in this channel (older messages were compacted):\nthe summary" },
-    { role: "user", content: "B: y" },
+    { role: "user", content: "Compacted earlier context (summary):\nthe summary" },
+    { role: "user", content: `${dayMarker(2)}\n${timeLabel(2)} B: y` },
   ]);
   ok("compaction: image window notes, recent image parts, summary rendered first");
 
@@ -2684,8 +2690,8 @@ process.exit(0);
   });
   const fileBlock2 = '[attachment "notes.md" (1 KB)]:\n```\n# Notes\nbody\n```';
   assert.deepEqual(ffres, [
-    { role: "user", content: 'Alice: old file\n*[attachment "notes.md" not sent: older than the file window]*' },
-    { role: "user", content: `Bob: recent file\n${fileBlock2}` },
+    { role: "user", content: `${dayMarker(1)}\n${timeLabel(1)} Alice: old file\n*[attachment "notes.md" not sent: older than the file window]*` },
+    { role: "user", content: `${timeLabel(2)} Bob: recent file\n${fileBlock2}` },
   ]);
   ok("compaction: file window notes, recent files inlined");
 
@@ -2713,9 +2719,9 @@ process.exit(0);
     {
       role: "user",
       content:
-        'Alice: old mix\n*[attachment "img.png" not sent: older than the image window]*\n*[attachment "notes.md" not sent: older than the file window]*',
+        `${dayMarker(1)}\n${timeLabel(1)} Alice: old mix\n*[attachment "img.png" not sent: older than the image window]*\n*[attachment "notes.md" not sent: older than the file window]*`,
     },
-    { role: "user", content: [{ type: "text", text: `Bob: recent mix\n${fileBlock2}` }, bfPart] },
+    { role: "user", content: [{ type: "text", text: `${timeLabel(2)} Bob: recent mix\n${fileBlock2}` }, bfPart] },
   ]);
   ok("compaction: both pipelines on — image part + file block, no duplicate notes");
 
@@ -2753,7 +2759,7 @@ process.exit(0);
     summarize: async () => "never",
   };
   assert.deepEqual(await buildChannelContext(noFetch, kstore, "k3", kOpts), [
-    { role: "user", content: "Alice: fresh start" },
+    { role: "user", content: `${dayMarker(300)}\n${timeLabel(300)} Alice: fresh start` },
   ]);
   // A mention queued before the clear: its message left the context, the
   // turn is skipped (no fetch attempted either — the mention check comes first).
@@ -2819,7 +2825,7 @@ process.exit(0);
     rendered.map((m) => [m.role, m.content]),
     [
       ["system", "sys"],
-      ["user", "Alice: check the file for me"],
+      ["user", `${dayMarker(100)}\n${timeLabel(100)} Alice: check the file for me`],
       ["assistant", "let me look"],
       ["tool", "file contents"],
       ["assistant", ""],
@@ -3086,7 +3092,7 @@ process.exit(0);
     const cuRes = await buildChannelContext(cuChan, cuRestored, "cu-new", seedOpts("bot1"));
     assert.deepEqual(
       cuRes!.map((x) => String(x.content)),
-      ["Alice: old", "Alice: offline one", "Bob: new"],
+      [`${dayMarker(100)}\n${timeLabel(100)} Alice: old`, `${timeLabel(200)} Alice: offline one`, `${timeLabel(300)} Bob: new`],
       "offline messages merged in chronological order; tracked ids keep their (newer, live) content",
     );
     assert.equal(cuRestored.seeded, true, "the catch-up happened once");
@@ -3110,7 +3116,7 @@ process.exit(0);
     const clRes = await buildChannelContext(clChan, clRestored, "cl-new", seedOpts("bot1"));
     assert.deepEqual(
       clRes!.map((x) => String(x.content)),
-      ["Alice: after the clear"],
+      [`${dayMarker(500)}\n${timeLabel(500)} Alice: after the clear`],
       "the pre-clear message is not resurrected by the restart",
     );
     const clCleared = new ChannelContext();
@@ -7316,9 +7322,9 @@ process.exit(0);
   assert.match(String(limited[1].content), /exceeds/);
   assert.doesNotMatch(String(limited[1].content), /file contents/);
   const disabled = await contextToMessages(restored, { ...opts, enableImages: false, enableFileContents: false });
-  assert.equal(disabled[1].content, "Alice: read these", "disabling features invalidates cached parts");
+  assert.equal(disabled[1].content, `${dayMarker(1)}\n${timeLabel(1)} Alice: read these`, "disabling features invalidates cached parts");
   restored.updateAttachments("1", []);
-  assert.equal((await contextToMessages(restored, opts))[1].content, "Alice: read these", "removed attachments do not survive in the prompt");
+  assert.equal((await contextToMessages(restored, opts))[1].content, `${dayMarker(1)}\n${timeLabel(1)} Alice: read these`, "removed attachments do not survive in the prompt");
   assert.equal(restored.find("1")!.attachmentPrompt!.images.length, 0);
   ok("prompt prefix: attachment admission, limits, URL refresh, edits and restart remain consistent");
 
@@ -7342,7 +7348,7 @@ process.exit(0);
     return new Response("stale bytes");
   } });
   assert.equal(replaced.find("5")!.attachmentPrompt, undefined, "stale downloaded bytes cannot be pinned onto replacement metadata");
-  assert.equal((await contextToMessages(replaced, opts))[1].content, "Alice: file");
+  assert.equal((await contextToMessages(replaced, opts))[1].content, `${dayMarker(5)}\n${timeLabel(5)} Alice: file`);
   ok("prompt prefix: failed downloads stay stable and late results cannot restore cleared or replaced attachments");
 }
 
@@ -7493,7 +7499,7 @@ process.exit(0);
         assert.equal(request[1].role, "system");
         assert(String(request[1].content).includes(`channels["${id}"]`));
         assert(String(request[1].content).includes(guildName));
-        assert.equal(request[2].content, `Alice: ${text}`);
+        assert.equal(request[2].content, `${dayMarker(1)}\n${timeLabel(1)} Alice: ${text}`);
         assert.equal(prefixEndIndex(context, opts, `message-${id}`), 3, "identity is counted in trigger indices");
         const restored = ChannelContext.restore(context.serialize());
         assert.deepEqual(await contextToMessages(restored, opts), request);
@@ -7645,7 +7651,7 @@ process.exit(0);
   const messages = await contextToMessages(context, { systemPrompt: "", maxMessages: 10, enableImages: false,
     imagesMaxBytes: 1024, enableFileContents: false, fileContentsMaxBytes: 1024 });
   const outcome = await runToolTurn(messages, { registry, maxRounds: 1, chat: async (updated) => {
-    assert.ok(updated.some((entry) => entry.content === "Bob: new context"));
+    assert.ok(updated.some((entry) => String(entry.content).includes("Bob: new context")));
     assert.ok(updated.some((entry) => entry.role === "tool" && entry.content === "saved exactly once"));
     return { content: "updated answer", toolCalls: [] };
   } });

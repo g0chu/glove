@@ -6,8 +6,8 @@ import { errMsg, log, truncate } from "../log.js";
 
 /** Decision instructions appended AFTER the shared chat context for prefix reuse. */
 export const CHIME_SYSTEM_PROMPT =
-  "Chime decision: decide whether to join the conversation after the newest user-role message (a Discord participant, possibly a bot). " +
-  "Use the surrounding conversation; earlier phase instructions apply only to their original requests. " +
+  "[CHIME] Chime decision: decide whether to join the conversation after the newest user-role message (a Discord participant, possibly a bot). " +
+  "Use the surrounding conversation. " +
   "Return exactly one chime tool call with boolean respond and a short string reason about whether a reply is useful. " +
   "No chat text or other tool calls; JSON in text is not a tool call. Even respond=true leaves the answer to a separate reply request.";
 

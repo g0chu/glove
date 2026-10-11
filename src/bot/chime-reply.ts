@@ -5,15 +5,25 @@ import { isContextOverflowError } from "../llm/context.js";
 import { log } from "../log.js";
 import { CHIME_TOOL_NAME, chimeTools } from "./chime.js";
 
+/** Two-digit clock/date part for the "Now:" anchor. */
+const pad = (n: number): string => String(n).padStart(2, "0");
+
+/** The current UTC time as a short label ("2026-10-10 14:32 UTC"). */
+export function nowUtcLabel(date: Date = new Date()): string {
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())} UTC`;
+}
+
 /** Transient instruction for the current reply, appended after the shared history. */
-export function replyPhaseInstruction(triggerId: string, messageIndex: number, directMention: boolean): string {
-  return `Reply to Discord message ${triggerId} at message index ${messageIndex} (zero-based). ` +
+export function replyPhaseInstruction(triggerId: string, messageIndex: number, directMention: boolean, triggerSnippet?: string): string {
+  const target = triggerSnippet ? `: ${triggerSnippet}` : "";
+  return `Reply to Discord message ${triggerId} at message index ${messageIndex} (zero-based)${target}. ` +
     (directMention
       ? "It mentions you and requires an answer. "
       : "Its chime decision allows an answer. ") +
     "Use the full updated conversation, including later messages and completed tool results. " +
     "Earlier phase instructions apply only to their original requests. Use tools as needed, but do not call chime; a chime acknowledgment does not end this reply. " +
-    "Reply text must contain the user-facing answer, not internal planning or thinking-process notes. Keep internal reasoning in the endpoint's separate reasoning field, if supported.";
+    "Reply text must contain the user-facing answer, not internal planning or thinking-process notes. Keep internal reasoning in the endpoint's separate reasoning field, if supported. " +
+    `Now: ${nowUtcLabel()}.`;
 }
 
 /**
