@@ -193,9 +193,10 @@ function drawEntry(detail, previous) {
             if (m.tool_calls?.length) root.append(toolsGroup(m.tool_calls, 'prompt-tools-' + i));
         } else {
             const toolName = m.name || toolNames.get(m.tool_call_id);
-            const kind = m.role === 'tool' ? 'tool-result' : m.role === 'user' ? 'user' : 'instructions';
+            const systemInstruction = m.role === 'user' && m.metadata?.sourceRole === 'system';
+            const kind = m.role === 'tool' ? 'tool-result' : m.role === 'user' ? (systemInstruction ? 'instructions' : 'user') : 'instructions';
             const label = m.role === 'tool' ? 'Tool result' + (toolName ? ' · ' + toolName : '') :
-                m.role === 'user' ? 'User message' + (m.name ? ' · ' + m.name : '') : 'Instructions';
+                m.role === 'user' ? (systemInstruction ? 'System instruction' + (m.metadata?.kind ? ' · ' + m.metadata.kind : '') : 'User message') + (m.name ? ' · ' + m.name : '') : 'Instructions';
             root.append(group(kind, label, messageContent(m.content), 'prompt-' + kind + '-' + i));
         }
     }

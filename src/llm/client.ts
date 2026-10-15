@@ -51,6 +51,48 @@ export function isImageAttachment(att: MessageAttachmentLike): boolean {
   return att.contentType != null && att.contentType in SUPPORTED_IMAGE_TYPES;
 }
 
+/**
+ * The purpose of an instruction that used to be a system message and is now
+ * sent as a user message (only the very first message of a request — the
+ * master system prompt — keeps the system role).
+ */
+export const SYSTEM_INSTRUCTION_KINDS = [
+  "channel-identity",
+  "compaction",
+  "chime-decision",
+  "chime-repair",
+  "chime-result",
+  /** A chime-exchange instruction persisted with the system role before the conversion. */
+  "chime-exchange",
+  "interruption-continuation",
+] as const;
+
+export type SystemInstructionKind = typeof SYSTEM_INSTRUCTION_KINDS[number];
+
+/** Provenance metadata of a user message that was once a system message. */
+export interface MessageMetadata {
+  /** The role the message used to carry. */
+  sourceRole: "system";
+  /** What the instruction is for. */
+  kind: SystemInstructionKind;
+}
+
+/** One user message carrying a former system instruction (metadata included). */
+export function systemInstructionMessage(kind: SystemInstructionKind, content: string): ChatMessage {
+  return { role: "user", content, metadata: { sourceRole: "system", kind } };
+}
+
+/**
+ * The wire-level tag around a converted system instruction: it tells the
+ * model the user message carries a system instruction (of the given kind),
+ * not user speech. Applied on the wire only (toWireMessage) — stored and
+ * in-memory content stays untagged, so the tag never leaks into the
+ * persisted context, the UI or the model's own recorded replies.
+ */
+export function systemInstructionTag(kind: SystemInstructionKind, content: string): string {
+  return `[SYSTEM MESSAGE: ${kind}]\n${content}\n[/SYSTEM MESSAGE]`;
+}
+
 /** A message in the conversation sent to the model (wire shape on request). */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -59,6 +101,12 @@ export interface ChatMessage {
    * (user messages carrying attachments; tool content is always a string).
    */
   content: string | ContentPart[];
+  /**
+   * Set on user messages that were converted from system instructions (every
+   * system message aside from the very first one): the original role and the
+   * instruction's purpose.
+   */
+  metadata?: MessageMetadata;
   /** assistant only: tool calls the model requested. */
   toolCalls?: ToolCall[];
   /**
@@ -343,7 +391,10 @@ function toWireMessage(m: ChatMessage): Record<string, unknown> {
       })),
     };
   }
-  return { role: m.role, content: m.content, ...withReasoning };
+  const content = m.metadata !== undefined && typeof m.content === "string"
+    ? systemInstructionTag(m.metadata.kind, m.content)
+    : m.content;
+  return { role: m.role, content, ...(m.metadata ? { metadata: m.metadata } : {}), ...withReasoning };
 }
 
 /**

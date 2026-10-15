@@ -1,7 +1,7 @@
 import { snapshotReactions, fetchReactionImage, reactionImageUrl, type ReactionMessage } from "./reactions.js";
 import type { GuildTextBasedChannel, Message } from "discord.js";
 import type { ChatMessage, ContentPart } from "../llm/client.js";
-import { attachmentIdentity, InterruptedError, isInterruptedError } from "../llm/client.js";
+import { attachmentIdentity, InterruptedError, isInterruptedError, systemInstructionMessage } from "../llm/client.js";
 import {
   compareDiscordIds,
   channelIdentityPrompt,
@@ -102,7 +102,7 @@ export interface ContextOptions {
   keepMessages: number;
   /** Custom summary guidance, followed by mandatory phase and boundary instructions. */
   compactionPrompt?: string;
-  /** One chat call over the unchanged active context plus a system instruction (production: the same model endpoint). */
+  /** One chat call over the unchanged active context plus the fold instruction (a user message carrying the system-provenance metadata; production: the same model endpoint). */
   summarize: (messages: ChatMessage[]) => Promise<string>;
 }
 
@@ -163,8 +163,10 @@ export interface CompactionOutcome {
  * Compact a channel context now — the model route: fold everything older
  * than the newest `opts.keepMessages` entries (plus any existing summary)
  * into one model-written summary via one chat call over the full active
- * context, the reply's ordered tool definitions and a trailing system
- * instruction; `mentionId` (the turn's mention) is never folded away. When
+ * context, the reply's ordered tool definitions and a trailing fold
+ * instruction (sent as a user message with the system-provenance metadata —
+ * only the first message keeps the system role); `mentionId` (the turn's
+ * mention) is never folded away. When
  * the summary cannot be written — nothing to fold, a broken or empty
  * summarizer, or the summarizer's own full-context request overfills the
  * window (the context is then shrunk hard — the mention protected, the
@@ -194,10 +196,7 @@ export async function compactChannelContext(
     const instruction = custom
       ? `Custom summary guidance (subject to the phase rules below):\n${custom}\n\n${COMPACTION_SYSTEM_PROMPT}`
       : COMPACTION_SYSTEM_PROMPT;
-    return opts.summarize([...active, {
-      role: "system",
-      content: `${instruction}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`,
-    }]);
+    return opts.summarize([...active, systemInstructionMessage("compaction", `${instruction}\n\nSummarize only the earlier portion: the existing summary (if present) and conversation messages before message ${boundary} (zero-based index in this request). Later messages remain verbatim; use them only as context. Return only summary text, at most 4000 characters. Do not call any tools.`)]);
   };
   let res: CompactionResult;
   // The second overflow's own reported request size (the trim's gap source
@@ -479,9 +478,12 @@ function dayKey(ts: number): number {
 
 /**
  * Render a persistent channel context into the request `messages` array:
- * the system prompt (when non-empty), the compaction summary (as a user
- * message — the role is the safest across llama.cpp chat templates), then
- * every entry in order. User entries carry the local clock and the author's
+ * the system prompt (when non-empty — the only system message), the channel
+ * identity (as a user message with the system-provenance metadata), the
+ * compaction summary (as a user message — the role is the safest across
+ * llama.cpp chat templates), then every entry in order. Entries persisted
+ * with the system role (retained chime exchanges written before the
+ * conversion) render as user messages carrying the metadata too. User entries carry the local clock and the author's
  * display name (`14:05 Name: …`, `Name (bot): …` for other bots), with a
  * one-line day marker on each local date change (timestamps come from the
  * immutable Discord createdTimestamp, so renderings stay stable); assistant
@@ -502,7 +504,7 @@ export async function contextToMessages(
   const out: ChatMessage[] = [];
   if (opts.systemPrompt.trim().length > 0) out.push({ role: "system", content: opts.systemPrompt });
   const channel = context.getChannelIdentity();
-  if (channel) out.push({ role: "system", content: channelIdentityPrompt(channel) });
+  if (channel) out.push(systemInstructionMessage("channel-identity", channelIdentityPrompt(channel)));
   const summary = context.getSummary();
   if (summary && summary.trim().length > 0) {
     out.push({
@@ -613,6 +615,15 @@ export async function contextToMessages(
     if (body.length === 0 && images.length === 0 && files.length === 0 && (e.toolCalls?.length ?? 0) === 0 && !e.reasoning) continue; // carries nothing
     const msg: ChatMessage =
       images.length === 0 && reactionParts.length === 0 ? { role: e.role, content: body } : { role: e.role, content: [] };
+    // Every system message aside from the very first one is sent as a user
+    // message with the system-provenance metadata: retained chime exchanges
+    // written before the conversion still carry the stored system role.
+    if (e.role === "system") {
+      msg.role = "user";
+      msg.metadata = e.metadata ?? { sourceRole: "system", kind: "chime-exchange" };
+    } else if (e.metadata) {
+      msg.metadata = e.metadata;
+    }
     if (images.length > 0 || reactionParts.length > 0) {
       const parts = msg.content as ContentPart[];
       if (body.length > 0) parts.push({ type: "text", text: body });

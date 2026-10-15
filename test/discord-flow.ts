@@ -49,7 +49,7 @@ LlmClient.prototype.chat = async function (messages, _callbacks, _tools, signal,
   const hook = duringChat;
   duringChat = undefined;
   if (hook) return hook(signal, _callbacks);
-  if (messages.at(-1)?.role === "system" && messages.at(-1)?.content === CHIME_SYSTEM_PROMPT) {
+  if (messages.at(-1)?.role === "user" && messages.at(-1)?.metadata?.kind === "chime-decision" && messages.at(-1)?.content === CHIME_SYSTEM_PROMPT) {
     assert.equal(options?.maxTokens, undefined, "chime decisions use the endpoint output limit");
     return { content: "", reasoning: "decision reasoning", toolCalls: [{ id: `decision-${requests.length}`, name: "chime",
       arguments: JSON.stringify({ respond: chimeRespond, reason: "conversation settled" }) }] };
@@ -198,6 +198,8 @@ async function run(): Promise<void> {
     assert.equal(requests.length, 1, "only the newest ambient trigger decides after stillness — typing did not hold the wait");
     assert(prompt().includes("first ambient message"));
     assert.equal(requests[0][0].role, "system");
+    assert.equal(requests[0][1].role, "user");
+    assert.deepEqual(requests[0][1].metadata, { sourceRole: "system", kind: "channel-identity" });
     assert(String(requests[0][1].content).includes('channels["channel"]'));
     assert(String(requests[0][1].content).includes('name "general"'));
     assert(String(requests[0][1].content).includes('guild "Test Server"'));
@@ -369,7 +371,7 @@ async function run(): Promise<void> {
   const partialIndex = retryPrompt.findIndex((m) => m.role === "assistant" && String(m.content).includes("partial answer before the edit"));
   assert(partialIndex !== -1, "the partial generation is carried into the retry");
   assert.equal(retryPrompt[partialIndex].reasoningContent, "partial thinking before the edit", "the partial thinking travels with the carried partial");
-  const metaIndex = retryPrompt.findIndex((m) => m.role === "system" && String(m.content).includes("interrupted by activity"));
+  const metaIndex = retryPrompt.findIndex((m) => m.role === "user" && m.metadata?.kind === "interruption-continuation" && String(m.content).includes("interrupted by activity"));
   assert.equal(metaIndex, partialIndex + 1, "the meta continuation instruction follows the carried partial");
   assert(!entries().some((e) => e.content === "answer 3"));
   assert(!entries().some((e) => String(e.content).includes("partial answer before the edit")), "the carried partial stays out of the persisted context");

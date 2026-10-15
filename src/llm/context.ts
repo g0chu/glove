@@ -1,6 +1,6 @@
 import type { ReactionSnapshot } from "../bot/reactions.js";
-import type { ChatMessage, MessageAttachmentLike, ToolCall } from "./client.js";
-import { attachmentIdentity, isImageAttachment, isInterruptedError } from "./client.js";
+import type { ChatMessage, MessageAttachmentLike, MessageMetadata, ToolCall } from "./client.js";
+import { attachmentIdentity, isImageAttachment, isInterruptedError, SYSTEM_INSTRUCTION_KINDS, type SystemInstructionKind } from "./client.js";
 
 /** The role of one context entry (the request `messages` array uses it). */
 export type Role = "system" | "user" | "assistant" | "tool";
@@ -55,6 +55,8 @@ export interface ContextEntry {
   name?: string;
   /** True when the author is another bot (labeled "(bot)" in the context). */
   bot?: boolean;
+  /** Provenance of a user entry converted from a system instruction (retained chime exchanges). */
+  metadata?: MessageMetadata;
   /** Attachment metadata; admitted attachments retain their first rendering until removed or edited. */
   attachments: MessageAttachmentLike[];
   /** Reaction snapshots by Discord chunk id, including older messages. */
@@ -317,7 +319,7 @@ export class ChannelContext {
       return {
         role: message.role, content: message.content, ids: [], attachments: [], ts: timestamp, exchangeId,
         reasoning: message.reasoningContent, toolCalls: message.toolCalls,
-        toolCallId: message.toolCallId, name: message.name,
+        toolCallId: message.toolCallId, name: message.name, metadata: message.metadata,
       };
     });
     this.entries.splice(Math.min(position, this.entries.length), 0, ...entries);
@@ -949,6 +951,11 @@ function sanitizeEntry(raw: unknown): ContextEntry | null {
   }
   if (typeof e.exchangeId === "string") entry.exchangeId = e.exchangeId;
   if (typeof e.turnId === "string") entry.turnId = e.turnId;
+  const metadata = e.metadata as Partial<MessageMetadata> | undefined;
+  if (metadata && metadata.sourceRole === "system" && typeof metadata.kind === "string" &&
+      (SYSTEM_INSTRUCTION_KINDS as readonly string[]).includes(metadata.kind)) {
+    entry.metadata = { sourceRole: "system", kind: metadata.kind as SystemInstructionKind };
+  }
   if (e.bot === true) entry.bot = true;
   if (typeof e.reasoning === "string" && e.reasoning.length > 0) entry.reasoning = e.reasoning;
   if (Array.isArray(e.toolCalls)) {

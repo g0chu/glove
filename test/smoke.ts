@@ -56,7 +56,7 @@ import { MessageObservations } from "../src/bot/observations.js";
 import { ChannelActivity } from "../src/bot/quiet.js";
 import { chimeReplyChat } from "../src/bot/chime-reply.js";
 import { executeReplyChime, chimeTools, CHIME_SYSTEM_PROMPT, CHIME_TOOL_SPEC, decideChime, formatChimeNo, type ChimeChat } from "../src/bot/chime.js";
-import { InterruptedError, isInterruptedError, ModelConnectionError, LlmClient, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
+import { InterruptedError, isInterruptedError, ModelConnectionError, LlmClient, systemInstructionMessage, type ChatMessage, type ChatResult, type ToolSpec } from "../src/llm/client.js";
 import { COMPACT_OUTPUT_RESERVE_TOKENS, LlamaMetrics, TurnTokens, deriveCompactionBudget, type ChatFn } from "../src/llm/metrics.js";
 import { ChannelQueue, type TurnRequest } from "../src/bot/queue.js";
 import { recordTurn } from "../src/bot/turn-record.js";
@@ -1138,9 +1138,9 @@ process.exit(0);
     assert.deepEqual(requests[0].tools?.map(tool => tool.name), ["file_read", "chime"]);
     assert.deepEqual(recovered, { respond: false, reason: "chatter" });
     assert.equal(requests.length, 2);
-    assert.equal(requests[0].choice, "auto");
+    assert.equal(requests[0].choice, "required");
     assert.deepEqual(requests[1].tools, requests[0].tools);
-    assert.equal(requests[1].choice, "auto");
+    assert.equal(requests[1].choice, "required");
     assert.equal(requests[0].maxTokens, undefined, "decision uses the endpoint output limit");
     assert.equal(requests[1].maxTokens, undefined, "repair also uses the endpoint output limit");
     assert.deepEqual(requests[1].messages.slice(0, -1), requests[0].messages, "repair preserves the message prefix");
@@ -1308,7 +1308,8 @@ process.exit(0);
   };
   assert.deepEqual(await decideChime(spying, transcript), { respond: false, reason: "chatter" });
   assert.equal(sent.length, transcript.length + 1);
-  assert.equal(sent.at(-1)!.role, "system");
+  assert.equal(sent.at(-1)!.role, "user", "the decision instruction is a user message (only the first system message stays system)");
+  assert.deepEqual(sent.at(-1)!.metadata, { sourceRole: "system", kind: "chime-decision" });
   assert.equal(sent.at(-1)!.content, CHIME_SYSTEM_PROMPT);
   assert.deepEqual(sent.slice(0, -1), transcript);
   assert.deepEqual(sentTools, [CHIME_TOOL_SPEC]);
@@ -2158,7 +2159,8 @@ process.exit(0);
       maxTokens: 1, keepMessages: 1,
       summarize: async (messages: ChatMessage[]): Promise<string> => {
         assert.deepEqual(messages.slice(0, -1), expected);
-        assert.equal(messages.at(-1)!.role, "system");
+        assert.equal(messages.at(-1)!.role, "user");
+        assert.deepEqual(messages.at(-1)!.metadata, { sourceRole: "system", kind: "compaction" });
         assert.ok(String(messages.at(-1)!.content).includes("before message 5"));
         return "summary";
       },
@@ -2266,7 +2268,8 @@ process.exit(0);
   assert.equal(seenTranscripts.length, 1, "one summarization call");
   assert.equal(summaryRequest![0].role, "system");
   assert.deepEqual(summaryRequest!.slice(0, -1), originalPrefix, "compaction preserves the entire reply prefix");
-  assert.equal(summaryRequest!.at(-1)!.role, "system");
+  assert.equal(summaryRequest!.at(-1)!.role, "user", "the fold instruction is a user message with the system-provenance metadata");
+  assert.deepEqual(summaryRequest!.at(-1)!.metadata, { sourceRole: "system", kind: "compaction" });
   assert.ok(String(summaryRequest!.at(-1)!.content).startsWith(COMPACTION_SYSTEM_PROMPT));
   assert.ok(String(summaryRequest!.at(-1)!.content).includes("before message 7"), "fold boundary excludes retained entries");
   const transcript = seenTranscripts[0];
@@ -2281,7 +2284,7 @@ process.exit(0);
     ...cOpts, keepMessages: 1, maxTokens: 1, compactionPrompt: "Custom summary",
     summarize: async (msgs) => {
       assert.equal(msgs[0].content, "sys");
-      assert.equal(msgs.at(-1)!.role, "system");
+      assert.equal(msgs.at(-1)!.role, "user");
       const instruction = String(msgs.at(-1)!.content);
       assert.ok(instruction.startsWith(`Custom summary guidance (subject to the phase rules below):\nCustom summary\n\n${COMPACTION_SYSTEM_PROMPT}`));
       assert.ok(instruction.includes("before message 2"), "custom guidance retains the fold boundary");
@@ -2957,6 +2960,7 @@ process.exit(0);
     measuredTokens: 1234,
     entries: [
       ...roundTrip.serialize().entries,
+      { role: "system", content: "legacy exchange instruction", ids: [], ts: 555, exchangeId: "legacy" } as ContextEntry, // a pre-conversion system entry survives the round-trip
       { role: "alien", content: "x", ids: ["bad"] } as unknown as ContextEntry, // unknown role -> skipped
       { role: "user", content: 42, ids: ["bad2"] } as unknown as ContextEntry, // non-string content -> skipped
       { role: "user", content: "survives", ids: "not-an-array" } as unknown as ContextEntry, // bad ids -> skipped
@@ -2965,8 +2969,12 @@ process.exit(0);
   });
   assert.equal(restored.seeded, true);
   assert.equal(restored.getMeasuredTokens(), 1234);
-  assert.deepEqual(restored.snapshot(), [...roundTrip.snapshot(), { role: "assistant", content: "kept calls only", ids: [], ts: 777, attachments: [], toolCalls: [{ id: "x", name: "y", arguments: "z" }] }], "malformed entries skipped, the rest intact");
-  assert.equal(restored.snapshot().length, roundTrip.length + 1);
+  assert.deepEqual(restored.snapshot(), [
+    ...roundTrip.snapshot(),
+    { role: "system", content: "legacy exchange instruction", ids: [], ts: 555, attachments: [], exchangeId: "legacy" },
+    { role: "assistant", content: "kept calls only", ids: [], ts: 777, attachments: [], toolCalls: [{ id: "x", name: "y", arguments: "z" }] },
+  ], "malformed entries skipped, the rest intact");
+  assert.equal(restored.snapshot().length, roundTrip.length + 2);
   ok("context: serialize/restore round-trips the full turn conversation (malformed entries skipped)");
 
   const catchupData = roundTrip.serialize();
@@ -3165,8 +3173,12 @@ process.exit(0);
     await chimeReplyChat(client.chat.bind(client))(sharedContext, undefined, sharedTools.filter(tool => tool.name !== "chime"));
     assert.deepEqual(wireRequests[1].messages.slice(0, wireRequests[0].messages.length), wireRequests[0].messages,
       "the serialized reply extends the complete decision request prefix");
+    const decisionInstruction = String((wireRequests[0].messages.at(-1) as { content: unknown }).content);
+    assert.ok(decisionInstruction.startsWith("[SYSTEM MESSAGE: chime-decision]\n"), "the decision instruction is tagged as a system message on the wire");
+    assert.ok(decisionInstruction.endsWith("\n[/SYSTEM MESSAGE]"), "the tag closes the system instruction");
     assert.deepEqual(wireRequests[0].tools, wireRequests[1].tools);
-    assert.equal(wireRequests[0].tool_choice, wireRequests[1].tool_choice);
+    assert.equal(wireRequests[0].tool_choice, "required", "the decision forces a tool call");
+    assert.equal(wireRequests[1].tool_choice, "auto", "the reply keeps the endpoint default choice");
     assert.equal(wireRequests[0].max_tokens, undefined, "chime omits the output token cap on the wire");
     assert.equal(wireRequests[1].max_tokens, undefined);
     assert.deepEqual(sharedContext.slice(0, originalContext.length), originalContext, "retaining the decision never rewrites earlier context");
@@ -3188,7 +3200,7 @@ process.exit(0);
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
   }
-  ok("chime: serialized decision and reply share full context, tools and tool choice");
+  ok("chime: serialized decision and reply share full context and tools");
 
   // prefixEndIndex counts tool entries the way contextToMessages renders
   // them (a tool entry renders with its result text; a calls-only assistant
@@ -6448,6 +6460,21 @@ process.exit(0);
   assert.equal("reasoning_content" in rtWire[3], false, "tool messages never carry it");
   ok("llm: assistant reasoning round-trips as reasoning_content on the wire");
 
+  // Converted system instructions are tagged on the wire: the model reads
+  // the user message as a system instruction (of the given kind), not user
+  // speech; the metadata rides along and the master prompt stays untagged.
+  await nsClient.chat([
+    { role: "system", content: "master" },
+    systemInstructionMessage("channel-identity", "Channel: id 42"),
+  ]);
+  const tagWire = (seenRequests.at(-1)!.body as Record<string, unknown>).messages as Array<Record<string, unknown>>;
+  assert.equal(tagWire[0].role, "system");
+  assert.equal(tagWire[0].content, "master", "the master prompt stays an untagged system message");
+  assert.equal(tagWire[1].role, "user");
+  assert.equal(tagWire[1].content, "[SYSTEM MESSAGE: channel-identity]\nChannel: id 42\n[/SYSTEM MESSAGE]", "the instruction is tagged as a system message on the wire");
+  assert.deepEqual(tagWire[1].metadata, { sourceRole: "system", kind: "channel-identity" });
+  ok("llm: converted system instructions are tagged as system messages on the wire");
+
   const recoveryClient = new LlmClient({ apiUrl: `${base}/v1/chime-recovery`, apiKey: "none", model: "local", stream: true, timeoutMs: 5000 });
   const account = new TurnTokens();
   const recoveryChat = account.track((messages, callbacks, tools, signal, options) => recoveryClient.chat(messages, callbacks, tools, signal, options));
@@ -6456,7 +6483,7 @@ process.exit(0);
     null);
   const recoveryRequests = seenRequests.slice(requestStart).map(r => r.body as Record<string, unknown>);
   assert.equal(recoveryRequests.length, 1);
-  assert.equal(recoveryRequests[0].tool_choice, "auto");
+  assert.equal(recoveryRequests[0].tool_choice, "required");
   assert.equal(recoveryRequests[0].max_tokens, undefined, "overflow retry preserves the endpoint output limit");
   ok("chime: real HTTP tool rejection stays silent without a text fallback");
 
@@ -6481,14 +6508,15 @@ process.exit(0);
   const prefixBodies = seenRequests.slice(prefixStart).map((r) => r.body as Record<string, unknown>);
   assert.equal(prefixBodies.length, 3);
   const replyBody = prefixBodies[2];
-  for (const body of prefixBodies) {
+  for (const [index, body] of prefixBodies.entries()) {
     assert.deepEqual(body.tools, replyBody.tools, "schema identity holds through actual HTTP serialization");
-    assert.equal(body.tool_choice, "auto");
+    assert.equal(body.tool_choice, index === prefixBodies.length - 1 ? "auto" : "required",
+      "decision and repair force a tool call; the reply keeps the default choice");
     assert.equal(Object.hasOwn(body, "cache_prompt"), false);
     assert.deepEqual((body.messages as unknown[]).slice(0, prefixMessages.length), replyBody.messages,
       "decision, repair and reply preserve the exact serialized conversation prefix");
   }
-  ok("prompt prefix: real HTTP decision, repair and reply retain identical schemas, choice and conversation bytes");
+  ok("prompt prefix: real HTTP decision, repair and reply retain identical schemas and conversation bytes");
 
   // Finish socket teardown before later tests replace clearTimeout with a mock;
   // otherwise Undici's real parser timers cannot be cancelled during close.
@@ -7496,7 +7524,8 @@ process.exit(0);
         refreshChannelIdentity(context, { id, name: "general", guildId, guild: { name: guildName } } as GuildTextBasedChannel);
         const request = await contextToMessages(context, opts);
         assert.equal(request[0].content, "master", "the master prompt stays unchanged");
-        assert.equal(request[1].role, "system");
+        assert.equal(request[1].role, "user", "the channel identity is a user message (only the first system message stays system)");
+        assert.deepEqual(request[1].metadata, { sourceRole: "system", kind: "channel-identity" });
         assert(String(request[1].content).includes(`channels["${id}"]`));
         assert(String(request[1].content).includes(guildName));
         assert.equal(request[2].content, `${dayMarker(1)}\n${timeLabel(1)} Alice: ${text}`);
@@ -7523,7 +7552,9 @@ process.exit(0);
       assert.equal(first.getRevision(), revision, "unchanged labels do not mutate the prompt");
       first.pushUser("Bob", "recent", "recent", 2, []);
       await first.compact(1, async () => "older alpha summary", "recent");
-      assert.equal((await contextToMessages(first, opts))[1].role, "system", "identity survives compaction");
+      const identityAfterCompaction = (await contextToMessages(first, opts))[1];
+      assert.equal(identityAfterCompaction.role, "user", "identity survives compaction");
+      assert.deepEqual(identityAfterCompaction.metadata, { sourceRole: "system", kind: "channel-identity" });
       first.emergencyShrink("recent", 1, "", 10);
       assert.equal(first.getChannelIdentity()!.name, "renamed");
       first.reset();
@@ -7535,6 +7566,18 @@ process.exit(0);
       const legacy = { ...saved.get("101")!, channel: undefined };
       assert.equal(ChannelContext.restore(legacy).getChannelIdentity(), undefined, "legacy stores remain readable");
       assert.equal(ChannelContext.restore(legacy).length, 1);
+      // An exchange persisted with the system role before the conversion
+      // renders as a user message carrying the provenance metadata.
+      const legacyExchange = ChannelContext.restore({
+        seeded: true, summary: null, measuredTokens: null, clearedAt: null,
+        entries: [
+          { role: "user", content: "before the exchange", ids: ["lx"], ts: 1 },
+          { role: "system", content: "Decision complete: no reply to this message.", ids: [], ts: 2, exchangeId: "lx-ex" },
+        ],
+      });
+      const legacyRequest = await contextToMessages(legacyExchange, opts);
+      assert.equal(legacyRequest.at(-1)?.role, "user", "a pre-conversion system entry renders as a user message");
+      assert.deepEqual(legacyRequest.at(-1)?.metadata, { sourceRole: "system", kind: "chime-exchange" });
       ok("channel identity: duplicate names, file/archive persistence, prompt indices, renames, compaction, clear and legacy restore");
     } finally { archive.close(); }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -7619,7 +7662,9 @@ process.exit(0);
     assert.equal(recoverTurns(archive, restored), 2);
     for (const channelId of ["journal", "checkpoint"]) {
       const entries = restored.get(channelId).snapshot();
-      assert.deepEqual(entries.map((entry) => entry.role), ["user", "system", "assistant", "tool", "system"]);
+      assert.deepEqual(entries.map((entry) => entry.role), ["user", "user", "assistant", "tool", "user"], "exchange instructions persist as user messages");
+      assert.deepEqual(entries[1].metadata, { sourceRole: "system", kind: "chime-decision" });
+      assert.deepEqual(entries[4].metadata, { sourceRole: "system", kind: "chime-result" });
       assert.equal(entries[3].toolCallId, "d");
       assert.equal(restored.get(channelId).has("trigger"), true);
     }

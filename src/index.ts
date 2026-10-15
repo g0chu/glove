@@ -13,7 +13,7 @@ import { fetchFreshMessages, reconcileMessageIds } from "./bot/refresh.js";
 import { ChannelActivity } from "./bot/quiet.js";
 import { CLEAR_CONFIRMATION, isClearCommand, isMentionOf, isTrackable, replaceMention } from "./bot/router.js";
 import { ResponseWriter, SAFE_MENTIONS, type PartialGeneration, type PostedReply } from "./bot/writer.js";
-import { LlmClient, InterruptedError, isInterruptedError, type ChatMessage } from "./llm/client.js";
+import { LlmClient, InterruptedError, isInterruptedError, systemInstructionMessage, type ChatMessage } from "./llm/client.js";
 import { ChatPersistence } from "./llm/persist.js";
 import { ConversationArchive } from "./llm/archive.js";
 import { archiveChat } from "./llm/archived-chat.js";
@@ -762,7 +762,7 @@ async function main(): Promise<void> {
                 content: carriedPartial.text,
                 ...(carriedPartial.reasoning !== undefined ? { reasoningContent: carriedPartial.reasoning } : {}),
               },
-              { role: "system", content: interruptionContinuationInstruction() },
+              systemInstructionMessage("interruption-continuation", interruptionContinuationInstruction()),
             ];
             const replyMessages: ChatMessage[] = [
               ...msgs, ...carried, ...carriedRoundMessages,

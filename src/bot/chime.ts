@@ -1,6 +1,6 @@
 import timers from "node:timers/promises";
 import type { ChatMessage, ChatResult, ChatRequestOptions, ToolCall, ToolSpec } from "../llm/client.js";
-import { InterruptedError, isInterruptedError, ModelConnectionError } from "../llm/client.js";
+import { InterruptedError, isInterruptedError, ModelConnectionError, systemInstructionMessage } from "../llm/client.js";
 import { isContextOverflowError } from "../llm/context.js";
 import { errMsg, log, truncate } from "../log.js";
 
@@ -56,7 +56,12 @@ export type ChimeChat = (messages: ChatMessage[], tools?: ToolSpec[], signal?: A
  * other calls accompany it (the retained exchange keeps only the deciding
  * call); only answers without a successful chime call (plain text, reasoning
  * alone, unrelated tools, broken arguments, empty) get the repair retry.
- * Custom guidance supplements the mandatory phase instructions. Unusable answers retry until valid
+ * The decision and its repairs send `tool_choice: "required"`, so the answer
+ * always carries a tool call and a plain-text answer is impossible; a call of a
+ * different tool or broken chime arguments still fail validation and get the repair.
+ * `tool_choice` is a request parameter, not prompt content, so forcing it keeps the
+ * shared serialized prefix (tools + messages) reusable by the YES reply. Custom
+ * guidance supplements the mandatory phase instructions. Unusable answers retry until valid
  * with the same schemas/choice and one replaceable validation reminder, preserving
  * the shared prompt prefix without accumulating rejected responses or instructions.
  * Transient pre-response connection failures get two cancellable delayed retries;
@@ -98,22 +103,23 @@ export async function decideChime(
   const instruction = custom
     ? `Custom guidance for deciding whether to reply (subject to the phase rules below):\n${custom}\n\n${CHIME_SYSTEM_PROMPT}`
     : CHIME_SYSTEM_PROMPT;
-  const messages: ChatMessage[] = [...transcript, { role: "system", content: instruction }];
+  const messages: ChatMessage[] = [...transcript, systemInstructionMessage("chime-decision", instruction)];
   let failure = "";
   let connectionRetries = 0;
   try {
     while (true) {
       if (signal?.aborted) throw new InterruptedError();
-      const requestMessages: ChatMessage[] = failure === "" ? messages : [...messages, {
-        role: "system", content: `Invalid decision: ${failure}. Retry with exactly one chime tool call (boolean respond, short string reason), no chat text or other calls. Keep thinking separate from response text: use reasoning_content or a closed marked thought block.`,
-      }];
+      const requestMessages: ChatMessage[] = failure === "" ? messages : [...messages, systemInstructionMessage(
+        "chime-repair",
+        `Invalid decision: ${failure}. Retry with exactly one chime tool call (boolean respond, short string reason), no chat text or other calls. Keep thinking separate from response text: use reasoning_content or a closed marked thought block.`,
+      )];
       let res: ChatResult;
       try {
         res = await chat(
           requestMessages,
           tools,
           signal,
-          { toolChoice: "auto" },
+          { toolChoice: "required" },
         );
       } catch (err) {
         if (signal?.aborted) throw new InterruptedError();
@@ -148,9 +154,9 @@ export async function decideChime(
           // would be invalid.
           { role: "assistant", content: res.content, reasoningContent: res.reasoning, toolCalls: [validation.call] },
           { role: "tool", name: CHIME_TOOL_NAME, toolCallId: validation.call.id, content: JSON.stringify(decision) },
-          { role: "system", content: decision.respond
+          systemInstructionMessage("chime-result", decision.respond
             ? "Decision complete: a separate request may now reply to this message."
-            : "Decision complete: no reply to this message. Later requests are independent." },
+            : "Decision complete: no reply to this message. Later requests are independent."),
         ]);
         return decision;
       }

@@ -46,7 +46,9 @@ output limits, model request wiring, and archive lifecycle.
 All schemas use object parameters with `additionalProperties: false`. The schema
 regression checks unique names, declared required fields, descriptions, and the
 four explicit Wikipedia modes across all 13 tools. Tool specs are sent as OpenAI
-function objects with `tool_choice: "auto"`; they do not enable strict structured
+function objects with `tool_choice: "auto"` (replies and compaction; chime
+decisions force `"required"` so the answer always carries a tool call); they do not
+enable strict structured
 outputs, which many compatible endpoints do not support.
 
 The registry validates the argument JSON object and invokes each tool's argument

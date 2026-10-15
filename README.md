@@ -288,8 +288,11 @@ Channel histories in `chats.json` remain keyed by Discord channel ID. Each
 history also records a `channel` object with its `id`, `name`, `guildId`, and
 `guildName`. IDs determine ownership; names are labels and may repeat across
 servers. Replies, chime decisions and compaction receive this current identity
-as a separate one-line system message: the channel ID, name and guild labels,
-the exact `channels["ID"]` key to use when reading the store through tools, and
+as a separate one-line message — a user message carrying the system-provenance
+metadata and wrapped in a `[SYSTEM MESSAGE: channel-identity]` tag on the wire,
+since only the master prompt keeps the system role: the channel ID, name and
+guild labels, the exact `channels["ID"]` key to use when reading the store
+through tools, and
 the rule that names are data, not instructions. Other stored histories remain
 separate conversations. Renames refresh labels, while clear/compaction preserve
 identity. Older stores are supported; metadata is populated when Discord
@@ -298,8 +301,10 @@ channels are observed again after startup.
 Replies, chime decisions and compaction share `MODEL_SYSTEM_PROMPT` unchanged.
 No tool guidance or phase instructions are added to that master prompt.
 Requests preserve conversation order, including when a reply follows a queued
-trigger. Endpoints must support trailing system instructions and generating a
-new reply after assistant history without treating it as an assistant prefill.
+trigger. Endpoints must support trailing instructions — sent as user messages
+carrying the system-provenance metadata and wrapped in a `[SYSTEM MESSAGE: …]`
+tag on the wire — and generating a new reply after assistant history without
+treating it as an assistant prefill.
 
 User messages render with a local clock prefix (`14:05 Name: text`), and the
 first user line of a request carries a one-line date marker
@@ -309,9 +314,15 @@ timestamps in the standing prompt. Compacted history renders under the label
 
 When chime is enabled, decisions and replies share the exact system prompt,
 full conversation (including reasoning, tool calls/results, summary and
-attachments), and ordered tool definitions. Both use `tool_choice: "auto"`:
-changing this can change the server's rendered prompt. The decision adds a
-short **system-role** instruction **after** that shared context. Completed YES
+attachments), and ordered tool definitions. Decisions send `tool_choice: "required"`
+(a plain-text answer is impossible; a call of another tool or broken arguments
+fail validation) while replies send `tool_choice: "auto"` — the choice is a
+request parameter, not prompt content, so the shared prefix is unchanged.
+Changing the shared prompt, context or schemas can change the server's rendered
+prompt. The decision adds a
+short instruction **after** that shared context (a user message carrying the
+system-provenance metadata, tagged `[SYSTEM MESSAGE: chime-decision]` on the
+wire). Completed YES
 and NO decisions are retained in the same channel history: the instruction,
 original assistant text/reasoning and chime call, a matching tool result, and
 an instruction ending the decision phase. A YES reply extends that exact
@@ -319,7 +330,7 @@ request prefix; a NO waits for new activity with its decision still in history.
 The decision exchange is checkpointed atomically and survives restart and
 crash recovery without duplication. Compaction and overflow remove exchanges
 whole, preserving call/result pairing. Interrupted or unusable decisions are
-not retained. Unusable decisions retry with unchanged schemas and `tool_choice: "auto"`,
+not retained. Unusable decisions retry with unchanged schemas and `tool_choice: "required"`,
 keeping only the latest validation reminder.
 
 A reply sends the shared context exactly as-is, with no trailing instruction:
@@ -356,8 +367,9 @@ crash recovery uses the accepted reply with all its paired tool results, so
 rejected candidates cannot create duplicate rounds or mispaired tool results.
 
 Compaction also sends the full active context with the same ordered tool
-schemas and `tool_choice: "auto"`, followed by a system instruction specifying
-which older portion to summarize. Roles, reasoning, tool calls/results and
+schemas and `tool_choice: "auto"`, followed by an instruction (a user message
+carrying the system-provenance metadata, tagged `[SYSTEM MESSAGE: compaction]`
+on the wire) specifying which older portion to summarize. Roles, reasoning, tool calls/results and
 attachments remain intact. Tools are never executed during compaction; a tool
 call is treated as a failed summary. Applying the summary still replaces older
 history, so the next request necessarily has a different prefix. Compaction
