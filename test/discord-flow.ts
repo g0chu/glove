@@ -219,9 +219,17 @@ async function run(): Promise<void> {
     }
     assert.equal(noMention.at(-1)?.role, "user", "the reply request is the shared context; the trigger is its newest message");
     assert(String(noMention.at(-1)?.content).includes("@Glove answer after NO"));
+    // An edit no longer interrupts the decision: it is synced into the
+    // context while the decision runs. Only a new message aborts it — and
+    // that newer message's own turn supersedes the decision, deciding over
+    // the still conversation with the synced edit in context.
     duringChat = async (signal) => {
       const ambient = history.get("200")!;
       edit(ambient, "edited during chime decision");
+      await ticks();
+      assert.equal(signal?.aborted, false, "an edit no longer interrupts the decision");
+      create("320", "a newer ambient interrupts the decision");
+      await ticks();
       assert(signal?.aborted);
       throw new InterruptedError();
     };
@@ -230,7 +238,7 @@ async function run(): Promise<void> {
     await advance(200);
     assert.equal(requests.length, 3, "the interrupted decision produces no reply");
     await advance(200);
-    assert.equal(requests.length, 5, "a fresh YES decision runs one reply");
+    assert.equal(requests.length, 5, "the newer turn's YES decision runs one reply");
     if (process.env.FLOW_MODE === "gemma") {
       assert.equal(requests.at(-1)!.filter(message => message.reasoningContent).length, 1, "only the current YES thoughts extend into the reply");
       assert.equal(requests.at(-1)!.find(message => message.reasoningContent)?.reasoningContent, "decision reasoning");
@@ -262,22 +270,29 @@ async function run(): Promise<void> {
     assert(String(afterYes.at(-1)?.content).includes("@Glove answer after interrupted YES"));
     duringChat = async () => {
       duringChat = async (signal) => {
-        // A content change (an edit — no new user entry, so the turn is not
-        // superseded) interrupts the in-flight reply.
+        // The edit in flight is synced without interrupting; only the new
+        // message aborts the reply. The newer message's own turn then
+        // supersedes the interrupted chime and answers over the retained
+        // decision history.
         edit(history.get("200")!, "edited while the reply was in flight");
+        await ticks();
+        assert.equal(signal?.aborted, false, "an edit no longer interrupts the reply");
+        create("750", "a newer ambient interrupts the reply");
+        await ticks();
         assert(signal?.aborted);
         throw new InterruptedError();
       };
       return { content: "", toolCalls: [{ id: "retry-yes", name: "chime", arguments: '{"respond":true,"reason":"continue"}' }] };
     };
-    create("700", "ambient reply interrupted by an edit");
+    create("700", "ambient reply interrupted by a newer message");
     await advance(200);
     assert.equal(requests.length, 11);
     await advance(9999);
-    assert.equal(requests.length, 13, "an interruption retries the YES turn over retained history");
+    assert.equal(requests.length, 13, "the newer turn answers over the retained decision history");
     const retriedYes = requests.at(-1)!;
-    assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")));
-    assert(retriedYes.some((m) => String(m.content).includes("ambient reply interrupted by an edit")));
+    assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")), "the interrupted turn's YES decision stays in history");
+    assert(retriedYes.some((m) => String(m.content).includes("edited while the reply was in flight")), "the edit reached the model without an interruption");
+    assert(retriedYes.some((m) => String(m.content).includes("a newer ambient interrupts the reply")));
     if (process.env.FLOW_MODE === "gemma") {
       const count = requests.length;
       duringChat = async () => {
@@ -297,6 +312,10 @@ async function run(): Promise<void> {
       duringChat = async () => {
         duringChat = async signal => {
           edit(history.get("200")!, "edited during the tool round");
+          await ticks();
+          assert.equal(signal?.aborted, false, "an edit no longer interrupts the tool round");
+          create("950", "a newer ambient interrupts the tool round");
+          await ticks();
           assert(signal?.aborted);
           duringChat = async () => {
             assert(requests.at(-1)!.some(message => message.reasoningContent === "retained tool reasoning"),
@@ -341,40 +360,50 @@ async function run(): Promise<void> {
   assert.equal(requests.length, 1);
   assert(!entries().some((e) => e.ids.includes("300")));
 
-  // Gateway activity invalidates a REST snapshot before it can overwrite edits.
+  // An edit that lands during the pre-turn REST catch-up is synced by its
+  // gateway event; it does not interrupt the model, and it restarts the
+  // stillness wait — the attempt answers over the updated text once the
+  // channel is still again.
   pageHook = async () => { streamed = edit(streamed, "newer gateway result"); };
   create("400", "<@bot> check fresh data");
   await advance(200);
-  assert.equal(requests.length, 1, "activity during REST prevents generation");
+  assert.equal(requests.length, 1, "an edit during the REST catch-up holds the stillness wait without interrupting");
   await advance(200);
   assert.equal(requests.length, 2);
   assert(prompt().includes("newer gateway result"));
   assert(!prompt().includes("final streamed result"));
 
-  // An edit during generation aborts the attempt; its retry sees updated
-  // history and carries the interrupted partial generation over, with a
-  // meta instruction keeping the model locked in with reality.
+  // An edit during generation does not abort the attempt (the model keeps
+  // generating, and the edit is synced into the context); only a new
+  // message interrupts. The retry sees the edit and the message and carries
+  // the interrupted partial generation over, with a meta instruction keeping
+  // the model locked in with reality.
   duringChat = async (signal, callbacks) => {
-    callbacks?.onDelta?.("partial answer before the edit");
-    callbacks?.onReasoning?.("partial thinking before the edit");
+    callbacks?.onDelta?.("partial answer before the interruption");
+    callbacks?.onReasoning?.("partial thinking before the interruption");
     streamed = edit(streamed, "edited during generation");
+    await ticks();
+    assert.equal(signal?.aborted, false, "an edit no longer interrupts the model");
+    create("550", "a new message interrupts the reply");
+    await ticks();
     assert(signal?.aborted);
     throw new InterruptedError();
   };
-  create("500", "<@bot> wait for the edit");
+  create("500", "<@bot> wait for the interruption");
   await advance(200);
   assert.equal(requests.length, 3);
   await advance(200);
   assert.equal(requests.length, 4);
   assert(prompt().includes("edited during generation"));
+  assert(prompt().includes("a new message interrupts the reply"));
   const retryPrompt = requests.at(-1)!;
-  const partialIndex = retryPrompt.findIndex((m) => m.role === "assistant" && String(m.content).includes("partial answer before the edit"));
+  const partialIndex = retryPrompt.findIndex((m) => m.role === "assistant" && String(m.content).includes("partial answer before the interruption"));
   assert(partialIndex !== -1, "the partial generation is carried into the retry");
-  assert.equal(retryPrompt[partialIndex].reasoningContent, "partial thinking before the edit", "the partial thinking travels with the carried partial");
+  assert.equal(retryPrompt[partialIndex].reasoningContent, "partial thinking before the interruption", "the partial thinking travels with the carried partial");
   const metaIndex = retryPrompt.findIndex((m) => m.role === "user" && m.metadata?.kind === "interruption-continuation" && String(m.content).includes("interrupted by activity"));
   assert.equal(metaIndex, partialIndex + 1, "the meta continuation instruction follows the carried partial");
   assert(!entries().some((e) => e.content === "answer 3"));
-  assert(!entries().some((e) => String(e.content).includes("partial answer before the edit")), "the carried partial stays out of the persisted context");
+  assert(!entries().some((e) => String(e.content).includes("partial answer before the interruption")), "the carried partial stays out of the persisted context");
 
   // A partial update holds the earlier gate until complete REST data returns.
   oneHook = () => new Promise<void>((resolve) => { release = resolve; });

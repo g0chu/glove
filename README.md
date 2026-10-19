@@ -253,7 +253,7 @@ and/or `MEMORYTOOLS_ENABLED=true` in `.env` and restart the bot.
 
 ## Message reactions
 
-The model sees each message's current emoji reactions, with readable emoji names and counts. Adds, removals and clearing reactions update the stored conversation, including reactions on the bot's replies and uncached older messages. Reaction changes interrupt an active model request so it can rebuild from the updated context; they do not queue a new reply by themselves. Startup catch-up and the pre-turn refresh also reconcile reactions on every retained Discord message, and fetched channel history includes existing reactions. Cleared, deleted or compacted messages are not resurrected by reactions.
+The model sees each message's current emoji reactions, with readable emoji names and counts. Adds, removals and clearing reactions update the stored conversation, including reactions on the bot's replies and uncached older messages. Reaction changes restart the channel's stillness wait without interrupting an active model request; they do not queue a new reply by themselves. Startup catch-up and the pre-turn refresh also reconcile reactions on every retained Discord message, and fetched channel history includes existing reactions. Cleared, deleted or compacted messages are not resurrected by reactions.
 
 With `MODEL_ENABLE_IMAGES=true`, reaction pictures are included even on messages outside the attachment image window. Custom emoji use a static first-frame PNG from Discord's CDN; standard emoji use [Twemoji](https://github.com/jdecked/twemoji) artwork (CC BY 4.0) from a fixed GitHub source. Each picture is labeled with its emoji name and message ID. Downloads have a 10-second deadline, reject redirects and respect `MODEL_IMAGES_MAX_BYTES`; unavailable pictures leave a note. Names/counts remain visible with images disabled. Rendered pictures and download failures persist across restarts. Unicode names come from Unicode 16.0, under the [Unicode data license](src/bot/UNICODE-LICENSE.txt).
 
@@ -432,9 +432,12 @@ previous decision stays scoped to its original message.
 
 ### Channel activity interruptions
 
-Typing, new messages, edits and deletions from other users or bots immediately
-interrupt the active model request during prompt processing, reasoning or reply
-text. Partial replies are withdrawn from the channel, and the interrupted
+A new message from another user or bot immediately interrupts the active
+model request during prompt processing, reasoning or reply text. Edits,
+deletions, reactions and renames do not interrupt: they restart the channel's
+stillness wait, the model finishes over the pre-change text, and the change is
+synced into the context for the next turn (or the retry, when a newer message
+interrupts the attempt). Partial replies are withdrawn from the channel, and the interrupted
 partial generation — the reply text and thinking the model had streamed — is
 carried into the retry's prompt as an assistant message plus a meta
 continuation instruction (the partial was never delivered, the conversation is

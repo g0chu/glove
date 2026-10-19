@@ -964,8 +964,9 @@ process.exit(0);
   // The channel-activity tracker (driven with an injected clock and sleeper
   // — no real waiting): a channel is quiet once it has been unchanged for
   // the window, a change while waiting restarts the window, and a running
-  // turn watches the channel to abort its in-flight model request on any
-  // change (the prompt-interruption feature, see index.ts).
+  // turn watches the channel to abort its in-flight model request on a new
+  // message — the only interrupting event (edits, deletions and the like
+  // restart the stillness wait without interrupting, see index.ts).
   const makeClock = () => {
     let t = 1000;
     const sleepers: Array<() => void> = [];
@@ -1054,6 +1055,34 @@ process.exit(0);
     assert.equal(self, 1);
   }
   ok("quiet: watchers fire per channel and unsubscribe cleanly");
+
+  // A change that is not a new message (an edit, a deletion, a reaction, a
+  // rename — touch) restarts the stillness window but does NOT fire the
+  // watcher: only a new message from another user interrupts a running
+  // model request. Every note and touch bumps the channel's epoch, so the
+  // pre-turn refresh detects gateway activity that raced its in-flight
+  // REST snapshot.
+  {
+    const clock = makeClock();
+    const a = new ChannelActivity({ now: clock.now, sleep: clock.sleep });
+    let fired = 0;
+    a.watch("c1", () => fired++);
+    assert.equal(a.epochOf("c1"), 0, "an unseen channel has epoch 0");
+    a.touch("c1"); // a change that is not a new message at t=1000
+    assert.equal(fired, 0, "a touch does not fire the watcher");
+    assert.equal(a.epochOf("c1"), 1, "a touch bumps the epoch");
+    const p = a.waitForQuiet("c1", 5000); // the first window sleeps to t=6000
+    a.note("c1"); // a new message while the wait is pending: restart
+    assert.equal(fired, 1, "a note fires the watcher");
+    await clock.wake(); // the first sleep elapses; the tracker sees the newer change
+    assert.equal(clock.now(), 11000, "the window restarted at the newest change (6000 + 5000)");
+    await clock.wake(); // the restarted window elapses
+    await p;
+    a.touch("c2");
+    await a.waitForQuiet("c2", 0); // zero window: quiet immediately once the change is noted
+    assert.equal(a.epochOf("c2"), 1, "the epoch counts touches too");
+  }
+  ok("quiet: touch restarts the stillness wait without firing watchers; the epoch counts every note and touch");
 
   // clearChannel forgets one channel (state and watchers); clear() forgets
   // everything (a deleted channel's turn must not keep waiting).

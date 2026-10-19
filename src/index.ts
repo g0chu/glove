@@ -353,8 +353,10 @@ async function main(): Promise<void> {
     }
   };
 
-  // Other users' and bots' activity cancels every model phase. Retrying
-  // waits for stillness and rebuilds the conversation from a fresh snapshot.
+  // A new message from another user or bot cancels every model phase
+  // (edits, deletions and the like restart the stillness wait but let the
+  // model finish). Retrying waits for stillness and rebuilds the
+  // conversation from a fresh snapshot.
   const channelActivity = new ChannelActivity();
 
   /**
@@ -366,15 +368,17 @@ async function main(): Promise<void> {
    * part of the context, so edits that happened while the turn was queued
    * are picked up automatically.
    *
-   * The turn runs in attempts. Messages, edits, deletions and typing from
-   * other users/bots cancel prompt processing, reasoning and reply text.
-   * The partial reply is withdrawn from the channel, and the attempt's
-   * partial generation (the text and thinking it streamed) is carried into
-   * the retried attempt's prompt as an assistant message plus a meta
-   * continuation instruction (the partial was never delivered; the
-   * conversation above it is the channel's current state). Completed tool
-   * rounds are checkpointed under a durable attempt identity, then the
-   * turn waits for stillness.
+   * The turn runs in attempts. A new message from another user or bot
+   * cancels prompt processing, reasoning and reply text (edits and
+   * deletions do not — the model finishes over the pre-change text and the
+   * change is synced into the context for the next turn or the retry;
+   * typing is not activity at all). The partial reply is withdrawn from
+   * the channel, and the attempt's partial generation (the text and
+   * thinking it streamed) is carried into the retried attempt's prompt as
+   * an assistant message plus a meta continuation instruction (the partial
+   * was never delivered; the conversation above it is the channel's current
+   * state). Completed tool rounds are checkpointed under a durable attempt
+   * identity, then the turn waits for stillness.
    * A newer queued mention supersedes an older mention; a newer committed
    * user entry supersedes a chime. Otherwise a fresh attempt sees updated
    * context and completed tool results without replaying earlier rounds.
@@ -448,8 +452,10 @@ async function main(): Promise<void> {
         };
         // Per-attempt state: a fresh writer (a previous attempt's partial
         // reply has been withdrawn), a fresh activity poster, a fresh round
-        // record, and a fresh abort controller — any channel activity while
-        // the attempt is running aborts its in-flight model request.
+        // record, and a fresh abort controller — a new message from another
+        // user while the attempt is running aborts its in-flight model
+        // request (edits and deletions restart the stillness wait but let
+        // the model finish).
         const writer = new ResponseWriter({
           channel,
           typingIntervalMs: cfg.discord.typingIntervalMs,
@@ -466,9 +472,10 @@ async function main(): Promise<void> {
         // for the next compaction check. The reply rounds stream into
         // the writer; the compaction summarizer and the chime decision use
         // a plain wrapper on the same account (their text is never posted).
-        // Channel activity cancels prompt processing, reasoning and reply
-        // generation. Completed tools are retained before a fresh attempt
-        // rebuilds the conversation; unstarted tools are skipped.
+        // A new message from another user cancels prompt processing,
+        // reasoning and reply generation. Completed tools are retained
+        // before a fresh attempt rebuilds the conversation; unstarted tools
+        // are skipped.
         const sharedTools = cfg.discord.chimeEnabled ? chimeTools(tools.registry.specs()) : tools.registry.specs();
         const measuredReplyChat: ChatFn = tokens.track(
           (msgs, _cbs, t, signal, options) =>
@@ -513,18 +520,25 @@ async function main(): Promise<void> {
           archive.record("catchup.started", { channelId }, { after });
           // Settled IDs were just observed by the catch-up (or via the
           // gateway this process) — the page alone is the fresh part.
+          const epochBefore = channelActivity.epochOf(channelId);
           const fresh = await fetchFreshMessages(trackedIds,
             async (before) => [...(await textChannel.messages.fetch({ limit: 100, before, cache: false })).values()],
             (id) => textChannel.messages.fetch({ message: id, force: true, cache: false }), attemptController.signal, after,
             (id) => settledIds.has(id));
           if (stopping || deletedChannelIds.has(channelId)) return;
-          // A gateway event wins over every observation in an in-flight snapshot.
+          // A new message that raced the snapshot fires the watcher and
+          // aborts the attempt; an edit, deletion or reaction that raced it
+          // already synced its newer state into the context, and the
+          // snapshot (taken before the gateway event) must not overwrite
+          // that newer state — the tracked-ID observations are skipped this
+          // attempt (the next attempt, or the gateway, carries them on).
+          const raced = channelActivity.epochOf(channelId) !== epochBefore;
           if (attemptController.signal.aborted) throw new InterruptedError();
           for (const id of fresh.deleted) {
             archive.record("discord.deleted", { channelId, messageId: id }, { source: "refresh" });
             gate.drop(id);
             context.removeById(id);
-            channelActivity.note(channelId);
+            channelActivity.touch(channelId);
           }
           const refreshBot = client.user;
           if (!refreshBot) return;
@@ -533,11 +547,12 @@ async function main(): Promise<void> {
             if (!context.has(message.id) && !isTrackable(message, refreshBot.id, cfg.discord.guildId)) continue;
             settledIds.add(message.id);
             if (context.has(message.id)) {
+              if (raced) continue; // a gateway event is newer than this snapshot
               // Only a changed observation is new to the archive: the page
               // re-fetches the channel's newest messages on every attempt.
               if (syncMessageUpdate(context, message, refreshBot.id, refreshBot.username)) {
                 archiveMessage(message, "refresh");
-                channelActivity.note(channelId);
+                channelActivity.touch(channelId);
               }
             } else {
               archiveMessage(message, "refresh");
@@ -941,10 +956,12 @@ async function main(): Promise<void> {
             //   ambient message does NOT supersede a mention turn: with
             //   chime off it queued no turn, and with chime on its decision
             //   may stay silent — the mention must still be answered.
-            //   not superseded -> retried. The interruption carried no new
-            //   message (an edit, a typing indicator), so nothing else will
-            //   answer: the next attempt's freshly built context carries
-            //   everything that arrived or changed while we waited.
+            //   not superseded -> retried. The interruption always comes
+            //   from a new message (edits and deletions no longer
+            //   interrupt); a mention turn is not superseded by a newer
+            //   ambient message, so the mention must still be answered:
+            //   the next attempt's freshly built context carries everything
+            //   that arrived or changed while we waited.
             const supersededBy = turn.chime
               ? context.newestUserEntryAfter(turn.id)
               : queues.get(channelId).newestPendingMentionAfter(turn.id, (id) => context.has(id));
@@ -1179,9 +1196,9 @@ async function main(): Promise<void> {
     }
     if (!isTrackable(message, botId, cfg.discord.guildId)) return;
     gate.arrive(message);
-    // A new message is a change in the channel: it interrupts a running
-    // turn's model request and restarts its quiet wait (see
-    // ChannelActivity).
+    // A new message from another user is the only channel event that
+    // interrupts a running turn's model request; it also restarts the
+    // stillness wait (see ChannelActivity).
     const channelId = message.channel?.id;
     if (channelId) channelActivity.note(channelId, !message.author.bot && isMentionOf(message, botId));
   });
@@ -1221,7 +1238,9 @@ async function main(): Promise<void> {
             const conv = conversationFor(channelId);
             if (conv) syncMessageUpdate(conv, fresh, botId, botUser.username);
           }
-          if (fresh.author.id !== botId) channelActivity.note(channelId);
+          // An edit is not a new message: it restarts the stillness wait
+          // without interrupting a running model request.
+          if (fresh.author.id !== botId) channelActivity.touch(channelId);
         }).catch((err) => {
           if (stopping || deletedChannelIds.has(channelId)) return;
           if ((err as { code?: unknown }).code === 10008) {
@@ -1238,13 +1257,16 @@ async function main(): Promise<void> {
       const conv = conversationFor(channelId);
       if (conv) syncMessageUpdate(conv, message, botId, botUser.username);
     }
-    // An edit is a change in the channel: it interrupts a running turn's
-    // model request and restarts its quiet wait (see ChannelActivity).
-    // The note comes after the gate refresh, so a still-pending message
-    // commits a hair before the quiet wait can resolve — the retry's
-    // context carries it.
+    // An edit is a change in the channel, but not a new message: it
+    // restarts the stillness wait (a chime must still decide over a still
+    // conversation) without interrupting a running model request — the
+    // model finishes over the pre-edit text, and the synced edit reaches
+    // the context for the next turn (or the retry, when a newer message
+    // interrupts the attempt). The touch comes after the gate refresh, so
+    // a still-pending message commits a hair before the quiet wait can
+    // resolve — the retry's context carries it.
     if (message.author?.id !== botId) {
-      channelActivity.note(channelId, gate.isPending(message.id) && !!message.author && !message.author.bot && isMentionOf(message, botId));
+      channelActivity.touch(channelId);
     }
   });
 
@@ -1256,7 +1278,9 @@ async function main(): Promise<void> {
     const channelId = message.channelId;
     noteLiveMessage(message.id);
     const external = userId !== client.user?.id;
-    if (external) channelActivity.note(channelId);
+    // A reaction is not a new message: it restarts the stillness wait
+    // without interrupting a running model request.
+    if (external) channelActivity.touch(channelId);
     archive.record("discord.reaction", { channelId, messageId: message.id }, { source, userId, emoji });
     const clearedAt = contexts.get(channelId).getClearedAt();
     const previous = reactionTasks.get(message.id) ?? Promise.resolve();
@@ -1280,7 +1304,7 @@ async function main(): Promise<void> {
         if (seed) context.seedFrom([seed], undefined, false);
       }
       context.updateReactions(fresh.id, snapshotReactions(fresh));
-      if (external) channelActivity.note(channelId);
+      if (external) channelActivity.touch(channelId);
     }).catch((err) => { log.warn(`could not refresh message reactions: ${errMsg(err)}`); });
     reactionTasks.set(message.id, task);
     activeTurns.add(task);
@@ -1319,7 +1343,9 @@ async function main(): Promise<void> {
     if (message.channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || message.guildId === cfg.discord.guildId)) {
       noteLiveMessage(message.id);
       archive.record("discord.deleted", { channelId, messageId: message.id }, {});
-      if (message.author?.id !== client.user?.id) channelActivity.note(channelId);
+      // A deletion is not a new message: it restarts the stillness wait
+      // without interrupting a running model request.
+      if (message.author?.id !== client.user?.id) channelActivity.touch(channelId);
     }
     gate.drop(message.id);
     conversationFor(channelId)?.removeById(message.id);
@@ -1332,7 +1358,7 @@ async function main(): Promise<void> {
       if (channel.type === ChannelType.GuildText && (cfg.discord.guildId === "" || channel.guildId === cfg.discord.guildId)) {
         noteLiveMessage(m.id);
         archive.record("discord.deleted", { channelId: channel.id, messageId: m.id }, { bulk: true });
-        if (m.author?.id !== client.user?.id) channelActivity.note(channel.id);
+        if (m.author?.id !== client.user?.id) channelActivity.touch(channel.id);
       }
       gate.drop(m.id);
       conv?.removeById(m.id);
@@ -1340,17 +1366,20 @@ async function main(): Promise<void> {
   });
 
   // Renames change identity labels, not history ownership or message order.
+  // Renames are not new messages: they refresh the identity label and
+  // restart the stillness wait without interrupting a running model
+  // request.
   client.on("channelUpdate", (_oldChannel, channel) => {
     if (stopping || channel.type !== ChannelType.GuildText || !contexts.has(channel.id)) return;
     refreshChannelIdentity(contexts.get(channel.id), channel);
-    channelActivity.note(channel.id);
+    channelActivity.touch(channel.id);
   });
   client.on("guildUpdate", (_oldGuild, guild) => {
     if (stopping) return;
     for (const channel of guild.channels.cache.values()) {
       if (channel.type !== ChannelType.GuildText || !contexts.has(channel.id)) continue;
       refreshChannelIdentity(contexts.get(channel.id), channel);
-      channelActivity.note(channel.id);
+      channelActivity.touch(channel.id);
     }
   });
 
@@ -1359,6 +1388,9 @@ async function main(): Promise<void> {
   client.on("channelDelete", (channel) => {
     if (stopping) return;
     deletedChannelIds.add(channel.id);
+    // The channel is gone: a running turn must stop now, so this one
+    // remains a note (its watcher aborts the in-flight request) even
+    // though a deletion is not a new message.
     channelActivity.note(channel.id);
     if (archive.messageCursors().has(channel.id) || contexts.has(channel.id)) archive.record("channel.deleted", { channelId: channel.id }, {});
     contexts.clear(channel.id);
