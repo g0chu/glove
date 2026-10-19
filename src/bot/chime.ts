@@ -4,12 +4,12 @@ import { InterruptedError, isInterruptedError, ModelConnectionError, systemInstr
 import { isContextOverflowError } from "../llm/context.js";
 import { errMsg, log, truncate } from "../log.js";
 
-/** Decision instructions appended AFTER the shared chat context for prefix reuse. */
+/** Decision instructions appended AFTER the shared chat context for prefix reuse, as plain sentences in the imperative. */
 export const CHIME_SYSTEM_PROMPT =
-  "[CHIME] Chime decision: decide whether to join the conversation after the newest user-role message (a Discord participant, possibly a bot). " +
+  "Decide whether to join the conversation after the newest user-role message (a Discord participant, possibly a bot). " +
   "Use the surrounding conversation. " +
-  "Return exactly one chime tool call with boolean respond and a short string reason about whether a reply is useful. " +
-  "No chat text or other tool calls; JSON in text is not a tool call. Even respond=true leaves the answer to a separate reply request.";
+  "Return exactly one chime tool call with a boolean respond and a short string reason about whether a reply is useful. " +
+  "Do not return chat text or other tool calls; JSON in text is not a tool call. Even respond=true leaves the answer to a separate reply request.";
 
 /** Keep tool definitions and their order identical across decision and reply requests. */
 export function chimeTools(tools: ToolSpec[]): ToolSpec[] {
@@ -111,7 +111,7 @@ export async function decideChime(
       if (signal?.aborted) throw new InterruptedError();
       const requestMessages: ChatMessage[] = failure === "" ? messages : [...messages, systemInstructionMessage(
         "chime-repair",
-        `Invalid decision: ${failure}. Retry with exactly one chime tool call (boolean respond, short string reason), no chat text or other calls. Keep thinking separate from response text: use reasoning_content or a closed marked thought block.`,
+        `Invalid decision: ${failure}. Retry with exactly one chime tool call (boolean respond, short string reason), no chat text or other calls.`,
       )];
       let res: ChatResult;
       try {

@@ -3203,8 +3203,7 @@ process.exit(0);
     assert.deepEqual(wireRequests[1].messages.slice(0, wireRequests[0].messages.length), wireRequests[0].messages,
       "the serialized reply extends the complete decision request prefix");
     const decisionInstruction = String((wireRequests[0].messages.at(-1) as { content: unknown }).content);
-    assert.ok(decisionInstruction.startsWith("[SYSTEM MESSAGE: chime-decision]\n"), "the decision instruction is tagged as a system message on the wire");
-    assert.ok(decisionInstruction.endsWith("\n[/SYSTEM MESSAGE]"), "the tag closes the system instruction");
+    assert.equal(decisionInstruction, CHIME_SYSTEM_PROMPT, "the decision instruction is a plain untagged sentence on the wire");
     assert.deepEqual(wireRequests[0].tools, wireRequests[1].tools);
     assert.equal(wireRequests[0].tool_choice, "required", "the decision forces a tool call");
     assert.equal(wireRequests[1].tool_choice, "auto", "the reply keeps the endpoint default choice");
@@ -6489,20 +6488,20 @@ process.exit(0);
   assert.equal("reasoning_content" in rtWire[3], false, "tool messages never carry it");
   ok("llm: assistant reasoning round-trips as reasoning_content on the wire");
 
-  // Converted system instructions are tagged on the wire: the model reads
-  // the user message as a system instruction (of the given kind), not user
-  // speech; the metadata rides along and the master prompt stays untagged.
+  // Converted system instructions are plain user messages on the wire: a
+  // normal sentence in the imperative, no tag; the provenance metadata rides
+  // along and the master prompt stays an untagged system message.
   await nsClient.chat([
     { role: "system", content: "master" },
-    systemInstructionMessage("channel-identity", "Channel: id 42"),
+    systemInstructionMessage("channel-identity", "Identify this channel by its ID, 42, not its name."),
   ]);
-  const tagWire = (seenRequests.at(-1)!.body as Record<string, unknown>).messages as Array<Record<string, unknown>>;
-  assert.equal(tagWire[0].role, "system");
-  assert.equal(tagWire[0].content, "master", "the master prompt stays an untagged system message");
-  assert.equal(tagWire[1].role, "user");
-  assert.equal(tagWire[1].content, "[SYSTEM MESSAGE: channel-identity]\nChannel: id 42\n[/SYSTEM MESSAGE]", "the instruction is tagged as a system message on the wire");
-  assert.deepEqual(tagWire[1].metadata, { sourceRole: "system", kind: "channel-identity" });
-  ok("llm: converted system instructions are tagged as system messages on the wire");
+  const plainWire = (seenRequests.at(-1)!.body as Record<string, unknown>).messages as Array<Record<string, unknown>>;
+  assert.equal(plainWire[0].role, "system");
+  assert.equal(plainWire[0].content, "master", "the master prompt stays an untagged system message");
+  assert.equal(plainWire[1].role, "user");
+  assert.equal(plainWire[1].content, "Identify this channel by its ID, 42, not its name.", "the instruction is a plain untagged sentence on the wire");
+  assert.deepEqual(plainWire[1].metadata, { sourceRole: "system", kind: "channel-identity" });
+  ok("llm: converted system instructions are plain untagged user messages on the wire");
 
   const recoveryClient = new LlmClient({ apiUrl: `${base}/v1/chime-recovery`, apiKey: "none", model: "local", stream: true, timeoutMs: 5000 });
   const account = new TurnTokens();

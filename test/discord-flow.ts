@@ -202,7 +202,7 @@ async function run(): Promise<void> {
     assert.deepEqual(requests[0][1].metadata, { sourceRole: "system", kind: "channel-identity" });
     assert(String(requests[0][1].content).includes('channels["channel"]'));
     assert(String(requests[0][1].content).includes('name "general"'));
-    assert(String(requests[0][1].content).includes('guild "Test Server"'));
+    assert(String(requests[0][1].content).includes('name "Test Server"'), "the guild name is rendered in the identity sentence");
     const savedChannel = JSON.parse(fs.readFileSync(path.join(process.cwd(), "chats.json"), "utf8")).channels.channel.channel;
     assert.deepEqual(savedChannel, { id: "channel", name: "general", guildId: "guild", guildName: "Test Server" });
     assert(prompt().includes("other-bot (bot): newest ambient message"));
@@ -293,6 +293,41 @@ async function run(): Promise<void> {
     assert(retriedYes.some((m) => m.toolCalls?.some((call) => call.id === "retry-yes")), "the interrupted turn's YES decision stays in history");
     assert(retriedYes.some((m) => String(m.content).includes("edited while the reply was in flight")), "the edit reached the model without an interruption");
     assert(retriedYes.some((m) => String(m.content).includes("a newer ambient interrupts the reply")));
+    // A mention turn with an executed tool round: the round's narration
+    // settles, the reply streams partial text and thinking, and a newer
+    // ambient message interrupts. An ambient message does not supersede a
+    // mention — the turn retries, and the retry carries the recorded round
+    // (its call and result) first, then the partial generation (its
+    // thinking travels with it) and the meta instruction.
+    duringChat = async () => {
+      duringChat = async (signal, callbacks) => {
+        callbacks?.onReasoning?.("thinking after the tool round");
+        callbacks?.onDelta?.("partial after the tool round");
+        create("875", "a newer ambient interrupts the mention reply");
+        await ticks();
+        assert(signal?.aborted, "the newer message interrupts the reply");
+        throw new InterruptedError();
+      };
+      return {
+        content: "narration before the tool",
+        reasoning: "narration reasoning",
+        toolCalls: [{ id: "mention-round-chime", name: "chime", arguments: '{"respond":true,"reason":"acknowledged"}' }],
+      };
+    };
+    create("860", "<@bot> mention with a tool round");
+    await advance(9999);
+    const carriedRetry = requests.find((r) => r.some((m) => m.metadata?.kind === "interruption-continuation"));
+    assert(carriedRetry, "the interrupted mention turn retries (a newer ambient does not supersede it)");
+    const roundIndex = carriedRetry!.findIndex((m) => m.role === "assistant" && m.toolCalls?.some((c) => c.id === "mention-round-chime"));
+    assert(roundIndex !== -1, "the executed round's call is in the retry prompt");
+    assert(carriedRetry!.some((m) => m.role === "tool" && m.toolCallId === "mention-round-chime"), "the round's result is in the retry prompt");
+    const partialIndex = carriedRetry!.findIndex((m) => m.role === "assistant" && String(m.content).includes("partial after the tool round"));
+    assert(partialIndex > roundIndex, "the partial generation is carried after the recorded round");
+    assert.equal(carriedRetry![partialIndex].reasoningContent, "thinking after the tool round", "the partial thinking travels with the partial");
+    const metaIndex = carriedRetry!.findIndex((m) => m.role === "user" && m.metadata?.kind === "interruption-continuation");
+    assert.equal(metaIndex, partialIndex + 1, "the meta continuation instruction follows the carried partial");
+    assert(carriedRetry!.some((m) => String(m.content).includes("a newer ambient interrupts the mention reply")), "the interrupting message is in the rebuilt context");
+    assert(!entries().some((e) => String(e.content).includes("partial after the tool round")), "the carried partial stays out of the persisted context");
     if (process.env.FLOW_MODE === "gemma") {
       const count = requests.length;
       duringChat = async () => {

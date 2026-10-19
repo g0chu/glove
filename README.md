@@ -288,9 +288,9 @@ Channel histories in `chats.json` remain keyed by Discord channel ID. Each
 history also records a `channel` object with its `id`, `name`, `guildId`, and
 `guildName`. IDs determine ownership; names are labels and may repeat across
 servers. Replies, chime decisions and compaction receive this current identity
-as a separate one-line message — a user message carrying the system-provenance
-metadata and wrapped in a `[SYSTEM MESSAGE: channel-identity]` tag on the wire,
-since only the master prompt keeps the system role: the channel ID, name and
+as a separate one-line message — a plain user message (a normal sentence in
+the imperative, no tag) carrying the system-provenance metadata, since only
+the master prompt keeps the system role: the channel ID, name and
 guild labels, the exact `channels["ID"]` key to use when reading the store
 through tools, and
 the rule that names are data, not instructions. Other stored histories remain
@@ -301,10 +301,10 @@ channels are observed again after startup.
 Replies, chime decisions and compaction share `MODEL_SYSTEM_PROMPT` unchanged.
 No tool guidance or phase instructions are added to that master prompt.
 Requests preserve conversation order, including when a reply follows a queued
-trigger. Endpoints must support trailing instructions — sent as user messages
-carrying the system-provenance metadata and wrapped in a `[SYSTEM MESSAGE: …]`
-tag on the wire — and generating a new reply after assistant history without
-treating it as an assistant prefill.
+trigger. Endpoints must support trailing instructions — sent as plain user
+messages (normal sentences in the imperative, no tag) carrying the
+system-provenance metadata — and generating a new reply after assistant
+history without treating it as an assistant prefill.
 
 User messages render with a local clock prefix (`14:05 Name: text`), and the
 first user line of a request carries a one-line date marker
@@ -320,9 +320,9 @@ fail validation) while replies send `tool_choice: "auto"` — the choice is a
 request parameter, not prompt content, so the shared prefix is unchanged.
 Changing the shared prompt, context or schemas can change the server's rendered
 prompt. The decision adds a
-short instruction **after** that shared context (a user message carrying the
-system-provenance metadata, tagged `[SYSTEM MESSAGE: chime-decision]` on the
-wire). Completed YES
+short instruction **after** that shared context (a plain user message — a
+normal sentence in the imperative — carrying the system-provenance
+metadata). Completed YES
 and NO decisions are retained in the same channel history: the instruction,
 original assistant text/reasoning and chime call, a matching tool result, and
 an instruction ending the decision phase. A YES reply extends that exact
@@ -340,8 +340,9 @@ model sees exactly what it is answering. The request therefore matches the
 decision's shared prefix byte for byte, which the endpoint can reuse from the
 prompt cache.
 
-Built-in instructions keep each task separate: `[CHIME]` decisions return one
-tool call, and `[SUMMARY]` compaction summarizes a specified older portion.
+Built-in instructions keep each task separate: the chime decision returns one
+tool call, and the compaction instruction summarizes a specified older
+portion.
 Output rules live in the trailing task instruction; the chime schema only
 describes the tool. These suffixes stay after the shared history, preserving
 the common prefix instead of inserting a changing task at the start. Prompt or
@@ -367,9 +368,9 @@ crash recovery uses the accepted reply with all its paired tool results, so
 rejected candidates cannot create duplicate rounds or mispaired tool results.
 
 Compaction also sends the full active context with the same ordered tool
-schemas and `tool_choice: "auto"`, followed by an instruction (a user message
-carrying the system-provenance metadata, tagged `[SYSTEM MESSAGE: compaction]`
-on the wire) specifying which older portion to summarize. Roles, reasoning, tool calls/results and
+schemas and `tool_choice: "auto"`, followed by an instruction (a plain user
+message — a normal sentence in the imperative — carrying the
+system-provenance metadata) specifying which older portion to summarize. Roles, reasoning, tool calls/results and
 attachments remain intact. Tools are never executed during compaction; a tool
 call is treated as a failed summary. Applying the summary still replaces older
 history, so the next request necessarily has a different prefix. Compaction

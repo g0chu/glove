@@ -82,17 +82,6 @@ export function systemInstructionMessage(kind: SystemInstructionKind, content: s
   return { role: "user", content, metadata: { sourceRole: "system", kind } };
 }
 
-/**
- * The wire-level tag around a converted system instruction: it tells the
- * model the user message carries a system instruction (of the given kind),
- * not user speech. Applied on the wire only (toWireMessage) — stored and
- * in-memory content stays untagged, so the tag never leaks into the
- * persisted context, the UI or the model's own recorded replies.
- */
-export function systemInstructionTag(kind: SystemInstructionKind, content: string): string {
-  return `[SYSTEM MESSAGE: ${kind}]\n${content}\n[/SYSTEM MESSAGE]`;
-}
-
 /** A message in the conversation sent to the model (wire shape on request). */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
@@ -391,10 +380,11 @@ function toWireMessage(m: ChatMessage): Record<string, unknown> {
       })),
     };
   }
-  const content = m.metadata !== undefined && typeof m.content === "string"
-    ? systemInstructionTag(m.metadata.kind, m.content)
-    : m.content;
-  return { role: m.role, content, ...(m.metadata ? { metadata: m.metadata } : {}), ...withReasoning };
+  // Converted system instructions are plain user messages on the wire: a
+  // normal sentence in the imperative, no tag — the provenance metadata
+  // rides along (invisible to the model, used by the UI), and only the very
+  // first message (the master prompt) keeps the system role.
+  return { role: m.role, content: m.content, ...(m.metadata ? { metadata: m.metadata } : {}), ...withReasoning };
 }
 
 /**
