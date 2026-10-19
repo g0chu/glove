@@ -37,6 +37,7 @@ import { loadConfig } from "./config.js";
 import { errMsg, log } from "./log.js";
 import { formatToolCall } from "./tools/activity.js";
 import { buildTools } from "./tools/index.js";
+import { connectMcpServers } from "./tools/mcp.js";
 import { runToolTurn, type ToolRound, type ToolTurnOutcome } from "./tools/loop.js";
 
 async function main(): Promise<void> {
@@ -318,6 +319,18 @@ async function main(): Promise<void> {
   };
   const tools = buildTools(cfg);
   if (cfg.discord.chimeEnabled) tools.registry.register(CHIME_TOOL_SPEC, executeReplyChime);
+  // MCP servers: external tool providers (a stdio process the bot spawns,
+  // or a streamable-HTTP endpoint). Their tools join the same registry as
+  // the in-process families; a server that cannot connect is logged and
+  // skipped — it never keeps the bot from starting.
+  if (cfg.tools.mcp.enabled && cfg.tools.mcp.servers.length > 0) {
+    const mcpClients = await connectMcpServers(cfg.tools.mcp.servers, tools.registry, {
+      timeoutMs: cfg.tools.mcp.timeoutMs,
+      maxResultChars: cfg.tools.maxResultChars,
+      prefixNames: cfg.tools.mcp.servers.length > 1,
+    });
+    tools.clients.push(...mcpClients);
+  }
   if (tools.registry.size > 0) {
     log.info(
       "tools enabled:",

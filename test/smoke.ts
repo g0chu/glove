@@ -18,8 +18,9 @@ import { fetchFreshMessages, RECONCILE_CONCURRENCY } from "../src/bot/refresh.js
  * (against a synthetic ZIM file and a synthetic notes vault built in temp
  * dirs), the LLM client (stream +
  * non-stream + tool calls + token usage + errors + multimodal wire shape)
- * against a local mock OpenAI-compatible server, and the llama-server
- * metrics (the /slots probe and per-turn token accounting). Run with:
+ * against a local mock OpenAI-compatible server, the llama-server metrics
+ * (the /slots probe and per-turn token accounting), and the MCP client
+ * (stdio and streamable-HTTP against in-process mock servers). Run with:
  * npm test
  */
 import assert from "node:assert/strict";
@@ -69,6 +70,7 @@ import { ToolRegistry, executeToolCalls, parseToolArgs, argString, argOptionalSt
 import { runToolTurn, type ToolRound } from "../src/tools/loop.js";
 import { formatToolCall } from "../src/tools/activity.js";
 import { buildTools } from "../src/tools/index.js";
+import { connectMcpServer, connectMcpServers } from "../src/tools/mcp.js";
 import { resolveUrl } from "../src/tools/web/ssrf.js";
 import { FetchCache } from "../src/tools/web/cache.js";
 import { extractTitle, extractContent } from "../src/tools/web/extract.js";
@@ -8625,6 +8627,241 @@ process.exit(0);
     assert.throws(() => new ConversationArchive(dir), /truncated/);
     ok("archive response: consolidated byte ranges verify checksums and truncation; damaged readable views rebuild without altering recovery history");
   } finally { archive.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// ------------------------------------------------------------------ mcp --
+{
+  // The MCP client against in-process mock servers: a stdio server is a
+  // node -e script speaking newline-delimited JSON-RPC, the streamable-HTTP
+  // server is a local http server (one answer as plain JSON, one as an
+  // event stream). No network, no .env.
+  const mcpScript = (toolNames: string[]): string =>
+    'let buf = "";' +
+    'const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");' +
+    'const toolNames = ' + JSON.stringify(toolNames) + ';' +
+    'const tools = toolNames.map((n) => ({ name: n, description: "mock tool " + n, inputSchema: { type: "object", properties: { text: { type: "string" } } } }));' +
+    'process.stdin.setEncoding("utf8");' +
+    'process.stdin.on("data", (chunk) => {' +
+    '  buf += chunk;' +
+    '  let i;' +
+    '  while ((i = buf.indexOf("\\n")) !== -1) {' +
+    '    const line = buf.slice(0, i).trim();' +
+    '    buf = buf.slice(i + 1);' +
+    '    if (!line) continue;' +
+    '    const msg = JSON.parse(line);' +
+    '    if (msg.id === undefined) continue;' +
+    '    if (msg.method === "initialize") {' +
+    '      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "mock-stdio", version: "1.0" } } });' +
+    '    } else if (msg.method === "ping") {' +
+    '      send({ jsonrpc: "2.0", id: msg.id, result: {} });' +
+    '    } else if (msg.method === "tools/list") {' +
+    '      send({ jsonrpc: "2.0", id: msg.id, result: { tools } });' +
+    '    } else if (msg.method === "tools/call") {' +
+    '      const name = msg.params.name;' +
+    '      const args = msg.params.arguments || {};' +
+    '      if (name === "hang") return;' +
+    '      if (name === "broken") send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "server says no" } });' +
+    '      if (name === "boom") send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "it exploded" }], isError: true } });' +
+    '      else if (name === "parts") send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "hello" }, { type: "image", data: "QUJD", mimeType: "image/png" }] } });' +
+    '      else if (name === "echo") send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "echo: " + (args.text === undefined ? "" : args.text) }] } });' +
+    '      else send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown tool " + name } });' +
+    '    }' +
+    '  }' +
+    '});';
+  const mcpOpts: { timeoutMs: number; maxResultChars: number; prefixNames: boolean } = {
+    timeoutMs: 1500,
+    maxResultChars: 1000,
+    prefixNames: false,
+  };
+
+  // config: the JSON array is parsed and validated entry by entry
+  const { config: mcpCfg, errors: mcpErrs } = parseConfig({
+    DISCORD_TOKEN: "t",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MCPTOOLS_ENABLED: "true",
+    MCP_SERVERS: JSON.stringify([
+      { name: "a", command: "python3", args: ["server.py"], env: { X: "1" } },
+      { name: "b", url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer t" } },
+    ]),
+  });
+  assert.deepEqual(mcpErrs, []);
+  assert.equal(mcpCfg.tools.mcp.enabled, true);
+  assert.equal(mcpCfg.tools.mcp.servers.length, 2);
+  assert.deepEqual(mcpCfg.tools.mcp.servers[0], { name: "a", command: "python3", args: ["server.py"], env: { X: "1" } });
+  assert.deepEqual(mcpCfg.tools.mcp.servers[1], { name: "b", url: "http://127.0.0.1:9/mcp", headers: { Authorization: "Bearer t" } });
+  const { config: mcpDisabled } = parseConfig({
+    DISCORD_TOKEN: "t",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MCP_SERVERS: JSON.stringify([{ name: "a", command: "python3" }]),
+  });
+  assert.equal(mcpDisabled.tools.mcp.enabled, false, "off by default");
+  const badJson = parseConfig({
+    DISCORD_TOKEN: "t",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MCPTOOLS_ENABLED: "true",
+    MCP_SERVERS: "{nope",
+  });
+  assert.ok(badJson.errors.some((e) => e.includes("MCP_SERVERS")), "broken JSON is reported");
+  const noServers = parseConfig({
+    DISCORD_TOKEN: "t",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MCPTOOLS_ENABLED: "true",
+  });
+  assert.ok(noServers.errors.some((e) => e.includes("MCP_SERVERS is required")), "enabled without servers is reported");
+  const brokenEntries = parseConfig({
+    DISCORD_TOKEN: "t",
+    MODEL_API_URL: "http://localhost:8080/v1/chat/completions",
+    MCPTOOLS_ENABLED: "true",
+    MCP_SERVERS: JSON.stringify([{ name: "x" }, { name: "x", command: "a" }, { name: "y", command: "a", url: "http://localhost:1/mcp" }]),
+  });
+  assert.ok(brokenEntries.errors.some((e) => e.includes('needs a "command"')), "missing transport is reported");
+  assert.ok(brokenEntries.errors.some((e) => e.includes("duplicate MCP server name")), "duplicate names are reported");
+  assert.ok(brokenEntries.errors.some((e) => e.includes("exactly one")), "both transports is reported");
+  ok("mcp: config parses and validates MCP_SERVERS");
+
+  // stdio: the handshake, registration, calls, errors, timeout, teardown
+  const registry = new ToolRegistry();
+  const client = await connectMcpServer(
+    { name: "mock", command: process.execPath, args: ["-e", mcpScript(["echo", "boom", "parts", "hang", "broken"])] },
+    registry,
+    mcpOpts,
+  );
+  assert.ok(client, "the stdio mock connects");
+  assert.deepEqual(client!.toolNames, ["echo", "boom", "parts", "hang", "broken"]);
+  const echoSpec = registry.get("echo")!.spec;
+  assert.equal(echoSpec.description, "mock tool echo");
+  assert.equal(echoSpec.parameters.type, "object");
+  assert.deepEqual((echoSpec.parameters as { properties: unknown }).properties, { text: { type: "string" } });
+  const results = await executeToolCalls(registry, [
+    { id: "m1", name: "echo", arguments: '{"text":"hi"}' },
+    { id: "m2", name: "boom", arguments: "{}" },
+    { id: "m3", name: "parts", arguments: "{}" },
+    { id: "m4", name: "broken", arguments: "{}" },
+    { id: "m5", name: "nope", arguments: "{}" },
+  ]);
+  assert.equal(results[0].content, "echo: hi");
+  assert.equal(results[1].content, "Error: it exploded", "isError results are flagged");
+  assert.ok(results[2].content.startsWith("hello"), "text parts are kept");
+  assert.ok(results[2].content.includes("[image part (image/png) omitted]"), "non-text parts become notes");
+  assert.equal(results[3].content, 'Error: JSON-RPC error -32601: server says no', "protocol errors reach the model");
+  assert.equal(results[4].content, 'Error: unknown tool "nope"', "unregistered names never reach the server");
+  // concurrent calls are multiplexed by id over the one channel
+  const [ca, cb] = await Promise.all([
+    executeToolCalls(registry, [{ id: "c1", name: "echo", arguments: '{"text":"a"}' }]),
+    executeToolCalls(registry, [{ id: "c2", name: "echo", arguments: '{"text":"b"}' }]),
+  ]);
+  assert.equal(ca[0].content, "echo: a");
+  assert.equal(cb[0].content, "echo: b");
+  // a call the server never answers hits the deadline (and the client stays usable)
+  const hang = await executeToolCalls(registry, [{ id: "m5", name: "hang", arguments: "{}" }]);
+  assert.ok(hang[0].content.includes("timed out"), hang[0].content);
+  const after = await executeToolCalls(registry, [{ id: "m6", name: "echo", arguments: '{"text":"still alive"}' }]);
+  assert.equal(after[0].content, "echo: still alive");
+  // abort tears the process down; later calls fail fast
+  client!.abort();
+  await ticks(3);
+  const deadCall = await executeToolCalls(registry, [{ id: "m7", name: "echo", arguments: "{}" }]);
+  assert.ok(deadCall[0].content.startsWith("Error:"), deadCall[0].content);
+  ok("mcp: stdio server — handshake, registration, calls, errors, deadline, teardown");
+
+  // a server that dies before the handshake or never exists resolves to null
+  const deadRegistry = new ToolRegistry();
+  const dead = await connectMcpServer(
+    { name: "dead", command: process.execPath, args: ["-e", "process.exit(1)"] },
+    deadRegistry,
+    mcpOpts,
+  );
+  assert.equal(dead, null, "a process that exits early is skipped");
+  const missing = await connectMcpServer(
+    { name: "missing", command: "definitely-not-a-command-xyz" },
+    deadRegistry,
+    mcpOpts,
+  );
+  assert.equal(missing, null, "a missing binary is skipped");
+  assert.equal(deadRegistry.size, 0);
+  ok("mcp: broken servers fail soft (null, nothing registered)");
+
+  // several servers: tool names are prefixed with the server's slug
+  const multi = new ToolRegistry();
+  const mcpClients = await connectMcpServers(
+    [
+      { name: "mock-a", command: process.execPath, args: ["-e", mcpScript(["echo"])] },
+      { name: "mock-b", command: process.execPath, args: ["-e", mcpScript(["echo"])] },
+    ],
+    multi,
+    { ...mcpOpts, prefixNames: true },
+  );
+  assert.equal(mcpClients.length, 2);
+  assert.ok(multi.has("mock-a__echo") && multi.has("mock-b__echo"), `got ${multi.specs().map((s) => s.name).join(", ")}`);
+  const prefixed = await executeToolCalls(multi, [{ id: "p1", name: "mock-b__echo", arguments: '{"text":"x"}' }]);
+  assert.equal(prefixed[0].content, "echo: x");
+  for (const c of mcpClients) c.abort();
+  ok("mcp: several servers get prefixed, unique tool names");
+
+  // streamable-HTTP: JSON and event-stream answers, session id on the wire
+  const sawSession = { list: false, call: false };
+  const readBody = (req: http.IncomingMessage): Promise<string> =>
+    new Promise((resolve, reject) => {
+      let data = "";
+      req.on("data", (c) => (data += c));
+      req.on("end", () => resolve(data));
+      req.on("error", reject);
+    });
+  const httpServer = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/mcp") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    const msg = JSON.parse(await readBody(req)) as { id?: number; method?: string; params?: { name?: string; arguments?: { text?: string } } };
+    if (req.headers["mcp-session-id"] === "sess-123") {
+      if (msg.method === "tools/list") sawSession.list = true;
+      if (msg.method === "tools/call") sawSession.call = true;
+    }
+    if (msg.method === "initialize") {
+      res.writeHead(200, { "Content-Type": "application/json", "Mcp-Session-Id": "sess-123" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "mock-http", version: "1.0" } } }));
+    } else if (msg.method === "notifications/initialized") {
+      res.writeHead(202);
+      res.end();
+    } else if (msg.method === "tools/list") {
+      // the answer as an event stream, not plain JSON
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(
+        `event: message\ndata: ${JSON.stringify({
+          jsonrpc: "2.0",
+          id: msg.id,
+          result: { tools: [{ name: "echo", description: "mock over http", inputSchema: { type: "object", properties: {} } }] },
+        })}\n\n`,
+      );
+      res.end();
+    } else if (msg.method === "tools/call") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: `http: ${msg.params?.arguments?.text ?? ""}` }] } }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise<void>((r) => httpServer.listen(0, "127.0.0.1", r));
+  const httpRegistry = new ToolRegistry();
+  const httpClient = await connectMcpServer(
+    { name: "mock-http", url: `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}/mcp` },
+    httpRegistry,
+    mcpOpts,
+  );
+  try {
+    assert.ok(httpClient, "the streamable-HTTP mock connects (SSE tools/list)");
+    assert.equal(httpRegistry.get("echo")!.spec.description, "mock over http");
+    const httpResults = await executeToolCalls(httpRegistry, [{ id: "h1", name: "echo", arguments: '{"text":"over http"}' }]);
+    assert.equal(httpResults[0].content, "http: over http");
+    assert.ok(sawSession.list && sawSession.call, "the session id is sent on later requests");
+    httpClient!.abort();
+    ok("mcp: streamable-HTTP server — JSON + SSE answers, session id");
+  } finally {
+    httpClient?.abort();
+    httpServer.close();
+  }
 }
 
 console.log(`\n${checks} check groups passed`);

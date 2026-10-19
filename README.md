@@ -178,12 +178,13 @@ without the affected tensor/MTP combination.
 
 ## Tools (web search/fetch + file workspace + shell + offline Wikipedia)
 
-The bot can run four optional tool families, all **in-process** (no
-sidecars, no Docker). All are **opt-in** (default `false`) and need a model
-endpoint that supports function calling (`tools`). With all disabled, the bot
-advertises no executable tool families. Enabled tools are described in their
-function schemas; tool guidance is not appended to `MODEL_SYSTEM_PROMPT`.
-The local `chime` schema is also shared by decision and reply requests.
+The bot can run six optional tool families: five **in-process** (no
+sidecars, no Docker) plus external **MCP servers**. All are **opt-in**
+(default `false`) and need a model endpoint that supports function calling
+(`tools`). With all disabled, the bot advertises no executable tool
+families. Enabled tools are described in their function schemas; tool
+guidance is not appended to `MODEL_SYSTEM_PROMPT`. The local `chime` schema
+is also shared by decision and reply requests.
 
 - **web tools**: `web_search` (DuckDuckGo) and `web_fetch` (plain
   pinned-socket HTTP fetch with SSRF protection, content extraction, and a
@@ -211,6 +212,14 @@ The local `chime` schema is also shared by decision and reply requests.
   match the ZIM tools, and search also checks note contents.
 - **memory tool**: `memory` manages persistent named notes shared across
   conversations. See [Persistent memory](#persistent-memory).
+- **MCP tools**: `MCPTOOLS_ENABLED=true` plus `MCP_SERVERS` (a JSON array) connects external
+  [MCP](https://modelcontextprotocol.io/) servers and registers the tools each one lists
+  alongside the in-process families. Each entry names a server and sets either a
+  `command` (stdio: the bot spawns the process, optional `args`/`env`) or a `url`
+  (streamable-HTTP endpoint, optional `headers`) — exactly one of the two. With several
+  servers, tool names are namespaced `<server>__<tool>`; with a single server they keep
+  their own names. `MCPTOOLS_TIMEOUT_S` (default 180) bounds each call. A server that
+  cannot connect or lists no tools is logged and skipped; the bot starts without it.
 
 A turn may run several model rounds: a round that ends in tool calls keeps
 its text in place (it stays in the channel above the activity lines), the
@@ -226,6 +235,7 @@ Nothing to build or run — the tools live in the bot process. Just set
 `WEBTOOLS_ENABLED=true`, `FILETOOLS_ENABLED=true`, `SHELLTOOLS_ENABLED=true`,
 `ZIMTOOLS_ENABLED=true` (with `ZIM_FILE` pointing at a ZIM archive),
 `VAULTTOOLS_ENABLED=true` (with `VAULT_DIR` pointing at a markdown vault),
+`MCPTOOLS_ENABLED=true` (with `MCP_SERVERS` listing the servers),
 and/or `MEMORYTOOLS_ENABLED=true` in `.env` and restart the bot.
 
 ### Notes

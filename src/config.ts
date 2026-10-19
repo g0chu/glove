@@ -159,6 +159,39 @@ export interface ZimToolsConfig {
 }
 
 /**
+ * One MCP (Model Context Protocol) server (an entry of the MCP_SERVERS
+ * JSON array). Either `command` (stdio: the bot spawns the server
+ * process and speaks newline-delimited JSON-RPC on stdin/stdout) or
+ * `url` (a streamable-HTTP endpoint) is required — exactly one.
+ */
+export interface McpServerConfig {
+  /** Human-readable label; also the tool-name prefix when several servers are configured. */
+  name: string;
+  /** stdio transport: the command to spawn (one of command/url is required). */
+  command?: string;
+  /** stdio transport: the command's arguments. */
+  args?: string[];
+  /** Extra environment variables for the spawned process (merged over the bot's env). */
+  env?: Record<string, string>;
+  /** streamable-HTTP transport: the endpoint URL (one of command/url is required). */
+  url?: string;
+  /** Extra headers sent with every streamable-HTTP request. */
+  headers?: Record<string, string>;
+}
+
+/**
+ * MCP tool family (external): the tools that configured MCP servers list
+ * are registered alongside the in-process families (see src/tools/mcp.ts).
+ */
+export interface McpToolsConfig {
+  enabled: boolean;
+  /** The MCP servers to connect at startup (parsed from MCP_SERVERS). */
+  servers: McpServerConfig[];
+  /** Deadline per tools/call request (ms); the startup handshake is capped at 60s. */
+  timeoutMs: number;
+}
+
+/**
  * Vault tool family (in-process): search and read notes of a local
  * offline Wikipedia vault of markdown notes (one flat note per article,
  * built by the wiki2vault project — see src/tools/vault/).
@@ -183,6 +216,8 @@ export interface ToolsConfig {
   vault: VaultToolsConfig;
   /** Optional bot-wide persistent note store. */
   memory: { enabled: boolean; file: string; maxBytes: number };
+  /** MCP servers whose tools join the tool registry. */
+  mcp: McpToolsConfig;
   /** Max tool-execution rounds per turn before the turn is cut off. */
   maxRounds: number;
   /** Hard cap on characters in one tool result (all families). */
@@ -198,6 +233,22 @@ export interface Config {
 export interface ParseResult {
   config: Config;
   errors: string[];
+}
+
+/** Validate an http(s) URL, appending a problem to `errors` when broken. */
+function httpUrlOk(name: string, value: string, errors: string[]): boolean {
+  if (!value) return true;
+  try {
+    const u = new URL(value);
+    if (u.protocol !== "http:" && u.protocol !== "https:") {
+      errors.push(`${name} must be http(s) (got "${value}")`);
+      return false;
+    }
+    return true;
+  } catch {
+    errors.push(`${name} is not a valid URL: "${value}"`);
+    return false;
+  }
 }
 
 /**
@@ -241,27 +292,12 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
     return dflt;
   };
 
-  const httpUrlOk = (name: string, value: string): boolean => {
-    if (!value) return true;
-    try {
-      const u = new URL(value);
-      if (u.protocol !== "http:" && u.protocol !== "https:") {
-        errors.push(`${name} must be http(s) (got "${value}")`);
-        return false;
-      }
-      return true;
-    } catch {
-      errors.push(`${name} is not a valid URL: "${value}"`);
-      return false;
-    }
-  };
-
   const token = required("DISCORD_TOKEN");
   // Optional: when empty the bot responds in every text channel of every
   // guild it is a member of (DMs are never tracked).
   const guildId = optional("DISCORD_GUILD_ID", "");
   const apiUrl = required("MODEL_API_URL");
-  if (apiUrl) httpUrlOk("MODEL_API_URL", apiUrl);
+  if (apiUrl) httpUrlOk("MODEL_API_URL", apiUrl, errors);
   const profile = optional("MODEL_COMPATIBILITY", "auto").toLowerCase();
   const compatibility: ModelCompatibility = profile === "gemma4" || profile === "generic" ? profile : "auto";
   if (!["auto", "generic", "gemma4"].includes(profile)) errors.push("MODEL_COMPATIBILITY must be auto, generic or gemma4");
@@ -376,6 +412,11 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
         scanBudgetMs: intEnv("VAULTTOOLS_SCAN_BUDGET_S", 10, 1) * 1000,
         rgPath: optional("VAULTTOOLS_RG_PATH", "rg"),
       },
+      mcp: {
+        enabled: boolEnv("MCPTOOLS_ENABLED", false),
+        servers: parseMcpServers(env, errors),
+        timeoutMs: intEnv("MCPTOOLS_TIMEOUT_S", 180, 1) * 1000,
+      },
       memory: {
         enabled: boolEnv("MEMORYTOOLS_ENABLED", false),
         file: optional("MEMORYTOOLS_FILE", "./data/memory.json"),
@@ -391,6 +432,9 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
   }
   if (config.tools.vault.enabled && config.tools.vault.dir.length === 0) {
     errors.push("VAULT_DIR is required when VAULTTOOLS_ENABLED is true");
+  }
+  if (config.tools.mcp.enabled && config.tools.mcp.servers.length === 0) {
+    errors.push('MCP_SERVERS is required when MCPTOOLS_ENABLED is true (a JSON array of at least one {"name": …, "command": …|"url": …} entry)');
   }
 
   // The compaction budget: an explicit CONTEXT_COMPACTION_MAX_TOKENS wins;
@@ -417,9 +461,96 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): ParseResult {
       // metrics URL empty; the probes simply fail soft at runtime.
     }
   }
-  if (config.model.metricsUrl !== "") httpUrlOk("MODEL_METRICS_URL", config.model.metricsUrl);
+  if (config.model.metricsUrl !== "") httpUrlOk("MODEL_METRICS_URL", config.model.metricsUrl, errors);
 
   return { config, errors };
+}
+
+/**
+ * Parse the MCP_SERVERS JSON array into server definitions, appending
+ * problems to `errors` (an unset/empty variable yields an empty list).
+ */
+function parseMcpServers(env: NodeJS.ProcessEnv, errors: string[]): McpServerConfig[] {
+  const raw = env.MCP_SERVERS?.trim();
+  if (!raw) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    errors.push("MCP_SERVERS must be a JSON array of server definitions");
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    errors.push("MCP_SERVERS must be a JSON array of server definitions");
+    return [];
+  }
+  const stringRecord = (v: unknown, where: string): Record<string, string> | undefined => {
+    if (!v || typeof v !== "object" || Array.isArray(v)) {
+      errors.push(`${where} must be an object of strings`);
+      return undefined;
+    }
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(v as Record<string, unknown>)) {
+      if (typeof value !== "string") {
+        errors.push(`${where}.${key} must be a string`);
+        return undefined;
+      }
+      out[key] = value;
+    }
+    return out;
+  };
+  const servers: McpServerConfig[] = [];
+  const seen = new Set<string>();
+  parsed.forEach((entry, index) => {
+    const where = `MCP_SERVERS[${index}]`;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      errors.push(`${where} must be an object`);
+      return;
+    }
+    const e = entry as Record<string, unknown>;
+    const name = typeof e.name === "string" ? e.name.trim() : "";
+    if (!name) {
+      errors.push(`${where} needs a non-empty "name"`);
+      return;
+    }
+    if (seen.has(name)) {
+      errors.push(`duplicate MCP server name: ${name}`);
+      return;
+    }
+    seen.add(name);
+    const command = typeof e.command === "string" ? e.command.trim() : "";
+    const url = typeof e.url === "string" ? e.url.trim() : "";
+    if (!command && !url) {
+      errors.push(`MCP server "${name}" needs a "command" (stdio) or a "url" (streamable-HTTP)`);
+      return;
+    }
+    if (command && url) {
+      errors.push(`MCP server "${name}" must set exactly one of "command" or "url"`);
+      return;
+    }
+    if (url) httpUrlOk(`${where}.url`, url, errors);
+    let args: string[] | undefined;
+    if (e.args !== undefined) {
+      if (!Array.isArray(e.args) || e.args.some((a) => typeof a !== "string")) {
+        errors.push(`${where}.args must be an array of strings`);
+        return;
+      }
+      args = e.args as string[];
+    }
+    const envVars = e.env !== undefined ? stringRecord(e.env, `${where}.env`) : undefined;
+    if (envVars === undefined && e.env !== undefined) return;
+    const headers = e.headers !== undefined ? stringRecord(e.headers, `${where}.headers`) : undefined;
+    if (headers === undefined && e.headers !== undefined) return;
+    servers.push({
+      name,
+      ...(command ? { command } : {}),
+      ...(url ? { url } : {}),
+      ...(args && args.length > 0 ? { args } : {}),
+      ...(envVars && Object.keys(envVars).length > 0 ? { env: envVars } : {}),
+      ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
+    });
+  });
+  return servers;
 }
 
 /** Load and validate config from the environment; fail fast with clear errors. */
