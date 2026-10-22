@@ -8635,10 +8635,14 @@ process.exit(0);
   // node -e script speaking newline-delimited JSON-RPC, the streamable-HTTP
   // server is a local http server (one answer as plain JSON, one as an
   // event stream). No network, no .env.
-  const mcpScript = (toolNames: string[]): string =>
+  const mcpScript = (
+    toolNames: string[],
+    resources: Array<{ uri: string; name?: string; description?: string }> = [],
+  ): string =>
     'let buf = "";' +
     'const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");' +
     'const toolNames = ' + JSON.stringify(toolNames) + ';' +
+    'const resources = ' + JSON.stringify(resources) + ';' +
     'const tools = toolNames.map((n) => ({ name: n, description: "mock tool " + n, inputSchema: { type: "object", properties: { text: { type: "string" } } } }));' +
     'process.stdin.setEncoding("utf8");' +
     'process.stdin.on("data", (chunk) => {' +
@@ -8651,11 +8655,17 @@ process.exit(0);
     '    const msg = JSON.parse(line);' +
     '    if (msg.id === undefined) continue;' +
     '    if (msg.method === "initialize") {' +
-    '      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "mock-stdio", version: "1.0" } } });' +
+    '      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: resources.length ? { resources: {} } : {}, serverInfo: { name: "mock-stdio", version: "1.0" } } });' +
     '    } else if (msg.method === "ping") {' +
     '      send({ jsonrpc: "2.0", id: msg.id, result: {} });' +
     '    } else if (msg.method === "tools/list") {' +
     '      send({ jsonrpc: "2.0", id: msg.id, result: { tools } });' +
+    '    } else if (msg.method === "resources/list") {' +
+    '      send({ jsonrpc: "2.0", id: msg.id, result: { resources } });' +
+    '    } else if (msg.method === "resources/read") {' +
+    '      const uri = msg.params.uri;' +
+    '      if (!resources.some((r) => r.uri === uri)) send({ jsonrpc: "2.0", id: msg.id, error: { code: -32004, message: "unknown resource " + uri } });' +
+    '      else send({ jsonrpc: "2.0", id: msg.id, result: { contents: [{ uri, mimeType: "text/plain", text: uri === "mock://long" ? "L".repeat(5000) : "note text for " + uri }] } });' +
     '    } else if (msg.method === "tools/call") {' +
     '      const name = msg.params.name;' +
     '      const args = msg.params.arguments || {};' +
@@ -8728,6 +8738,7 @@ process.exit(0);
   );
   assert.ok(client, "the stdio mock connects");
   assert.deepEqual(client!.toolNames, ["echo", "boom", "parts", "hang", "broken"]);
+  assert.equal(registry.has("mcp_resource_read"), false, "no reader when the server declares no resources");
   const echoSpec = registry.get("echo")!.spec;
   assert.equal(echoSpec.description, "mock tool echo");
   assert.equal(echoSpec.parameters.type, "object");
@@ -8763,6 +8774,52 @@ process.exit(0);
   const deadCall = await executeToolCalls(registry, [{ id: "m7", name: "echo", arguments: "{}" }]);
   assert.ok(deadCall[0].content.startsWith("Error:"), deadCall[0].content);
   ok("mcp: stdio server — handshake, registration, calls, errors, deadline, teardown");
+
+  // resources: a server that lists resources gets ONE reader tool — the
+  // listing lives in its description, reads are capped like tool results,
+  // and an unknown uri is a soft Error for the model. A server with only
+  // resources (no tools) still connects.
+  const resRegistry = new ToolRegistry();
+  const resClient = await connectMcpServer(
+    {
+      name: "notes",
+      command: process.execPath,
+      args: [
+        "-e",
+        mcpScript(["echo"], [
+          { uri: "mock://alpha", name: "Alpha", description: "the first note" },
+          { uri: "mock://beta" },
+          { uri: "mock://long" },
+        ]),
+      ],
+    },
+    resRegistry,
+    mcpOpts,
+  );
+  assert.ok(resClient, "the resource server connects");
+  assert.deepEqual(resClient!.toolNames, ["echo", "mcp_resource_read"]);
+  const readerSpec = resRegistry.get("mcp_resource_read")!.spec;
+  assert.ok(readerSpec.description.includes("- mock://alpha — the first note"), readerSpec.description);
+  assert.ok(readerSpec.description.includes("- mock://beta"), "nameless resources are listed too");
+  const readResults = await executeToolCalls(resRegistry, [
+    { id: "r1", name: "mcp_resource_read", arguments: '{"uri":"mock://alpha"}' },
+    { id: "r2", name: "mcp_resource_read", arguments: '{"uri":"mock://nope"}' },
+  ]);
+  assert.equal(readResults[0].content, "note text for mock://alpha");
+  assert.equal(readResults[1].content, "Error: JSON-RPC error -32004: unknown resource mock://nope");
+  const longRes = await executeToolCalls(resRegistry, [{ id: "r3", name: "mcp_resource_read", arguments: '{"uri":"mock://long"}' }]);
+  assert.ok(longRes[0].content.endsWith("…[truncated]"), "resource reads are capped like tool results");
+  resClient!.abort();
+  const soloRegistry = new ToolRegistry();
+  const soloClient = await connectMcpServer(
+    { name: "solo", command: process.execPath, args: ["-e", mcpScript([], [{ uri: "mock://solo" }])] },
+    soloRegistry,
+    mcpOpts,
+  );
+  assert.ok(soloClient, "a server with only resources still connects");
+  assert.deepEqual(soloClient!.toolNames, ["mcp_resource_read"]);
+  soloClient!.abort();
+  ok("mcp: resources — one reader tool, listing in the description, capped reads");
 
   // a server that dies before the handshake or never exists resolves to null
   const deadRegistry = new ToolRegistry();

@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { errMsg, log, truncate } from "../log.js";
 import type { McpServerConfig } from "../config.js";
 import type { ToolSpec } from "../llm/client.js";
-import type { ToolRegistry } from "./executor.js";
+import { argString, type ToolRegistry } from "./executor.js";
 
 /**
  * MCP (Model Context Protocol) client: connects to external MCP servers —
@@ -18,6 +18,12 @@ import type { ToolRegistry } from "./executor.js";
  * multiplexed by id, so concurrent tool calls fly in parallel). A broken
  * server degrades to "Error: …" tool results and startup warnings — it
  * never crashes the bot.
+ *
+ * A server that lists resources (read-only, URI-addressed documents) gets
+ * one extra tool — `mcp_resource_read`, whose description carries the
+ * resource listing — instead of a permanent tool per resource. Servers that
+ * do not declare the resources capability are skipped silently; a failed
+ * resources/list is logged and the server keeps its tools.
  */
 
 /** The newest protocol version the client announces (servers may answer with theirs). */
@@ -47,6 +53,14 @@ export interface McpTool {
   description?: string;
   /** A JSON Schema object (type: "object") for the tool's arguments. */
   inputSchema?: unknown;
+}
+
+/** One resource as the server's resources/list reports it (uri identifies it). */
+export interface McpResource {
+  uri: string;
+  name?: string;
+  description?: string;
+  mimeType?: string;
 }
 
 /** One connected MCP server; its tools are already registered in the given registry. */
@@ -113,9 +127,9 @@ export async function connectMcpServer(server: McpServerConfig, registry: ToolRe
     log.warn(`${label}: tools/list failed: ${errMsg(err)}`);
     return null;
   }
-  if (tools.length === 0) {
+  if (tools.length === 0 && !conn.declaresResources()) {
     conn.close();
-    log.warn(`${label}: the server lists no tools; skipping`);
+    log.warn(`${label}: the server lists no tools (and no resources); skipping`);
     return null;
   }
   const names: string[] = [];
@@ -129,12 +143,54 @@ export async function connectMcpServer(server: McpServerConfig, registry: ToolRe
     registry.register(spec, (args) => conn.callTool(tool.name, args, opts.timeoutMs, opts.maxResultChars));
     names.push(spec.name);
   }
+  // Resources: static, URI-addressed documents the server keeps. They get
+  // ONE reader tool (the listing lives in its description) instead of a
+  // permanent tool per resource; a failed listing never takes the server's
+  // tools down.
+  let resourceCount = 0;
+  if (conn.declaresResources()) {
+    let resources: McpResource[] = [];
+    try {
+      resources = await conn.listResources(opts.timeoutMs);
+    } catch (err) {
+      log.warn(`${label}: resources/list failed: ${errMsg(err)}; its tools are still registered`);
+    }
+    if (resources.length > 0) {
+      resourceCount = resources.length;
+      const listing = resources
+        .map((r) => `- ${r.uri}${r.description ? ` — ${r.description}` : r.name ? ` — ${r.name}` : ""}`)
+        .join("\n");
+      const spec = toToolSpec(
+        server.name,
+        {
+          name: "mcp_resource_read",
+          description: `Read a document (resource) from the ${server.name} MCP server by URI. Available resources:\n${listing}`,
+          inputSchema: {
+            type: "object",
+            properties: { uri: { type: "string", description: "The resource URI to read (one of the listed resources)" } },
+            required: ["uri"],
+          },
+        },
+        opts.prefixNames,
+      );
+      if (spec) {
+        if (registry.has(spec.name)) {
+          log.warn(`${label}: tool "${spec.name}" is already registered; skipping it`);
+        } else {
+          registry.register(spec, (args) => conn.readResource(argString(args, "uri"), opts.timeoutMs, opts.maxResultChars));
+          names.push(spec.name);
+        }
+      }
+    }
+  }
   if (names.length === 0) {
     conn.close();
     log.warn(`${label}: none of the server's tools could be registered; skipping`);
     return null;
   }
-  log.info(`${label}: connected (${names.length} tool(s): ${names.join(", ")})`);
+  log.info(
+    `${label}: connected (${names.length} tool(s)${resourceCount ? `, ${resourceCount} resource(s)` : ""}: ${names.join(", ")})`,
+  );
   return new McpClient(server.name, names, conn);
 }
 
@@ -147,6 +203,8 @@ class McpConnection {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private closed = false;
+  /** The server's initialize capabilities ({} when absent or malformed). */
+  private capabilities: Record<string, unknown> = {};
 
   constructor(
     private readonly transport: StdioTransport | HttpTransport,
@@ -167,7 +225,8 @@ class McpConnection {
         clientInfo: { name: "glove", version: "0.1.0" },
       },
       this.handshakeTimeoutMs,
-    )) as { protocolVersion?: unknown; serverInfo?: { name?: unknown } } | undefined;
+    )) as { protocolVersion?: unknown; serverInfo?: { name?: unknown }; capabilities?: unknown } | undefined;
+    this.capabilities = (res?.capabilities && typeof res.capabilities === "object" ? res.capabilities : {}) as Record<string, unknown>;
     const version = typeof res?.protocolVersion === "string" ? res.protocolVersion : MCP_PROTOCOL_VERSION;
     const info = res?.serverInfo?.name;
     log.info(`${this.label}: initialized (protocol ${version}${typeof info === "string" && info ? `, server ${info}` : ""})`);
@@ -191,6 +250,61 @@ class McpConnection {
       cursor = res.nextCursor;
     }
     return tools;
+  }
+
+  /** Whether the server declared the resources capability (initialize). */
+  declaresResources(): boolean {
+    const c = this.capabilities.resources;
+    return c !== null && typeof c === "object";
+  }
+
+  /** resources/list with pagination (like tools/list). */
+  async listResources(timeoutMs: number): Promise<McpResource[]> {
+    const resources: McpResource[] = [];
+    let cursor: unknown;
+    for (let page = 0; page < 10; page++) {
+      const res = (await this.request(
+        "resources/list",
+        cursor === undefined ? {} : { cursor },
+        timeoutMs,
+      )) as { resources?: unknown; nextCursor?: unknown } | undefined;
+      if (res && Array.isArray(res.resources)) {
+        for (const item of res.resources as Array<Record<string, unknown>>) {
+          if (typeof item?.uri !== "string") continue;
+          resources.push({
+            uri: item.uri,
+            name: typeof item.name === "string" ? item.name : undefined,
+            description: typeof item.description === "string" ? item.description : undefined,
+            mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
+          });
+        }
+      }
+      if (res?.nextCursor === undefined) break;
+      cursor = res.nextCursor;
+    }
+    return resources;
+  }
+
+  /**
+   * One resources/read, formatted like a tool result: text parts joined,
+   * binary parts reduced to one-line notes, length capped the same way.
+   */
+  async readResource(uri: string, timeoutMs: number, maxResultChars: number): Promise<string> {
+    const result = await this.request("resources/read", { uri }, timeoutMs);
+    const r = (result ?? {}) as { contents?: unknown };
+    const parts: string[] = [];
+    if (Array.isArray(r.contents)) {
+      for (const part of r.contents) {
+        const p = (part ?? {}) as { text?: unknown; mimeType?: unknown };
+        if (typeof p.text === "string") {
+          parts.push(p.text);
+        } else {
+          parts.push(`[binary resource (${String(p.mimeType ?? "unknown type")}) omitted]`);
+        }
+      }
+    }
+    const text = parts.length > 0 ? parts.join("\n") : "no content";
+    return text.length > maxResultChars ? `${text.slice(0, maxResultChars)}\n…[truncated]` : text;
   }
 
   /** One tools/call, formatted into the text the model sees. */

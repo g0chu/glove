@@ -214,7 +214,10 @@ is also shared by decision and reply requests.
   conversations. See [Persistent memory](#persistent-memory).
 - **MCP tools**: `MCPTOOLS_ENABLED=true` plus `MCP_SERVERS` (a JSON array) connects external
   [MCP](https://modelcontextprotocol.io/) servers and registers the tools each one lists
-  alongside the in-process families. Each entry names a server and sets either a
+  alongside the in-process families. A server that also lists resources
+  (read-only, URI-addressed documents) gets one extra `mcp_resource_read`
+  tool — the resource listing lives in its description, and a read is capped
+  like any tool result. Each entry names a server and sets either a
   `command` (stdio: the bot spawns the process, optional `args`/`env`) or a `url`
   (streamable-HTTP endpoint, optional `headers`) — exactly one of the two. With several
   servers, tool names are namespaced `<server>__<tool>`; with a single server they keep
